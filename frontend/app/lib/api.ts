@@ -81,3 +81,42 @@ export async function fetchStateFromHP(
 export function saturationCSVUrl(fluid: string): string {
   return `${API_BASE}/fluids/${encodeURIComponent(fluid)}/saturation/csv`
 }
+
+// ── Simulation ────────────────────────────────────────────────────
+export type SimNode = { id: string; data: Record<string, unknown> }
+export type SimEdge = { id: string; source: string; target: string }
+
+export type TankResult = {
+  label: string
+  equipType: 'tank'
+  level: number[]
+  volume: number[]
+  area: number
+  height: number
+}
+export type EquipResult = { label: string; equipType: string; flowRate: number[] }
+export type SimResults = {
+  time: number[]
+  results: Record<string, TankResult | EquipResult>
+  fluid: string
+  rho: number
+}
+
+export async function runSimulate(payload: {
+  nodes: SimNode[]
+  edges: SimEdge[]
+  duration: number
+  dt: number
+  fluid: string
+}): Promise<SimResults> {
+  const res = await fetch(`${API_BASE}/simulate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error((err as { detail?: string }).detail ?? 'シミュレーションに失敗しました')
+  }
+  return res.json()
+}
