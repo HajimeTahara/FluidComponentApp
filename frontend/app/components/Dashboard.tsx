@@ -5,12 +5,14 @@ import { fetchFluids } from '@/app/lib/api'
 import SaturationChart from './SaturationChart'
 import PHDiagramChart from './PHDiagramChart'
 import PropertiesLookup from './PropertiesLookup'
+import PIDDiagram from './PIDDiagram'
 
-type Tab = 'data' | 'ph-diagram'
+type Tab = 'data' | 'ph-diagram' | 'pid'
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'data', label: '飽和特性・物性値' },
   { id: 'ph-diagram', label: 'pH線図' },
+  { id: 'pid', label: 'P&ID' },
 ]
 
 export default function Dashboard() {
@@ -36,7 +38,7 @@ export default function Dashboard() {
 
         {backendError ? (
           <span className="text-red-500 text-sm">{backendError}</span>
-        ) : (
+        ) : tab !== 'pid' ? (
           <div className="flex items-center gap-2">
             <label htmlFor="fluid-select" className="text-sm text-gray-500 shrink-0">
               液種:
@@ -56,7 +58,7 @@ export default function Dashboard() {
               </select>
             )}
           </div>
-        )}
+        ) : null}
       </header>
 
       {/* Tabs */}
@@ -111,6 +113,7 @@ export default function Dashboard() {
               </div>
             )}
             {tab === 'ph-diagram' && <PHDiagramChart fluid={fluid} />}
+            {tab === 'pid' && <PIDDiagram />}
           </>
         )}
       </main>
