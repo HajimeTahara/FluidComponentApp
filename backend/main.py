@@ -1,3 +1,4 @@
+from collections import defaultdict
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -7,6 +8,7 @@ import CoolProp.CoolProp as CP
 import numpy as np
 import pandas as pd
 from scipy.integrate import solve_ivp
+from scipy.optimize import brentq
 import io
 
 app = FastAPI(title="Fluid Properties API", version="0.1.0")
@@ -435,6 +437,243 @@ def simulate(req: SimRequest):
         }
 
     return {"time": sol.t.tolist(), "results": results, "fluid": req.fluid, "rho": rho}
+
+
+class PressureDropRequest(BaseModel):
+    pipe_type: str = "circular"
+    diameter: float = 0.1          # [m] 円管内径
+    width: float = 0.1             # [m] 矩形管幅
+    duct_height: float = 0.05      # [m] 矩形管高さ
+    outer_diameter: float = 0.1    # [m] 環状管外径
+    inner_diameter: float = 0.05   # [m] 環状管内径
+    length: float = 100.0          # [m] 配管長
+    roughness: float = 4.6e-5      # [m] 表面粗さ（商業鋼管デフォルト 0.046 mm）
+    density: float = 1000.0        # [kg/m³]
+    viscosity: float = 0.001       # [Pa·s]
+    friction_method: str = "colebrook"
+    flow_rate_min: float = 1.0     # [m³/h]
+    flow_rate_max: float = 100.0   # [m³/h]
+    points: int = 80
+
+
+def _darcy_friction_turbulent(method: str, Re: float, eps: float, D_h: float) -> float:
+    """乱流域のダルシー摩擦係数を返す"""
+    if method == "blasius":
+        return 0.316 * Re ** (-0.25)
+    # Colebrook-White: 1/√f = -2 log10(ε/(3.7 Dh) + 2.51/(Re √f))
+    eps_D = eps / D_h
+
+    def eq(f: float) -> float:
+        return 1.0 / np.sqrt(f) + 2.0 * np.log10(eps_D / 3.7 + 2.51 / (Re * np.sqrt(f)))
+
+    try:
+        return brentq(eq, 1e-6, 0.5, xtol=1e-10)
+    except Exception:
+        # Swamee-Jain 近似式にフォールバック
+        return 0.25 / (np.log10(eps_D / 3.7 + 5.74 / Re ** 0.9)) ** 2
+
+
+@app.post("/pressure-drop")
+def calc_pressure_drop(req: PressureDropRequest):
+    """Darcy-Weisbach 式で流量–圧力損失特性を計算する"""
+    pt = req.pipe_type
+    if pt == "circular":
+        A = np.pi * req.diameter ** 2 / 4.0
+        D_h = req.diameter
+    elif pt == "rectangular":
+        w, h = req.width, req.duct_height
+        if w <= 0 or h <= 0:
+            raise HTTPException(status_code=400, detail="幅・高さは正の値を入力してください")
+        A = w * h
+        D_h = 2.0 * w * h / (w + h)
+    elif pt == "annulus":
+        D_o, D_i = req.outer_diameter, req.inner_diameter
+        if D_i >= D_o:
+            raise HTTPException(status_code=400, detail="内径は外径より小さくしてください")
+        A = np.pi / 4.0 * (D_o ** 2 - D_i ** 2)
+        D_h = D_o - D_i
+    else:
+        raise HTTPException(status_code=400, detail=f"不明な管タイプ: {pt}")
+
+    if A <= 0 or D_h <= 0:
+        raise HTTPException(status_code=400, detail="ジオメトリが不正です")
+
+    eps = req.roughness
+    rho = req.density
+    mu = req.viscosity
+    L = req.length
+    nu = mu / rho  # 動粘度 [m²/s]
+
+    flow_rates = np.linspace(req.flow_rate_min, req.flow_rate_max, req.points)
+    q_list, v_list, re_list, f_list, dp_list, regime_list = [], [], [], [], [], []
+
+    for Q_m3h in flow_rates:
+        Q_m3s = Q_m3h / 3600.0
+        v = Q_m3s / A
+        Re = rho * v * D_h / mu if mu > 0 else 0.0
+
+        if Re < 1e-3:
+            f, regime = 0.0, "laminar"
+        elif Re < 2300.0:
+            f, regime = 64.0 / Re, "laminar"
+        elif Re < 4000.0:
+            f_lam = 64.0 / 2300.0
+            f_turb = _darcy_friction_turbulent(req.friction_method, 4000.0, eps, D_h)
+            alpha = (Re - 2300.0) / 1700.0
+            f, regime = f_lam * (1.0 - alpha) + f_turb * alpha, "transitional"
+        else:
+            f, regime = _darcy_friction_turbulent(req.friction_method, Re, eps, D_h), "turbulent"
+
+        dP = f * (L / D_h) * (rho * v ** 2 / 2.0)
+
+        q_list.append(round(float(Q_m3h), 4))
+        v_list.append(round(float(v), 4))
+        re_list.append(round(float(Re), 2))
+        f_list.append(round(float(f), 8))
+        dp_list.append(round(float(dP), 4))
+        regime_list.append(regime)
+
+    Q_lam = 2300.0 * nu * A / D_h * 3600.0
+    Q_turb = 4000.0 * nu * A / D_h * 3600.0
+
+    return {
+        "flow_rates": q_list,
+        "velocities": v_list,
+        "reynolds": re_list,
+        "friction_factors": f_list,
+        "pressure_drops": dp_list,
+        "regimes": regime_list,
+        "hydraulic_diameter_mm": round(float(D_h) * 1000, 3),
+        "cross_section_area_mm2": round(float(A) * 1e6, 3),
+        "q_lam_turb": [round(float(Q_lam), 4), round(float(Q_turb), 4)],
+    }
+
+
+class PipeNetworkNode(BaseModel):
+    id: str
+    node_type: str
+    params: dict[str, Any] = {}
+
+class PipeNetworkEdge(BaseModel):
+    id: str
+    source: str
+    target: str
+    source_handle: str | None = None
+    target_handle: str | None = None
+
+class PipeNetworkRequest(BaseModel):
+    nodes: list[PipeNetworkNode]
+    edges: list[PipeNetworkEdge]
+    density: float = 1000.0
+    viscosity: float = 0.001
+    friction_method: str = "colebrook"
+
+
+def _calc_pipe_segment(params: dict, Q_m3s: float, rho: float, mu: float, method: str) -> dict:
+    # Per-pipe friction method overrides the global default
+    method    = params.get("frictionMethod", method)
+    pipe_shape = params.get("pipeShape", "circular")
+    L         = float(params.get("length",    50))
+    eps       = float(params.get("roughness", 0.046)) / 1000  # mm → m
+
+    if pipe_shape == "annulus":
+        Do  = float(params.get("outerDiameter", 100)) / 1000
+        Di  = float(params.get("innerDiameter",  50)) / 1000
+        D_h = Do - Di
+        A   = np.pi * (Do ** 2 - Di ** 2) / 4.0
+    elif pipe_shape == "rectangular":
+        W   = float(params.get("width",       100)) / 1000
+        H   = float(params.get("ductHeight",   50)) / 1000
+        D_h = 2 * W * H / (W + H) if (W + H) > 0 else 0.0
+        A   = W * H
+    else:  # circular
+        D   = float(params.get("diameter", 100)) / 1000
+        D_h = D
+        A   = np.pi * D ** 2 / 4.0
+
+    if D_h <= 0 or A <= 0 or Q_m3s <= 0:
+        return {"Q_m3h": 0, "v": 0, "Re": 0, "f": 0, "dP_kpa": 0, "regime": "laminar"}
+
+    v  = Q_m3s / A
+    Re = rho * v * D_h / mu if mu > 0 else 0.0
+
+    if Re < 1e-3:
+        f, regime = 0.0, "laminar"
+    elif Re < 2300.0:
+        f, regime = 64.0 / Re, "laminar"
+    elif Re < 4000.0:
+        f_l = 64.0 / 2300.0
+        f_t = _darcy_friction_turbulent(method, 4000.0, eps, D_h)
+        f   = f_l + (f_t - f_l) * (Re - 2300.0) / 1700.0
+        regime = "transitional"
+    else:
+        f  = _darcy_friction_turbulent(method, Re, eps, D_h)
+        regime = "turbulent"
+
+    dP = f * (L / D_h) * (rho * v ** 2 / 2.0)
+    return {
+        "Q_m3h":  round(Q_m3s * 3600, 4),
+        "v":      round(v, 4),
+        "Re":     round(Re, 2),
+        "f":      round(f, 8),
+        "dP_kpa": round(dP / 1000, 6),
+        "regime": regime,
+    }
+
+
+@app.post("/pipe-network")
+def calc_pipe_network(req: PipeNetworkRequest):
+    """パイプネットワークを BFS で辿り各管の圧損を計算し、ソース必要圧力を返す"""
+    nodes_dict = {n.id: n for n in req.nodes}
+    outgoing: dict[str, list[tuple[str, str | None]]] = defaultdict(list)
+    for e in req.edges:
+        outgoing[e.source].append((e.target, e.source_handle))
+
+    rho, mu = req.density, req.viscosity
+    results: dict[str, Any] = {}
+    source_pressures: dict[str, float] = {}
+
+    for src in (n for n in req.nodes if n.node_type == "source"):
+        Q_total = float(src.params.get("flowRate", 10.0)) / 3600.0
+        # queue: (node_id, Q_m3s, cumulative_dP_kpa from source to this node's inlet)
+        queue: list[tuple[str, float, float]] = [(src.id, Q_total, 0.0)]
+        visited: set[str] = set()
+
+        while queue:
+            nid, Q, cum_dp = queue.pop(0)
+            if nid in visited:
+                continue
+            visited.add(nid)
+            node = nodes_dict.get(nid)
+            if not node:
+                continue
+
+            next_cum_dp = cum_dp
+            if node.node_type == "pipe":
+                seg = _calc_pipe_segment(node.params, Q, rho, mu, req.friction_method)
+                results[nid] = seg
+                next_cum_dp = cum_dp + seg["dP_kpa"]
+            elif node.node_type == "sink":
+                sink_p = float(node.params.get("pressure", 0.0))  # kPa
+                req_src_p = sink_p + cum_dp
+                source_pressures[src.id] = max(source_pressures.get(src.id, 0.0), req_src_p)
+
+            downstream = outgoing[nid]
+            n_down = len(downstream)
+            if n_down == 0:
+                continue
+
+            if node.node_type == "tee" and n_down >= 2:
+                ratio  = float(node.params.get("splitRatio", 0.5))
+                others = (1.0 - ratio) / max(1, n_down - 1)
+                ratios = [ratio] + [others] * (n_down - 1)
+                for (tid, _), r in zip(downstream, ratios):
+                    queue.append((tid, Q * r, next_cum_dp))
+            else:
+                for tid, _ in downstream:
+                    queue.append((tid, Q, next_cum_dp))
+
+    return {"nodes": results, "source_pressures": source_pressures}
 
 
 @app.get("/fluids/{fluid}/saturation/csv")

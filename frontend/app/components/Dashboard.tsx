@@ -6,13 +6,15 @@ import SaturationChart from './SaturationChart'
 import PHDiagramChart from './PHDiagramChart'
 import PropertiesLookup from './PropertiesLookup'
 import PIDDiagram from './PIDDiagram'
+import PipeNetworkCalc from './PipeNetworkCalc'
 
-type Tab = 'data' | 'ph-diagram' | 'pid'
+type Tab = 'data' | 'ph-diagram' | 'pid' | 'pressure-drop'
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'data', label: '飽和特性・物性値' },
   { id: 'ph-diagram', label: 'pH線図' },
   { id: 'pid', label: 'P&ID' },
+  { id: 'pressure-drop', label: '圧損計算' },
 ]
 
 export default function Dashboard() {
@@ -38,7 +40,7 @@ export default function Dashboard() {
 
         {backendError ? (
           <span className="text-red-500 text-sm">{backendError}</span>
-        ) : tab !== 'pid' ? (
+        ) : tab !== 'pid' && tab !== 'pressure-drop' ? (
           <div className="flex items-center gap-2">
             <label htmlFor="fluid-select" className="text-sm text-gray-500 shrink-0">
               液種:
@@ -114,6 +116,7 @@ export default function Dashboard() {
             )}
             {tab === 'ph-diagram' && <PHDiagramChart fluid={fluid} />}
             {tab === 'pid' && <PIDDiagram />}
+            {tab === 'pressure-drop' && <PipeNetworkCalc />}
           </>
         )}
       </main>

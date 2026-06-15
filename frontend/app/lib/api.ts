@@ -102,6 +102,95 @@ export type SimResults = {
   rho: number
 }
 
+// ── Pressure Drop Calculation ────────────────────────────────────
+export type PressureDropRequest = {
+  pipe_type: 'circular' | 'rectangular' | 'annulus'
+  diameter?: number
+  width?: number
+  duct_height?: number
+  outer_diameter?: number
+  inner_diameter?: number
+  length: number
+  roughness: number
+  density: number
+  viscosity: number
+  friction_method: 'colebrook' | 'blasius'
+  flow_rate_min: number
+  flow_rate_max: number
+  points?: number
+}
+
+export type PressureDropResult = {
+  flow_rates: number[]
+  velocities: number[]
+  reynolds: number[]
+  friction_factors: number[]
+  pressure_drops: number[]
+  regimes: string[]
+  hydraulic_diameter_mm: number
+  cross_section_area_mm2: number
+  q_lam_turb: [number, number]
+}
+
+export async function calcPressureDrop(payload: PressureDropRequest): Promise<PressureDropResult> {
+  const res = await fetch(`${API_BASE}/pressure-drop`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error((err as { detail?: string }).detail ?? '圧損計算に失敗しました')
+  }
+  return res.json()
+}
+
+// ── Pipe Network Calculation ──────────────────────────────────────
+export type PipeNetworkNodePayload = {
+  id: string
+  node_type: string
+  params: Record<string, unknown>
+}
+export type PipeNetworkEdgePayload = {
+  id: string
+  source: string
+  target: string
+  source_handle: string | null
+  target_handle: string | null
+}
+export type PipeNetworkPayload = {
+  nodes: PipeNetworkNodePayload[]
+  edges: PipeNetworkEdgePayload[]
+  density: number
+  viscosity: number
+  friction_method?: string  // global fallback; per-pipe frictionMethod in params takes precedence
+}
+export type PipeSegmentResult = {
+  Q_m3h: number
+  v: number
+  Re: number
+  f: number
+  dP_kpa: number
+  regime: string
+}
+export type PipeNetworkResult = {
+  nodes: Record<string, PipeSegmentResult>
+  source_pressures: Record<string, number>  // sourceNodeId → required inlet pressure kPa
+}
+
+export async function calcPipeNetwork(payload: PipeNetworkPayload): Promise<PipeNetworkResult> {
+  const res = await fetch(`${API_BASE}/pipe-network`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error((err as { detail?: string }).detail ?? 'ネットワーク圧損計算に失敗しました')
+  }
+  return res.json()
+}
+
 export async function runSimulate(payload: {
   nodes: SimNode[]
   edges: SimEdge[]
