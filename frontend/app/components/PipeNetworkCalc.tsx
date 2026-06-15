@@ -14,6 +14,7 @@ import {
   ReactFlowProvider,
   Handle,
   Position,
+  MarkerType,
   type Node,
   type Edge,
   type Connection,
@@ -192,16 +193,20 @@ function SinkNode({ data, selected }: NodeProps) {
       </div>
       {isPressure ? (
         <>
-          <div className="text-xs text-rose-400">P: {d.pressure ?? 0} kPa</div>
+          <div className="text-xs text-rose-400">P出口: {d.pressure ?? 0} kPa</div>
           {d.result && (
-            <div className="text-xs font-bold text-blue-600">Q着: {d.result.Q_m3h.toFixed(2)} m³/h</div>
+            <div className="text-xs font-bold text-blue-600">Q: {d.result.Q_m3h.toFixed(2)} m³/h</div>
           )}
         </>
       ) : (
         <>
-          <div className="text-xs text-rose-400">目標: {d.flowRate ?? 10} m³/h</div>
+          <div className="text-xs text-rose-400">Q目標: {d.flowRate ?? 10} m³/h</div>
           {d.result && (
-            <div className="text-xs font-bold text-blue-600">実際: {d.result.Q_m3h.toFixed(2)} m³/h</div>
+            <div className="text-xs font-bold text-blue-600">
+              {d.result.P_kpa !== undefined
+                ? `P入口: ${d.result.P_kpa.toFixed(1)} kPa`
+                : `Q: ${d.result.Q_m3h.toFixed(2)} m³/h`}
+            </div>
           )}
         </>
       )}
@@ -469,7 +474,7 @@ function NodeParamPanel({ node, onChange }: {
           )}
         </>) : (<>
           <NumField label="目標流量 Q" unit="m³/h" value={d.flowRate ?? 10} onChange={v => onChange({ flowRate: v })} />
-          {d.result && (
+          {d.result && (<>
             <div className="bg-rose-50 rounded-lg p-4 border border-rose-100">
               <div className="text-xs font-semibold text-rose-500 mb-1">計算結果 — 実際流量</div>
               <div className="text-2xl font-bold text-rose-700 tabular-nums">
@@ -477,7 +482,16 @@ function NodeParamPanel({ node, onChange }: {
                 <span className="text-sm font-normal text-rose-500 ml-1">m³/h</span>
               </div>
             </div>
-          )}
+            {d.result.P_kpa !== undefined && (
+              <div className="bg-blue-50 rounded-lg p-4 border border-blue-100">
+                <div className="text-xs font-semibold text-blue-500 mb-1">計算結果 — 入口圧力</div>
+                <div className="text-2xl font-bold text-blue-700 tabular-nums">
+                  {d.result.P_kpa.toFixed(2)}
+                  <span className="text-sm font-normal text-blue-500 ml-1">kPa</span>
+                </div>
+              </div>
+            )}
+          </>)}
         </>)}
       </>)}
     </div>
@@ -725,6 +739,7 @@ function PipeNetworkCalcInner() {
       ...conn,
       type: 'smoothstep',
       style: { stroke: '#94a3b8', strokeWidth: 2 },
+      markerEnd: { type: MarkerType.ArrowClosed, color: '#94a3b8', width: 16, height: 16 },
     }, prev))
   }, [setEdges])
 
