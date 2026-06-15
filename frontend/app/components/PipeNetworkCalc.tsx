@@ -44,8 +44,10 @@ type NetworkNodeData = {
   nodeType: 'source' | 'pipe' | 'tee' | 'sink'
   label: string
   // source
+  sourceType?: 'flow' | 'pressure'
   flowRate?: number
-  calcPressure?: number   // filled after calc: required inlet pressure kPa
+  calcPressure?: number   // flow-source after calc: required inlet pressure kPa
+  calcFlow?: number       // pressure-source after calc: computed flow m³/h
   // pipe
   pipeShape?: PipeShape
   diameter?: number       // circular: mm
@@ -56,10 +58,10 @@ type NetworkNodeData = {
   length?: number         // m
   roughness?: number      // mm
   frictionMethod?: 'colebrook' | 'blasius'
-  // tee
-  splitRatio?: number
+  // tee (flow split is physics-based; no manual parameter)
   // sink
-  pressure?: number       // outlet reference pressure kPa
+  sinkType?: 'pressure' | 'flow'
+  pressure?: number       // pressure-sink: outlet back-pressure kPa; pressure-source: inlet pressure kPa
   // result
   result?: PipeSegmentResult
   [key: string]: unknown
@@ -109,15 +111,27 @@ function SvgSink({ className = '' }) {
 
 function SourceNode({ data, selected }: NodeProps) {
   const d = data as unknown as NetworkNodeData
+  const isFlow = (d.sourceType ?? 'flow') === 'flow'
   return (
-    <div className={`px-3 py-2 rounded-xl border-2 bg-emerald-50 min-w-[110px] ${selected ? 'border-blue-500 shadow-lg' : 'border-emerald-500'}`}>
+    <div className={`px-3 py-2 rounded-xl border-2 bg-emerald-50 min-w-[120px] ${selected ? 'border-blue-500 shadow-lg' : 'border-emerald-500'}`}>
       <div className="flex items-center gap-1.5 mb-0.5">
         <SvgSource className="w-4 h-4 text-emerald-600 shrink-0" />
         <span className="text-xs font-bold text-emerald-700">{d.label}</span>
       </div>
-      <div className="text-xs text-emerald-600 pl-5">{d.flowRate ?? 10} m³/h</div>
-      {d.calcPressure !== undefined && (
-        <div className="text-xs font-bold text-blue-600 pl-5">P: {d.calcPressure.toFixed(1)} kPa</div>
+      {isFlow ? (
+        <>
+          <div className="text-xs text-emerald-600 pl-5">Q: {d.flowRate ?? 10} m³/h</div>
+          {d.calcPressure !== undefined && (
+            <div className="text-xs font-bold text-blue-600 pl-5">P入口: {d.calcPressure.toFixed(1)} kPa</div>
+          )}
+        </>
+      ) : (
+        <>
+          <div className="text-xs text-emerald-600 pl-5">P: {d.pressure ?? 100} kPa</div>
+          {d.calcFlow !== undefined && (
+            <div className="text-xs font-bold text-blue-600 pl-5">Q: {d.calcFlow.toFixed(2)} m³/h</div>
+          )}
+        </>
       )}
       <Handle type="source" position={Position.Right} style={{ background: '#10b981' }} />
     </div>
@@ -145,16 +159,21 @@ function PipeNode({ data, selected }: NodeProps) {
 
 function TeeNode({ data, selected }: NodeProps) {
   const d = data as unknown as NetworkNodeData
+  const r = d.result
   return (
-    <div className={`px-3 py-3 rounded border-2 bg-amber-50 min-w-[100px] text-center ${selected ? 'border-blue-500 shadow-lg' : 'border-amber-400'}`}>
+    <div className={`px-3 py-3 rounded border-2 bg-amber-50 min-w-[110px] text-center ${selected ? 'border-blue-500 shadow-lg' : 'border-amber-400'}`}>
       <Handle type="target" position={Position.Left} id="in" style={{ background: '#f59e0b' }} />
       <div className="flex items-center justify-center gap-1.5 mb-0.5">
         <SvgTee className="w-4 h-4 text-amber-600 shrink-0" />
         <span className="text-xs font-bold text-amber-700">{d.label}</span>
       </div>
-      <div className="text-xs text-amber-500">
-        {Math.round((d.splitRatio ?? 0.5) * 100)} / {100 - Math.round((d.splitRatio ?? 0.5) * 100)}
-      </div>
+      {r?.regime === 'split' ? (
+        <div className="text-xs text-amber-600 font-medium tabular-nums">
+          {r.Q1_m3h?.toFixed(2)} / {r.Q2_m3h?.toFixed(2)} m³/h
+        </div>
+      ) : (
+        <div className="text-xs text-amber-400">圧損バランス分配</div>
+      )}
       <Handle type="source" position={Position.Right} id="out-1" style={{ background: '#f59e0b' }} />
       <Handle type="source" position={Position.Bottom} id="out-2" style={{ background: '#f59e0b', left: '50%' }} />
     </div>
@@ -163,14 +182,29 @@ function TeeNode({ data, selected }: NodeProps) {
 
 function SinkNode({ data, selected }: NodeProps) {
   const d = data as unknown as NetworkNodeData
+  const isPressure = (d.sinkType ?? 'pressure') === 'pressure'
   return (
-    <div className={`px-3 py-2 rounded-xl border-2 bg-rose-50 min-w-[90px] ${selected ? 'border-blue-500 shadow-lg' : 'border-rose-400'}`}>
+    <div className={`px-3 py-2 rounded-xl border-2 bg-rose-50 min-w-[110px] ${selected ? 'border-blue-500 shadow-lg' : 'border-rose-400'}`}>
       <Handle type="target" position={Position.Left} style={{ background: '#fb7185' }} />
       <div className="flex items-center gap-1.5 mb-0.5">
         <SvgSink className="w-4 h-4 text-rose-500 shrink-0" />
         <span className="text-xs font-bold text-rose-700">{d.label}</span>
       </div>
-      <div className="text-xs text-rose-400">P: {d.pressure ?? 0} kPa</div>
+      {isPressure ? (
+        <>
+          <div className="text-xs text-rose-400">P: {d.pressure ?? 0} kPa</div>
+          {d.result && (
+            <div className="text-xs font-bold text-blue-600">Q着: {d.result.Q_m3h.toFixed(2)} m³/h</div>
+          )}
+        </>
+      ) : (
+        <>
+          <div className="text-xs text-rose-400">目標: {d.flowRate ?? 10} m³/h</div>
+          {d.result && (
+            <div className="text-xs font-bold text-blue-600">実際: {d.result.Q_m3h.toFixed(2)} m³/h</div>
+          )}
+        </>
+      )}
     </div>
   )
 }
@@ -189,7 +223,7 @@ const PALETTE = [
 
 function defaultData(type: string, n: number): NetworkNodeData {
   switch (type) {
-    case 'source': return { nodeType: 'source', label: `ソース${n}`, flowRate: 10 }
+    case 'source': return { nodeType: 'source', label: `ソース${n}`, sourceType: 'flow', flowRate: 10, pressure: 100 }
     case 'pipe':   return {
       nodeType: 'pipe', label: `パイプ${n}`,
       pipeShape: 'circular',
@@ -198,8 +232,8 @@ function defaultData(type: string, n: number): NetworkNodeData {
       length: 50, roughness: 0.046,
       frictionMethod: 'colebrook',
     }
-    case 'tee':  return { nodeType: 'tee',  label: `T字管${n}`,  splitRatio: 0.5 }
-    case 'sink': return { nodeType: 'sink', label: `シンク${n}`, pressure: 0 }
+    case 'tee':  return { nodeType: 'tee',  label: `T字管${n}` }
+    case 'sink': return { nodeType: 'sink', label: `シンク${n}`, sinkType: 'pressure', pressure: 0, flowRate: 10 }
     default:     return { nodeType: 'sink', label: `${type}${n}`, pressure: 0 }
   }
 }
@@ -274,16 +308,47 @@ function NodeParamPanel({ node, onChange }: {
 
       {/* ── Source ── */}
       {d.nodeType === 'source' && (<>
-        <NumField label="流量 Q" unit="m³/h" value={d.flowRate ?? 10} onChange={v => onChange({ flowRate: v })} />
-        {d.calcPressure !== undefined && (
-          <div className="bg-blue-50 rounded-lg p-4 border border-blue-100">
-            <div className="text-xs font-semibold text-blue-500 mb-1">計算結果 — 必要入口圧力</div>
-            <div className="text-2xl font-bold text-blue-700 tabular-nums">
-              {d.calcPressure.toFixed(2)}
-              <span className="text-sm font-normal text-blue-500 ml-1">kPa</span>
-            </div>
+        <div className="flex flex-col gap-1.5">
+          <label className="text-xs font-medium text-gray-600">ソース種別</label>
+          <div className="flex gap-4">
+            {(['flow', 'pressure'] as const).map(t => (
+              <label key={t} className="flex items-center gap-1.5 text-sm cursor-pointer select-none">
+                <input
+                  type="radio"
+                  name={`sourceType-${node.id}`}
+                  value={t}
+                  checked={(d.sourceType ?? 'flow') === t}
+                  onChange={() => onChange({ sourceType: t })}
+                />
+                {t === 'flow' ? '流量ソース' : '圧力ソース'}
+              </label>
+            ))}
           </div>
-        )}
+        </div>
+
+        {(d.sourceType ?? 'flow') === 'flow' ? (<>
+          <NumField label="流量 Q" unit="m³/h" value={d.flowRate ?? 10} onChange={v => onChange({ flowRate: v })} />
+          {d.calcPressure !== undefined && (
+            <div className="bg-blue-50 rounded-lg p-4 border border-blue-100">
+              <div className="text-xs font-semibold text-blue-500 mb-1">計算結果 — 必要入口圧力</div>
+              <div className="text-2xl font-bold text-blue-700 tabular-nums">
+                {d.calcPressure.toFixed(2)}
+                <span className="text-sm font-normal text-blue-500 ml-1">kPa</span>
+              </div>
+            </div>
+          )}
+        </>) : (<>
+          <NumField label="ソース圧力 P" unit="kPa" value={d.pressure ?? 100} onChange={v => onChange({ pressure: v })} />
+          {d.calcFlow !== undefined && (
+            <div className="bg-blue-50 rounded-lg p-4 border border-blue-100">
+              <div className="text-xs font-semibold text-blue-500 mb-1">計算結果 — 通過流量</div>
+              <div className="text-2xl font-bold text-blue-700 tabular-nums">
+                {d.calcFlow.toFixed(3)}
+                <span className="text-sm font-normal text-blue-500 ml-1">m³/h</span>
+              </div>
+            </div>
+          )}
+        </>)}
       </>)}
 
       {/* ── Pipe ── */}
@@ -339,25 +404,82 @@ function NodeParamPanel({ node, onChange }: {
 
       {/* ── Tee ── */}
       {d.nodeType === 'tee' && (
-        <div className="flex flex-col gap-3">
-          <label className="text-xs font-medium text-gray-600">流量分割比（右 / 下）</label>
-          <input
-            type="range" min="0" max="100"
-            value={Math.round((d.splitRatio ?? 0.5) * 100)}
-            onChange={e => onChange({ splitRatio: parseInt(e.target.value) / 100 })}
-            className="w-full accent-amber-500"
-          />
-          <div className="flex justify-between text-sm font-semibold">
-            <span className="text-amber-600">右: {Math.round((d.splitRatio ?? 0.5) * 100)}%</span>
-            <span className="text-amber-600">下: {100 - Math.round((d.splitRatio ?? 0.5) * 100)}%</span>
+        d.result?.regime === 'split' ? (
+          <div className="bg-amber-50 rounded-lg p-4 border border-amber-100 flex flex-col gap-2">
+            <div className="text-xs font-semibold text-amber-600 mb-1">計算結果 — 圧損バランス分配</div>
+            {[
+              { label: '入口流量 Q',      value: d.result.Q_m3h.toFixed(3),             unit: 'm³/h' },
+              { label: '右出口 Q₁',       value: d.result.Q1_m3h?.toFixed(3) ?? '—',    unit: 'm³/h', accent: true },
+              { label: '下出口 Q₂',       value: d.result.Q2_m3h?.toFixed(3) ?? '—',    unit: 'm³/h', accent: true },
+              { label: '分配比 Q₁ : Q₂',  value: (d.result.Q1_m3h != null && d.result.Q2_m3h != null)
+                  ? `${(d.result.Q1_m3h / d.result.Q_m3h * 100).toFixed(1)} : ${(d.result.Q2_m3h / d.result.Q_m3h * 100).toFixed(1)} %`
+                  : '—',
+                unit: '' },
+            ].map(row => (
+              <div key={row.label} className="flex justify-between items-baseline gap-2">
+                <span className="text-xs text-gray-500 shrink-0">{row.label}</span>
+                <span className={`text-sm tabular-nums font-medium ${row.accent ? 'text-amber-700 font-bold' : 'text-gray-800'}`}>
+                  {row.value}{row.unit ? ` ${row.unit}` : ''}
+                </span>
+              </div>
+            ))}
           </div>
-        </div>
+        ) : (
+          <div className="bg-amber-50 rounded-lg p-4 border border-amber-100 text-center flex flex-col items-center gap-2">
+            <SvgTee className="w-8 h-8 text-amber-400" />
+            <p className="text-sm font-medium text-amber-600">圧損バランス自動分配</p>
+            <p className="text-xs text-gray-400 leading-relaxed">
+              下流の配管抵抗が等しくなるよう流量を自動分配します。
+              「計算開始」で分配結果を確認できます。
+            </p>
+          </div>
+        )
       )}
 
       {/* ── Sink ── */}
-      {d.nodeType === 'sink' && (
-        <NumField label="出口圧力 P" unit="kPa" value={d.pressure ?? 0} onChange={v => onChange({ pressure: v })} />
-      )}
+      {d.nodeType === 'sink' && (<>
+        <div className="flex flex-col gap-1.5">
+          <label className="text-xs font-medium text-gray-600">シンク種別</label>
+          <div className="flex gap-4">
+            {(['pressure', 'flow'] as const).map(t => (
+              <label key={t} className="flex items-center gap-1.5 text-sm cursor-pointer select-none">
+                <input
+                  type="radio"
+                  name={`sinkType-${node.id}`}
+                  value={t}
+                  checked={(d.sinkType ?? 'pressure') === t}
+                  onChange={() => onChange({ sinkType: t })}
+                />
+                {t === 'pressure' ? '圧力シンク' : '流量シンク'}
+              </label>
+            ))}
+          </div>
+        </div>
+
+        {(d.sinkType ?? 'pressure') === 'pressure' ? (<>
+          <NumField label="出口圧力 P" unit="kPa" value={d.pressure ?? 0} onChange={v => onChange({ pressure: v })} />
+          {d.result && (
+            <div className="bg-rose-50 rounded-lg p-4 border border-rose-100">
+              <div className="text-xs font-semibold text-rose-500 mb-1">計算結果 — 到達流量</div>
+              <div className="text-2xl font-bold text-rose-700 tabular-nums">
+                {d.result.Q_m3h.toFixed(3)}
+                <span className="text-sm font-normal text-rose-500 ml-1">m³/h</span>
+              </div>
+            </div>
+          )}
+        </>) : (<>
+          <NumField label="目標流量 Q" unit="m³/h" value={d.flowRate ?? 10} onChange={v => onChange({ flowRate: v })} />
+          {d.result && (
+            <div className="bg-rose-50 rounded-lg p-4 border border-rose-100">
+              <div className="text-xs font-semibold text-rose-500 mb-1">計算結果 — 実際流量</div>
+              <div className="text-2xl font-bold text-rose-700 tabular-nums">
+                {d.result.Q_m3h.toFixed(3)}
+                <span className="text-sm font-normal text-rose-500 ml-1">m³/h</span>
+              </div>
+            </div>
+          )}
+        </>)}
+      </>)}
     </div>
   )
 }
@@ -640,14 +762,16 @@ function PipeNetworkCalcInner() {
 
       setNodes(prev => prev.map(n => {
         const d = n.data as unknown as NetworkNodeData
-        const pipeResult  = res.nodes[n.id]
+        const nodeResult  = res.nodes[n.id]
         const srcPressure = res.source_pressures[n.id]
+        const srcFlow     = res.source_flows[n.id]
         return {
           ...n,
           data: {
             ...d,
-            ...(pipeResult  !== undefined ? { result: pipeResult }          : {}),
+            ...(nodeResult  !== undefined ? { result: nodeResult }          : {}),
             ...(srcPressure !== undefined ? { calcPressure: srcPressure }   : {}),
+            ...(srcFlow     !== undefined ? { calcFlow: srcFlow }           : {}),
           } as NetworkNodeData,
         }
       }))
@@ -706,7 +830,7 @@ function PipeNetworkCalcInner() {
             disabled={loading || nodes.length === 0}
             className="bg-blue-600 hover:bg-blue-700 text-white text-sm px-5 py-2 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
           >
-            {loading ? '計算中...' : '圧損を計算'}
+            {loading ? '計算中...' : '計算開始'}
           </button>
           {error && <span className="text-sm text-red-500">{error}</span>}
 

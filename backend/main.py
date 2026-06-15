@@ -621,9 +621,76 @@ def _calc_pipe_segment(params: dict, Q_m3s: float, rho: float, mu: float, method
     }
 
 
+def _path_total_backpressure(
+    start_id: str,
+    Q_m3s: float,
+    nodes_dict: dict,
+    outgoing: dict,
+    rho: float,
+    mu: float,
+    method: str,
+    visited: frozenset = frozenset(),
+) -> float:
+    """
+    T字管の流量分配を求めるためのヘルパー。
+    start_id から辿った経路の「合計背圧」(kPa) を返す。
+    合計背圧 = 経路上の全配管 ΔP の和 + 末端シンクの圧力
+    """
+    total = 0.0
+    nid = start_id
+    local_v = set(visited)
+
+    while nid and nid not in local_v:
+        local_v.add(nid)
+        node = nodes_dict.get(nid)
+        if not node:
+            break
+
+        if node.node_type == "pipe":
+            seg = _calc_pipe_segment(node.params, Q_m3s, rho, mu, method)
+            total += seg["dP_kpa"]
+        elif node.node_type == "sink":
+            if node.params.get("sinkType", "pressure") == "pressure":
+                total += float(node.params.get("pressure", 0.0))
+            break
+
+        downstream = outgoing.get(nid, [])
+        n_down = len(downstream)
+        if n_down == 0:
+            break
+
+        if node.node_type == "tee" and n_down >= 2:
+            # ネスト T字管: 再帰的に圧損バランスを解く
+            tid1 = downstream[0][0]
+            tid2 = downstream[1][0]
+            fv = frozenset(local_v)
+
+            def nested_delta(q1: float) -> float:
+                bp1 = _path_total_backpressure(tid1, q1,         nodes_dict, outgoing, rho, mu, method, fv)
+                bp2 = _path_total_backpressure(tid2, Q_m3s - q1, nodes_dict, outgoing, rho, mu, method, fv)
+                return bp1 - bp2
+
+            try:
+                q1_opt = brentq(nested_delta, 1e-10 * Q_m3s, (1 - 1e-10) * Q_m3s,
+                                xtol=Q_m3s * 1e-8, maxiter=50)
+            except Exception:
+                q1_opt = Q_m3s * 0.5
+
+            # 解では bp1 == bp2 なのでどちらを足しても同じ
+            total += _path_total_backpressure(tid1, q1_opt, nodes_dict, outgoing, rho, mu, method, fv)
+            break
+        else:
+            nid = downstream[0][0]
+
+    return total
+
+
 @app.post("/pipe-network")
 def calc_pipe_network(req: PipeNetworkRequest):
-    """パイプネットワークを BFS で辿り各管の圧損を計算し、ソース必要圧力を返す"""
+    """パイプネットワークを BFS で辿り各管の圧損を計算する。
+    流量ソース: Q固定→必要入口圧力を計算。
+    圧力ソース: P固定→brentq で通過流量を逆算してから BFS。
+    """
     nodes_dict = {n.id: n for n in req.nodes}
     outgoing: dict[str, list[tuple[str, str | None]]] = defaultdict(list)
     for e in req.edges:
@@ -631,32 +698,85 @@ def calc_pipe_network(req: PipeNetworkRequest):
 
     rho, mu = req.density, req.viscosity
     results: dict[str, Any] = {}
-    source_pressures: dict[str, float] = {}
+    source_pressures: dict[str, float] = {}  # src.id → 入口圧力 kPa (流量ソース: 必要圧; 圧力ソース: 指定圧)
+    source_flows: dict[str, float] = {}      # src.id → 流量 m³/h (流量ソース: 指定値; 圧力ソース: 計算値)
 
     for src in (n for n in req.nodes if n.node_type == "source"):
-        Q_total = float(src.params.get("flowRate", 10.0)) / 3600.0
-        # queue: (node_id, Q_m3s, cumulative_dP_kpa from source to this node's inlet)
+        source_type = src.params.get("sourceType", "flow")
+
+        if source_type == "pressure":
+            P_in = float(src.params.get("pressure", 100.0))  # kPa
+            source_pressures[src.id] = round(P_in, 4)
+            first_down = outgoing.get(src.id, [])
+            if not first_down:
+                source_flows[src.id] = 0.0
+                continue
+            first_nid = first_down[0][0]
+            fv: frozenset = frozenset()
+
+            # Q_max を P_in を超えるまで倍々で拡大
+            Q_lo, Q_hi = 1e-8, 1.0
+            for _ in range(25):
+                try:
+                    bp_hi = _path_total_backpressure(first_nid, Q_hi, nodes_dict, outgoing, rho, mu, req.friction_method, fv)
+                except Exception:
+                    break
+                if bp_hi >= P_in:
+                    break
+                Q_hi *= 2.0
+
+            try:
+                def bp_eq(Q_m3s: float) -> float:
+                    return _path_total_backpressure(first_nid, Q_m3s, nodes_dict, outgoing, rho, mu, req.friction_method, fv) - P_in
+
+                bp_lo = _path_total_backpressure(first_nid, Q_lo, nodes_dict, outgoing, rho, mu, req.friction_method, fv)
+                if bp_lo >= P_in:
+                    Q_total = Q_lo  # 入口圧が低すぎて流れない
+                else:
+                    Q_total = brentq(bp_eq, Q_lo, Q_hi, xtol=1e-10, maxiter=100)
+            except Exception:
+                Q_total = Q_lo
+
+            source_flows[src.id] = round(Q_total * 3600, 4)
+        else:
+            Q_total = float(src.params.get("flowRate", 10.0)) / 3600.0
+            source_flows[src.id] = round(Q_total * 3600, 4)
+
+        # BFS: (node_id, Q [m³/s], cumulative ΔP [kPa] from source inlet)
         queue: list[tuple[str, float, float]] = [(src.id, Q_total, 0.0)]
         visited: set[str] = set()
 
         while queue:
             nid, Q, cum_dp = queue.pop(0)
-            if nid in visited:
-                continue
-            visited.add(nid)
             node = nodes_dict.get(nid)
             if not node:
                 continue
+
+            # シンクは複数経路から到達可能なので visited を使わず流量を累積
+            if node.node_type == "sink":
+                sink_type = node.params.get("sinkType", "pressure")
+                sink_p = float(node.params.get("pressure", 0.0)) if sink_type == "pressure" else 0.0
+                if source_type == "flow":
+                    req_src_p = sink_p + cum_dp
+                    source_pressures[src.id] = max(source_pressures.get(src.id, 0.0), req_src_p)
+                if nid in results:
+                    results[nid]["Q_m3h"] = round(results[nid]["Q_m3h"] + Q * 3600, 4)
+                else:
+                    results[nid] = {
+                        "Q_m3h": round(Q * 3600, 4), "P_kpa": round(sink_p, 4),
+                        "v": 0.0, "Re": 0.0, "f": 0.0, "dP_kpa": 0.0, "regime": "sink",
+                    }
+                continue
+
+            if nid in visited:
+                continue
+            visited.add(nid)
 
             next_cum_dp = cum_dp
             if node.node_type == "pipe":
                 seg = _calc_pipe_segment(node.params, Q, rho, mu, req.friction_method)
                 results[nid] = seg
                 next_cum_dp = cum_dp + seg["dP_kpa"]
-            elif node.node_type == "sink":
-                sink_p = float(node.params.get("pressure", 0.0))  # kPa
-                req_src_p = sink_p + cum_dp
-                source_pressures[src.id] = max(source_pressures.get(src.id, 0.0), req_src_p)
 
             downstream = outgoing[nid]
             n_down = len(downstream)
@@ -664,16 +784,34 @@ def calc_pipe_network(req: PipeNetworkRequest):
                 continue
 
             if node.node_type == "tee" and n_down >= 2:
-                ratio  = float(node.params.get("splitRatio", 0.5))
-                others = (1.0 - ratio) / max(1, n_down - 1)
-                ratios = [ratio] + [others] * (n_down - 1)
-                for (tid, _), r in zip(downstream, ratios):
-                    queue.append((tid, Q * r, next_cum_dp))
+                tid1, _ = downstream[0]
+                tid2, _ = downstream[1]
+                fv2 = frozenset(visited)
+
+                def delta_bp(q1: float, _Q: float = Q, _fv: frozenset = fv2) -> float:
+                    bp1 = _path_total_backpressure(tid1, q1,      nodes_dict, outgoing, rho, mu, req.friction_method, _fv)
+                    bp2 = _path_total_backpressure(tid2, _Q - q1, nodes_dict, outgoing, rho, mu, req.friction_method, _fv)
+                    return bp1 - bp2
+
+                try:
+                    q1_opt = brentq(delta_bp, 1e-10 * Q, (1 - 1e-10) * Q,
+                                    xtol=Q * 1e-8, maxiter=100)
+                except Exception:
+                    q1_opt = Q * 0.5
+
+                results[nid] = {
+                    "Q_m3h":  round(Q * 3600, 4),
+                    "Q1_m3h": round(q1_opt * 3600, 4),
+                    "Q2_m3h": round((Q - q1_opt) * 3600, 4),
+                    "v": 0.0, "Re": 0.0, "f": 0.0, "dP_kpa": 0.0, "regime": "split",
+                }
+                queue.append((tid1, q1_opt,      next_cum_dp))
+                queue.append((tid2, Q - q1_opt,  next_cum_dp))
             else:
                 for tid, _ in downstream:
                     queue.append((tid, Q, next_cum_dp))
 
-    return {"nodes": results, "source_pressures": source_pressures}
+    return {"nodes": results, "source_pressures": source_pressures, "source_flows": source_flows}
 
 
 @app.get("/fluids/{fluid}/saturation/csv")
