@@ -174,12 +174,16 @@ export type PipeSegmentResult = {
   regime: string
   Q1_m3h?: number  // tee: flow to first outlet (regime === 'split')
   Q2_m3h?: number  // tee: flow to second outlet
-  P_kpa?: number   // sink: node back-pressure kPa
+  P_kpa?: number   // boundary/sink/tee node pressure kPa
+  P_from_kpa?: number
+  P_to_kpa?: number
+  P_in_kpa?: number
+  P_out_kpa?: number
 }
 export type PipeNetworkResult = {
   nodes: Record<string, PipeSegmentResult>
-  source_pressures: Record<string, number>  // flow-source: required P kPa; pressure-source: given P kPa
-  source_flows: Record<string, number>      // flow-source: given Q m³/h; pressure-source: computed Q m³/h
+  source_pressures: Record<string, number>  // boundary/source pressure kPa
+  source_flows: Record<string, number>      // boundary/source flow m³/h
 }
 
 export async function calcPipeNetwork(payload: PipeNetworkPayload): Promise<PipeNetworkResult> {

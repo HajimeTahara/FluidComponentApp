@@ -8,7 +8,7 @@ import CoolProp.CoolProp as CP
 import numpy as np
 import pandas as pd
 from scipy.integrate import solve_ivp
-from scipy.optimize import brentq
+from scipy.optimize import brentq, least_squares
 import io
 
 app = FastAPI(title="Fluid Properties API", version="0.1.0")
@@ -615,11 +615,11 @@ def _calc_pipe_segment(params: dict, Q_m3s: float, rho: float, mu: float, method
 
     dP = f * (L / D_h) * (rho * v ** 2 / 2.0)
     return {
-        "Q_m3h":  round(Q_m3s * 3600, 4),      # signed
-        "v":      round(sign * v, 4),             # signed
+        "Q_m3h":  round(Q_m3s * 3600, 4),  # 符号付き: 負=逆流
+        "v":      round(sign * v, 4),         # 符号付き
         "Re":     round(Re, 2),
         "f":      round(f, 8),
-        "dP_kpa": round(sign * dP / 1000, 6),   # signed: negative for reverse flow
+        "dP_kpa": round(dP / 1000, 6),      # 常に正（エネルギー散逸の大きさ）
         "regime": regime,
     }
 
@@ -651,9 +651,12 @@ def _path_total_backpressure(
 
         if node.node_type == "pipe":
             seg = _calc_pipe_segment(node.params, Q_m3s, rho, mu, method)
-            total += seg["dP_kpa"]
-        elif node.node_type == "sink":
-            if node.params.get("sinkType", "pressure") == "pressure":
+            # dP_kpa は常に正。Q の符号で「正方向に圧力が落ちる」か「上がる」かを決める
+            total += seg["dP_kpa"] if Q_m3s >= 0 else -seg["dP_kpa"]
+        elif node.node_type == "sink" or node.node_type == "boundary":
+            # boundaryType='pressure' または旧 sinkType='pressure' の場合に背圧を加算
+            btype = node.params.get("boundaryType", node.params.get("sinkType", "pressure"))
+            if btype == "pressure":
                 total += float(node.params.get("pressure", 0.0))
             break
 
@@ -694,20 +697,289 @@ def _path_total_backpressure(
     return total
 
 
+def _boundary_type(node_params: dict) -> str:
+    """ソース/シンク共通の境界条件種別を返す。boundaryType > sourceType/sinkType の優先順。"""
+    return node_params.get("boundaryType",
+           node_params.get("sourceType",
+           node_params.get("sinkType", "flow")))
+
+
+BOUNDARY_NODE_TYPES = {"source", "sink", "boundary"}
+
+
+def _pipe_flow_for_pressure_drop(
+    params: dict,
+    dp_kpa: float,
+    rho: float,
+    mu: float,
+    method: str,
+) -> float:
+    """指定した圧力差[kPa]を生む体積流量[m³/s]の絶対値を返す。"""
+    if dp_kpa <= 1e-9:
+        return 0.0
+
+    def residual(q_m3s: float) -> float:
+        return _calc_pipe_segment(params, q_m3s, rho, mu, method)["dP_kpa"] - dp_kpa
+
+    q_hi = 1e-6
+    for _ in range(80):
+        if residual(q_hi) >= 0:
+            return brentq(residual, 0.0, q_hi, xtol=1e-12, maxiter=120)
+        q_hi *= 2.0
+
+    raise HTTPException(status_code=400, detail="圧力差に対応する流量の探索範囲を超えました")
+
+
+def _solve_boundary_network(
+    req: PipeNetworkRequest,
+    nodes_dict: dict[str, PipeNetworkNode],
+    outgoing: dict[str, list[tuple[str, str | None]]],
+    incoming: dict[str, list[tuple[str, str | None]]],
+) -> dict[str, Any]:
+    """圧力固定・流量固定の境界条件を節点圧から解く。"""
+    rho, mu = req.density, req.viscosity
+
+    parent: dict[str, str] = {}
+
+    def add_point(pid: str) -> None:
+        parent.setdefault(pid, pid)
+
+    def find(pid: str) -> str:
+        add_point(pid)
+        if parent[pid] != pid:
+            parent[pid] = find(parent[pid])
+        return parent[pid]
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    def node_point(nid: str, outgoing_side: bool) -> str:
+        node = nodes_dict[nid]
+        if node.node_type == "pipe":
+            return f"{nid}:out" if outgoing_side else f"{nid}:in"
+        return nid
+
+    for n in req.nodes:
+        if n.node_type == "pipe":
+            add_point(f"{n.id}:in")
+            add_point(f"{n.id}:out")
+        elif n.node_type in BOUNDARY_NODE_TYPES or n.node_type == "tee":
+            add_point(n.id)
+
+    for e in req.edges:
+        union(node_point(e.source, outgoing_side=True), node_point(e.target, outgoing_side=False))
+
+    fixed_p: dict[str, float] = {}
+    fixed_q: dict[str, float] = defaultdict(float)
+    fixed_pressure_count = 0
+    fixed_flow_count = 0
+    for n in req.nodes:
+        if n.node_type not in BOUNDARY_NODE_TYPES:
+            continue
+
+        btype = _boundary_type(n.params)
+        root_id = find(n.id)
+        if btype == "pressure":
+            fixed_pressure_count += 1
+            root_id = find(n.id)
+            p_val = float(n.params.get("pressure", 0.0))
+            if root_id in fixed_p and abs(fixed_p[root_id] - p_val) > 1e-9:
+                raise HTTPException(
+                    status_code=400,
+                    detail="圧力が異なる境界ノードが抵抗要素なしで直接接続されています",
+                )
+            fixed_p[root_id] = p_val
+        elif btype == "flow":
+            fixed_flow_count += 1
+            fixed_q[root_id] += float(n.params.get("flowRate", 0.0)) / 3600.0
+        else:
+            raise HTTPException(status_code=400, detail=f"不明な境界条件: {btype}")
+
+    if fixed_pressure_count < 1:
+        raise HTTPException(status_code=400, detail="境界条件計算には圧力固定境界が少なくとも1つ必要です")
+
+    links: list[dict[str, Any]] = []
+    for pipe in (n for n in req.nodes if n.node_type == "pipe"):
+        a = find(f"{pipe.id}:in")
+        b = find(f"{pipe.id}:out")
+        if a == b:
+            continue
+        links.append({"id": pipe.id, "a": a, "b": b, "params": pipe.params})
+
+    if not links:
+        raise HTTPException(status_code=400, detail="圧力境界計算にはパイプが少なくとも1本必要です")
+
+    junction_ids = sorted({pid for link in links for pid in (link["a"], link["b"])})
+    unknown_ids = [pid for pid in junction_ids if pid not in fixed_p]
+
+    def pressure_map(x: np.ndarray) -> dict[str, float]:
+        p = dict(fixed_p)
+        p.update({nid: float(x[i]) for i, nid in enumerate(unknown_ids)})
+        return p
+
+    def signed_link_flow(link: dict[str, Any], p: dict[str, float]) -> float:
+        dp = p[link["a"]] - p[link["b"]]
+        q_abs = _pipe_flow_for_pressure_drop(link["params"], abs(dp), rho, mu, req.friction_method)
+        return q_abs if dp >= 0 else -q_abs
+
+    def residual(x: np.ndarray) -> np.ndarray:
+        p = pressure_map(x)
+        net_out = defaultdict(float)
+        for link in links:
+            q = signed_link_flow(link, p)
+            net_out[link["a"]] += q
+            net_out[link["b"]] -= q
+        return np.array([net_out[nid] - fixed_q.get(nid, 0.0) for nid in unknown_ids], dtype=float)
+
+    if unknown_ids:
+        mean_p = sum(fixed_p.values()) / len(fixed_p)
+        initial_p: dict[str, float] = {}
+
+        adjacency: dict[str, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
+        for link in links:
+            adjacency[link["a"]].append((link["b"], link))
+            adjacency[link["b"]].append((link["a"], link))
+
+        for start_id, q in fixed_q.items():
+            if start_id in fixed_p or abs(q) < 1e-12:
+                continue
+            queue: list[tuple[str, list[tuple[str, str, dict[str, Any]]]]] = [(start_id, [])]
+            seen = {start_id}
+            found_path: list[tuple[str, str, dict[str, Any]]] | None = None
+            end_id: str | None = None
+            while queue and found_path is None:
+                nid, path = queue.pop(0)
+                if nid in fixed_p:
+                    found_path = path
+                    end_id = nid
+                    break
+                for next_id, link in adjacency.get(nid, []):
+                    if next_id in seen:
+                        continue
+                    seen.add(next_id)
+                    queue.append((next_id, path + [(nid, next_id, link)]))
+
+            if found_path is None or end_id is None:
+                continue
+
+            p_next = fixed_p[end_id]
+            for from_id, to_id, link in reversed(found_path):
+                dp_est = _calc_pipe_segment(link["params"], abs(q), rho, mu, req.friction_method)["dP_kpa"]
+                p_from = p_next + (dp_est if q > 0 else -dp_est)
+                initial_p.setdefault(from_id, p_from)
+                p_next = p_from
+
+        def initial_pressure(nid: str) -> float:
+            if nid in initial_p:
+                return initial_p[nid]
+            q = fixed_q.get(nid, 0.0)
+            if abs(q) < 1e-12:
+                return mean_p
+            adjacent = next((link for link in links if link["a"] == nid or link["b"] == nid), None)
+            if adjacent is None:
+                return mean_p
+            dp_est = _calc_pipe_segment(adjacent["params"], abs(q), rho, mu, req.friction_method)["dP_kpa"]
+            return mean_p + (dp_est if q > 0 else -dp_est)
+
+        x0 = np.array([initial_pressure(nid) for nid in unknown_ids], dtype=float)
+        sol = least_squares(residual, x0, xtol=1e-10, ftol=1e-10, gtol=1e-10, max_nfev=300)
+        max_residual = float(np.max(np.abs(residual(sol.x)))) if len(unknown_ids) > 0 else 0.0
+        if not sol.success or max_residual > 1e-5:
+            raise HTTPException(status_code=400, detail=f"圧力分布の解が収束しませんでした: {sol.message}")
+        pressures = pressure_map(sol.x)
+    else:
+        pressures = dict(fixed_p)
+
+    results: dict[str, Any] = {}
+    net_out = defaultdict(float)
+    link_flows: dict[str, float] = {}
+    for link in links:
+        p_a = pressures[link["a"]]
+        p_b = pressures[link["b"]]
+        q = signed_link_flow(link, pressures)
+        link_flows[link["id"]] = q
+        seg = _calc_pipe_segment(link["params"], q, rho, mu, req.friction_method)
+        seg.update({
+            "P_from_kpa": round(p_a, 4),
+            "P_to_kpa": round(p_b, 4),
+            "P_in_kpa": round(max(p_a, p_b), 4),
+            "P_out_kpa": round(min(p_a, p_b), 4),
+        })
+        results[link["id"]] = seg
+        net_out[link["a"]] += q
+        net_out[link["b"]] -= q
+
+    source_pressures: dict[str, float] = {}
+    source_flows: dict[str, float] = {}
+    for n in req.nodes:
+        p_id = find(n.id) if n.node_type in BOUNDARY_NODE_TYPES or n.node_type == "tee" else None
+        if n.node_type == "source" and p_id in pressures:
+            source_pressures[n.id] = round(pressures[p_id], 4)
+            source_flows[n.id] = round(net_out[p_id] * 3600, 4)
+        elif n.node_type == "sink" and p_id in pressures:
+            results[n.id] = {
+                "Q_m3h": round(-net_out[p_id] * 3600, 4),
+                "P_kpa": round(pressures[p_id], 4),
+                "v": 0.0, "Re": 0.0, "f": 0.0, "dP_kpa": 0.0, "regime": "sink",
+            }
+        elif n.node_type == "boundary" and p_id in pressures:
+            q_out = fixed_q.get(p_id, net_out[p_id]) * 3600
+            source_pressures[n.id] = round(pressures[p_id], 4)
+            source_flows[n.id] = round(q_out, 4)
+            results[n.id] = {
+                "Q_m3h": round(q_out, 4),
+                "P_kpa": round(pressures[p_id], 4),
+                "v": 0.0, "Re": 0.0, "f": 0.0, "dP_kpa": 0.0, "regime": "boundary",
+            }
+        elif n.node_type == "tee" and p_id in pressures:
+            out_edges = outgoing.get(n.id, [])
+            outlet_flows: list[float] = []
+            for target_id, _ in out_edges:
+                for link in links:
+                    if link["id"] == target_id and link["a"] == p_id:
+                        outlet_flows.append(link_flows[link["id"]] * 3600)
+                    elif link["id"] == target_id and link["b"] == p_id:
+                        outlet_flows.append(-link_flows[link["id"]] * 3600)
+            tee_result: dict[str, Any] = {
+                "Q_m3h": round(sum(max(0.0, q) for q in outlet_flows), 4),
+                "P_kpa": round(pressures[p_id], 4),
+                "v": 0.0, "Re": 0.0, "f": 0.0, "dP_kpa": 0.0, "regime": "junction",
+            }
+            if len(outlet_flows) >= 2:
+                tee_result["Q1_m3h"] = round(outlet_flows[0], 4)
+                tee_result["Q2_m3h"] = round(outlet_flows[1], 4)
+            results[n.id] = tee_result
+
+    return {"nodes": results, "source_pressures": source_pressures, "source_flows": source_flows}
+
+
 @app.post("/pipe-network")
 def calc_pipe_network(req: PipeNetworkRequest):
-    """パイプネットワークの圧損計算。
-    - 流量ソース: Q固定→必要入口圧力を計算
-    - 圧力ソース: P固定→brentq で通過流量を逆算
-    - マージノード（複数入力）に対応: 入力が揃ってから処理
-    - 逆流許可: T字管 brentq の探索範囲を拡張
+    """パイプネットワーク圧損計算。
+    境界条件:
+      flow   型 … Q固定 → 必要圧力を逆算（ソース）またはQ到達量を表示（シンク）
+      pressure 型 … P固定 → 通過流量を逆算（ソース）または背圧として使用（シンク）
+    逆流: Q が負になることで表現。ΔP は常に正（エネルギー散逸の大きさ）。
+    マージノード: 複数入力が揃ってから処理するトポロジカル BFS。
     """
     nodes_dict = {n.id: n for n in req.nodes}
     outgoing: dict[str, list[tuple[str, str | None]]] = defaultdict(list)
+    incoming: dict[str, list[tuple[str, str | None]]] = defaultdict(list)
     for e in req.edges:
         outgoing[e.source].append((e.target, e.source_handle))
+        incoming[e.target].append((e.source, e.target_handle))
 
-    # 各ノードへの入力エッジ数（マージノード検出用）
+    boundary_nodes = [n for n in req.nodes if n.node_type in BOUNDARY_NODE_TYPES]
+    if (
+        boundary_nodes
+        and all(_boundary_type(n.params) in ("pressure", "flow") for n in boundary_nodes)
+        and any(_boundary_type(n.params) == "pressure" for n in boundary_nodes)
+    ):
+        return _solve_boundary_network(req, nodes_dict, outgoing, incoming)
+
+    # マージノード検出
     global_in_deg: dict[str, int] = defaultdict(int)
     for e in req.edges:
         global_in_deg[e.target] += 1
@@ -715,13 +987,13 @@ def calc_pipe_network(req: PipeNetworkRequest):
     rho, mu = req.density, req.viscosity
     results: dict[str, Any] = {}
     source_pressures: dict[str, float] = {}  # src.id → 入口圧力 kPa
-    source_flows: dict[str, float] = {}      # src.id → 流量 m³/h
+    source_flows: dict[str, float] = {}      # src.id → 流量 m³/h (符号付き)
 
-    for src in (n for n in req.nodes if n.node_type == "source"):
-        source_type = src.params.get("sourceType", "flow")
+    for src in (n for n in req.nodes if n.node_type == "source" or (n.node_type == "boundary" and _boundary_type(n.params) == "flow")):
+        btype = _boundary_type(src.params)
 
-        # ── 圧力ソース: P固定 → Q逆算 ──────────────────────────────────
-        if source_type == "pressure":
+        # ── 圧力境界: P固定 → Q逆算 ─────────────────────────────────────
+        if btype == "pressure":
             P_in = float(src.params.get("pressure", 100.0))
             source_pressures[src.id] = round(P_in, 4)
             first_down = outgoing.get(src.id, [])
@@ -753,18 +1025,17 @@ def calc_pipe_network(req: PipeNetworkRequest):
 
             source_flows[src.id] = round(Q_total * 3600, 4)
         else:
-            # ── 流量ソース ───────────────────────────────────────────────
+            # ── 流量境界: Q固定 ──────────────────────────────────────────
             Q_total = float(src.params.get("flowRate", 10.0)) / 3600.0
             source_flows[src.id] = round(Q_total * 3600, 4)
 
         # ── BFS: マージノード対応トポロジカル処理 ───────────────────────
-        # remaining[nid]: あと何入力を待つか
         remaining: dict[str, int] = {nid: deg for nid, deg in global_in_deg.items()}
-        pending_Q:  dict[str, float] = defaultdict(float)   # 累積流量
-        pending_dp: dict[str, float] = {}                   # 最初の到着時 cum_dp
+        pending_Q:  dict[str, float] = defaultdict(float)
+        pending_dp: dict[str, float] = {}
 
         def _enqueue(queue_: list, tid: str, q_in: float, dp_in: float) -> None:
-            """downstream ノードに流量を積み、全入力揃ったらキューへ追加する。"""
+            """全入力が揃ったタイミングでキューへ追加する。"""
             pending_Q[tid] += q_in
             if tid not in pending_dp:
                 pending_dp[tid] = dp_in
@@ -772,24 +1043,22 @@ def calc_pipe_network(req: PipeNetworkRequest):
             if remaining.get(tid, 0) <= 0:
                 queue_.append((tid, pending_Q[tid], pending_dp[tid]))
 
-        # ソースノードは手動で最初の downstream をキューへ
-        init_queue: list[tuple[str, float, float]] = []
+        bfs: list[tuple[str, float, float]] = []
         for tid, _ in outgoing.get(src.id, []):
-            _enqueue(init_queue, tid, Q_total, 0.0)
+            _enqueue(bfs, tid, Q_total, 0.0)
 
-        queue2: list[tuple[str, float, float]] = init_queue
-
-        while queue2:
-            nid, Q, cum_dp = queue2.pop(0)
+        while bfs:
+            nid, Q, cum_dp = bfs.pop(0)
             node = nodes_dict.get(nid)
             if not node:
                 continue
 
-            # ── シンク: 複数経路から到達時は流量を累積 ─────────────────
-            if node.node_type == "sink":
-                sink_type = node.params.get("sinkType", "pressure")
-                sink_p = float(node.params.get("pressure", 0.0)) if sink_type == "pressure" else 0.0
-                if source_type == "flow":
+            # ── シンク ──────────────────────────────────────────────────
+            if node.node_type == "sink" or (node.node_type == "boundary" and node.id != src.id):
+                sb = _boundary_type(node.params)
+                sink_p = float(node.params.get("pressure", 0.0)) if sb == "pressure" else 0.0
+                if btype == "flow":
+                    # 流量ソース: シンクの背圧＋到達ΔPからソース必要圧を更新
                     source_pressures[src.id] = max(source_pressures.get(src.id, 0.0), sink_p + cum_dp)
                 if nid in results:
                     results[nid]["Q_m3h"] = round(results[nid]["Q_m3h"] + Q * 3600, 4)
@@ -797,24 +1066,29 @@ def calc_pipe_network(req: PipeNetworkRequest):
                     results[nid] = {
                         "Q_m3h": round(Q * 3600, 4),
                         "P_kpa": round(sink_p, 4),
-                        "_cum_dp": round(cum_dp, 6),  # 後処理用（流量シンクのP計算）
-                        "v": 0.0, "Re": 0.0, "f": 0.0, "dP_kpa": 0.0, "regime": "sink",
+                        "_cum_dp": round(cum_dp, 6),
+                        "v": 0.0, "Re": 0.0, "f": 0.0, "dP_kpa": 0.0,
+                        "regime": "boundary" if node.node_type == "boundary" else "sink",
                     }
                 continue
 
+            # ── パイプ ──────────────────────────────────────────────────
             next_cum_dp = cum_dp
             if node.node_type == "pipe":
                 seg = _calc_pipe_segment(node.params, Q, rho, mu, req.friction_method)
+                seg["_cum_dp_in"] = round(cum_dp, 6)
                 results[nid] = seg
-                next_cum_dp = cum_dp + seg["dP_kpa"]
+                # cum_dp = ソースからの累積ΔP。逆流(Q<0)では圧力が「回収」される
+                next_cum_dp = cum_dp + (seg["dP_kpa"] if Q >= 0 else -seg["dP_kpa"])
+                results[nid]["_cum_dp_out"] = round(next_cum_dp, 6)
 
             downstream = outgoing.get(nid, [])
             n_down = len(downstream)
             if n_down == 0:
                 continue
 
+            # ── T字管: 圧損バランスで自動分配（逆流も許可）─────────────
             if node.node_type == "tee" and n_down >= 2:
-                # 圧損バランスで自動分配（逆流も許可）
                 tid1, _ = downstream[0]
                 tid2, _ = downstream[1]
                 fv_bfs: frozenset = frozenset(
@@ -827,7 +1101,7 @@ def calc_pipe_network(req: PipeNetworkRequest):
                     return bp1 - bp2
 
                 Q_range = max(abs(Q) * 20, 1.0)
-                q1_opt = Q * 0.5  # fallback
+                q1_opt = Q * 0.5
                 try:
                     d_lo = delta_bp(1e-12 * max(abs(Q), 1e-6))
                     d_hi = delta_bp((1 - 1e-10) * Q)
@@ -844,25 +1118,40 @@ def calc_pipe_network(req: PipeNetworkRequest):
                     "Q_m3h":  round(Q * 3600, 4),
                     "Q1_m3h": round(q1_opt * 3600, 4),
                     "Q2_m3h": round(q2_opt * 3600, 4),
+                    "_cum_dp": round(next_cum_dp, 6),
                     "v": 0.0, "Re": 0.0, "f": 0.0, "dP_kpa": 0.0, "regime": "split",
                 }
-                _enqueue(queue2, tid1, q1_opt, next_cum_dp)
-                _enqueue(queue2, tid2, q2_opt, next_cum_dp)
+                _enqueue(bfs, tid1, q1_opt, next_cum_dp)
+                _enqueue(bfs, tid2, q2_opt, next_cum_dp)
             else:
                 for tid, _ in downstream:
-                    _enqueue(queue2, tid, Q, next_cum_dp)
+                    _enqueue(bfs, tid, Q, next_cum_dp)
 
-        # ── 流量シンクの入口圧力を後処理で計算 ─────────────────────────
-        P_src_kpa = (source_pressures.get(src.id)
-                     if source_type == "pressure"
-                     else source_pressures.get(src.id, 0.0))
+        # ── 流量シンクの入口圧力を後処理で算出 ─────────────────────────
+        P_src_kpa = source_pressures.get(src.id, 0.0)
         for nid, r in results.items():
-            if r.get("regime") == "sink" and "_cum_dp" in r:
+            if r.get("regime") in ("laminar", "transitional", "turbulent"):
+                cd_in = r.pop("_cum_dp_in", None)
+                cd_out = r.pop("_cum_dp_out", None)
+                if cd_in is not None and cd_out is not None:
+                    p_from = P_src_kpa - cd_in
+                    p_to = P_src_kpa - cd_out
+                    r["P_from_kpa"] = round(p_from, 4)
+                    r["P_to_kpa"] = round(p_to, 4)
+                    r["P_in_kpa"] = round(max(p_from, p_to), 4)
+                    r["P_out_kpa"] = round(min(p_from, p_to), 4)
+                continue
+            if r.get("regime") == "split" and "_cum_dp" in r:
+                cd = r.pop("_cum_dp")
+                r["P_kpa"] = round(P_src_kpa - cd, 4)
+                continue
+            if r.get("regime") in ("sink", "boundary") and "_cum_dp" in r:
                 cd = r.pop("_cum_dp")
                 sink_node = nodes_dict.get(nid)
-                if sink_node and sink_node.params.get("sinkType", "pressure") == "flow":
-                    # 流量シンク: 上流圧力 = ソース圧 − 累積ΔP
-                    r["P_kpa"] = round((P_src_kpa or 0.0) - cd, 4)
+                if sink_node and _boundary_type(sink_node.params) == "flow":
+                    r["P_kpa"] = round(P_src_kpa - cd, 4)
+                elif sink_node and _boundary_type(sink_node.params) == "pressure":
+                    r["P_kpa"] = round(float(sink_node.params.get("pressure", r.get("P_kpa", 0.0))), 4)
 
     return {"nodes": results, "source_pressures": source_pressures, "source_flows": source_flows}
 
