@@ -171,6 +171,10 @@ export type PipeSegmentResult = {
   Re: number
   f: number
   dP_kpa: number
+  boost_kpa?: number
+  head_m?: number
+  hydraulic_power_kw?: number
+  shaft_power_kw?: number
   regime: string
   Q1_m3h?: number  // tee: flow to first outlet (regime === 'split')
   Q2_m3h?: number  // tee: flow to second outlet

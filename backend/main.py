@@ -705,6 +705,7 @@ def _boundary_type(node_params: dict) -> str:
 
 
 BOUNDARY_NODE_TYPES = {"source", "sink", "boundary"}
+TWO_PORT_NODE_TYPES = {"pipe", "pump"}
 
 
 def _pipe_flow_for_pressure_drop(
@@ -728,6 +729,113 @@ def _pipe_flow_for_pressure_drop(
         q_hi *= 2.0
 
     raise HTTPException(status_code=400, detail="圧力差に対応する流量の探索範囲を超えました")
+
+
+def _pump_curve_points(params: dict) -> list[tuple[float, float]]:
+    raw_points = params.get("pumpCurvePoints", [])
+    points: list[tuple[float, float]] = []
+    if isinstance(raw_points, list):
+        for point in raw_points:
+            if not isinstance(point, dict):
+                continue
+            try:
+                q = float(point.get("q", point.get("flow", 0.0)))
+                h = float(point.get("h", point.get("head", 0.0)))
+            except (TypeError, ValueError):
+                continue
+            if q >= 0 and h >= 0:
+                points.append((q, h))
+    if len(points) < 2:
+        q_rated = max(float(params.get("ratedFlow", 30.0)), 0.0)
+        h_rated = max(float(params.get("ratedHead", 20.0)), 0.0)
+        h_shutoff = max(float(params.get("shutoffHead", max(h_rated, 0.0))), 0.0)
+        q_max = _pump_zero_head_flow(params)
+        points = [(0.0, h_shutoff), (q_rated, h_rated), (q_max, 0.0)]
+
+    return sorted(points, key=lambda p: p[0])
+
+
+def _pump_zero_head_flow(params: dict) -> float:
+    q_rated = max(float(params.get("ratedFlow", 30.0)), 1e-9)
+    h_rated = float(params.get("ratedHead", 20.0))
+    h_shutoff = float(params.get("shutoffHead", max(h_rated, 0.0)))
+    drop_at_rated = h_shutoff - h_rated
+    if h_shutoff <= 0 or drop_at_rated <= 1e-9:
+        return q_rated
+    return q_rated * (h_shutoff / drop_at_rated) ** 0.5
+
+
+def _pump_head_m(params: dict, q_m3h: float) -> float:
+    """PQ特性から揚程[m]を返す。ポンプ方向はIN→OUT固定。"""
+    if params.get("pumpCurveMode") == "table":
+        points = _pump_curve_points(params)
+        if len(points) >= 2:
+            q = max(q_m3h, 0.0)
+            if q <= points[0][0]:
+                return points[0][1]
+            for (q0, h0), (q1, h1) in zip(points, points[1:]):
+                if q <= q1:
+                    if abs(q1 - q0) < 1e-12:
+                        return h1
+                    t = (q - q0) / (q1 - q0)
+                    return max(h0 + (h1 - h0) * t, 0.0)
+            return points[-1][1]
+
+    q_rated = max(float(params.get("ratedFlow", 30.0)), 1e-9)
+    h_rated = float(params.get("ratedHead", 20.0))
+    h_shutoff = float(params.get("shutoffHead", max(h_rated, 0.0)))
+    h_max = max(h_shutoff, h_rated, 0.0)
+    if h_max <= 0:
+        return 0.0
+
+    curve = max((h_shutoff - h_rated) / (q_rated ** 2), 0.0)
+    if curve <= 1e-12:
+        return h_max
+    return max(h_shutoff - curve * (max(q_m3h, 0.0) ** 2), 0.0)
+
+
+def _pump_boost_kpa(params: dict, q_m3h: float, rho: float) -> float:
+    return rho * 9.80665 * _pump_head_m(params, q_m3h) / 1000.0
+
+
+def _pump_flow_for_required_boost(params: dict, boost_kpa: float, rho: float) -> float:
+    """要求昇圧[kPa]に対応するポンプ流量[m³/s]を返す。逆流は許可しない。"""
+    points = _pump_curve_points(params) if params.get("pumpCurveMode") == "table" else []
+    q_max = points[-1][0] if len(points) >= 2 else _pump_zero_head_flow(params)
+    q_max = max(q_max, 1e-9)
+    boost_zero = _pump_boost_kpa(params, 0.0, rho)
+    boost_max = _pump_boost_kpa(params, q_max, rho)
+
+    if boost_kpa >= boost_zero:
+        return 0.0
+    if boost_kpa <= boost_max:
+        return q_max / 3600.0
+
+    def residual(q_m3h: float) -> float:
+        return _pump_boost_kpa(params, q_m3h, rho) - boost_kpa
+
+    return brentq(residual, 0.0, q_max, xtol=1e-9, maxiter=80) / 3600.0
+
+
+def _calc_pump_segment(params: dict, q_m3s: float, rho: float) -> dict:
+    q_m3h = max(q_m3s * 3600.0, 0.0)
+    head_m = _pump_head_m(params, q_m3h)
+    boost_kpa = _pump_boost_kpa(params, q_m3h, rho)
+    hydraulic_power_kw = boost_kpa * q_m3s
+    efficiency = max(float(params.get("efficiency", 70.0)), 1e-9) / 100.0
+    shaft_power_kw = hydraulic_power_kw / efficiency
+    return {
+        "Q_m3h": round(q_m3h, 4),
+        "v": 0.0,
+        "Re": 0.0,
+        "f": 0.0,
+        "dP_kpa": round(-boost_kpa, 4),
+        "boost_kpa": round(boost_kpa, 4),
+        "head_m": round(head_m, 4),
+        "hydraulic_power_kw": round(hydraulic_power_kw, 6),
+        "shaft_power_kw": round(shaft_power_kw, 6),
+        "regime": "pump",
+    }
 
 
 def _solve_boundary_network(
@@ -757,12 +865,12 @@ def _solve_boundary_network(
 
     def node_point(nid: str, outgoing_side: bool) -> str:
         node = nodes_dict[nid]
-        if node.node_type == "pipe":
+        if node.node_type in TWO_PORT_NODE_TYPES:
             return f"{nid}:out" if outgoing_side else f"{nid}:in"
         return nid
 
     for n in req.nodes:
-        if n.node_type == "pipe":
+        if n.node_type in TWO_PORT_NODE_TYPES:
             add_point(f"{n.id}:in")
             add_point(f"{n.id}:out")
         elif n.node_type in BOUNDARY_NODE_TYPES or n.node_type == "tee":
@@ -801,15 +909,15 @@ def _solve_boundary_network(
         raise HTTPException(status_code=400, detail="境界条件計算には圧力固定境界が少なくとも1つ必要です")
 
     links: list[dict[str, Any]] = []
-    for pipe in (n for n in req.nodes if n.node_type == "pipe"):
-        a = find(f"{pipe.id}:in")
-        b = find(f"{pipe.id}:out")
+    for elem in (n for n in req.nodes if n.node_type in TWO_PORT_NODE_TYPES):
+        a = find(f"{elem.id}:in")
+        b = find(f"{elem.id}:out")
         if a == b:
             continue
-        links.append({"id": pipe.id, "a": a, "b": b, "params": pipe.params})
+        links.append({"id": elem.id, "kind": elem.node_type, "a": a, "b": b, "params": elem.params})
 
     if not links:
-        raise HTTPException(status_code=400, detail="圧力境界計算にはパイプが少なくとも1本必要です")
+        raise HTTPException(status_code=400, detail="圧力境界計算には2ポート要素が少なくとも1つ必要です")
 
     junction_ids = sorted({pid for link in links for pid in (link["a"], link["b"])})
     unknown_ids = [pid for pid in junction_ids if pid not in fixed_p]
@@ -820,6 +928,10 @@ def _solve_boundary_network(
         return p
 
     def signed_link_flow(link: dict[str, Any], p: dict[str, float]) -> float:
+        if link["kind"] == "pump":
+            required_boost = p[link["b"]] - p[link["a"]]
+            return _pump_flow_for_required_boost(link["params"], required_boost, rho)
+
         dp = p[link["a"]] - p[link["b"]]
         q_abs = _pipe_flow_for_pressure_drop(link["params"], abs(dp), rho, mu, req.friction_method)
         return q_abs if dp >= 0 else -q_abs
@@ -866,8 +978,12 @@ def _solve_boundary_network(
 
             p_next = fixed_p[end_id]
             for from_id, to_id, link in reversed(found_path):
-                dp_est = _calc_pipe_segment(link["params"], abs(q), rho, mu, req.friction_method)["dP_kpa"]
-                p_from = p_next + (dp_est if q > 0 else -dp_est)
+                if link["kind"] == "pump":
+                    boost_est = _pump_boost_kpa(link["params"], abs(q) * 3600.0, rho)
+                    p_from = p_next - boost_est
+                else:
+                    dp_est = _calc_pipe_segment(link["params"], abs(q), rho, mu, req.friction_method)["dP_kpa"]
+                    p_from = p_next + (dp_est if q > 0 else -dp_est)
                 initial_p.setdefault(from_id, p_from)
                 p_next = p_from
 
@@ -875,10 +991,16 @@ def _solve_boundary_network(
             if nid in initial_p:
                 return initial_p[nid]
             q = fixed_q.get(nid, 0.0)
-            if abs(q) < 1e-12:
-                return mean_p
             adjacent = next((link for link in links if link["a"] == nid or link["b"] == nid), None)
             if adjacent is None:
+                return mean_p
+            if adjacent["kind"] == "pump":
+                q_est_m3h = abs(q) * 3600.0
+                if q_est_m3h < 1e-9:
+                    q_est_m3h = _pump_zero_head_flow(adjacent["params"]) * 0.95
+                dp_est = _pump_boost_kpa(adjacent["params"], q_est_m3h, rho)
+                return mean_p - dp_est if adjacent["a"] == nid else mean_p + dp_est
+            if abs(q) < 1e-12:
                 return mean_p
             dp_est = _calc_pipe_segment(adjacent["params"], abs(q), rho, mu, req.friction_method)["dP_kpa"]
             return mean_p + (dp_est if q > 0 else -dp_est)
@@ -900,12 +1022,15 @@ def _solve_boundary_network(
         p_b = pressures[link["b"]]
         q = signed_link_flow(link, pressures)
         link_flows[link["id"]] = q
-        seg = _calc_pipe_segment(link["params"], q, rho, mu, req.friction_method)
+        if link["kind"] == "pump":
+            seg = _calc_pump_segment(link["params"], q, rho)
+        else:
+            seg = _calc_pipe_segment(link["params"], q, rho, mu, req.friction_method)
         seg.update({
             "P_from_kpa": round(p_a, 4),
             "P_to_kpa": round(p_b, 4),
-            "P_in_kpa": round(max(p_a, p_b), 4),
-            "P_out_kpa": round(min(p_a, p_b), 4),
+            "P_in_kpa": round(p_a if link["kind"] == "pump" else max(p_a, p_b), 4),
+            "P_out_kpa": round(p_b if link["kind"] == "pump" else min(p_a, p_b), 4),
         })
         results[link["id"]] = seg
         net_out[link["a"]] += q
