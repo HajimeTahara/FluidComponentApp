@@ -6,8 +6,8 @@ const geistSans = Geist({ variable: '--font-geist-sans', subsets: ['latin'] })
 const geistMono = Geist_Mono({ variable: '--font-geist-mono', subsets: ['latin'] })
 
 export const metadata: Metadata = {
-  title: '流体物性ビューア',
-  description: 'CoolPropを使った流体の熱物性データベース閲覧・抽出アプリ',
+  title: 'FluidLab',
+  description: '流体物性と流れ解析のためのエンジニアリングアプリ',
 }
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {

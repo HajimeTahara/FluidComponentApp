@@ -163,23 +163,44 @@ def get_properties(
     # P₀ における飽和特性
     try:
         T_sat = CP.PropsSI("T", "P", P, "Q", 0, fluid)
+        D_liq = CP.PropsSI("D", "P", P, "Q", 0, fluid)
+        D_vap = CP.PropsSI("D", "P", P, "Q", 1, fluid)
         H_liq = CP.PropsSI("H", "P", P, "Q", 0, fluid)
         H_vap = CP.PropsSI("H", "P", P, "Q", 1, fluid)
         result["T_sat_at_P"] = T_sat
+        result["D_sat_liq_at_P"] = D_liq
+        result["D_sat_vap_at_P"] = D_vap
         result["H_sat_liq_at_P"] = H_liq
         result["H_sat_vap_at_P"] = H_vap
         result["latent_heat_at_P"] = H_vap - H_liq
     except Exception:
         result["T_sat_at_P"] = None
+        result["D_sat_liq_at_P"] = None
+        result["D_sat_vap_at_P"] = None
         result["H_sat_liq_at_P"] = None
         result["H_sat_vap_at_P"] = None
         result["latent_heat_at_P"] = None
 
-    # T₀ における飽和蒸気圧
+    # T₀ における飽和特性
     try:
-        result["P_sat_at_T"] = CP.PropsSI("P", "T", T, "Q", 0, fluid)
+        P_sat = CP.PropsSI("P", "T", T, "Q", 0, fluid)
+        D_liq = CP.PropsSI("D", "T", T, "Q", 0, fluid)
+        D_vap = CP.PropsSI("D", "T", T, "Q", 1, fluid)
+        H_liq = CP.PropsSI("H", "T", T, "Q", 0, fluid)
+        H_vap = CP.PropsSI("H", "T", T, "Q", 1, fluid)
+        result["P_sat_at_T"] = P_sat
+        result["D_sat_liq_at_T"] = D_liq
+        result["D_sat_vap_at_T"] = D_vap
+        result["H_sat_liq_at_T"] = H_liq
+        result["H_sat_vap_at_T"] = H_vap
+        result["latent_heat_at_T"] = H_vap - H_liq
     except Exception:
         result["P_sat_at_T"] = None
+        result["D_sat_liq_at_T"] = None
+        result["D_sat_vap_at_T"] = None
+        result["H_sat_liq_at_T"] = None
+        result["H_sat_vap_at_T"] = None
+        result["latent_heat_at_T"] = None
 
     # 臨界点
     result["T_crit"] = CP.PropsSI("Tcrit", fluid)

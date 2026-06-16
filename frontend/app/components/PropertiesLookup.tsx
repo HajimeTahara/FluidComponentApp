@@ -15,6 +15,19 @@ function fmt(v: number | null | undefined, scale = 1, digits = 4): string {
   return v != null ? (v * scale).toFixed(digits) : 'N/A'
 }
 
+function HelpTip({ text }: { text: string }) {
+  return (
+    <span className="relative inline-flex group align-middle">
+      <span className="inline-flex h-4 w-4 items-center justify-center rounded-full border border-gray-300 bg-white text-[10px] font-bold text-gray-500 cursor-help">
+        ?
+      </span>
+      <span className="pointer-events-none absolute left-1/2 top-5 z-20 hidden w-56 -translate-x-1/2 rounded-md border border-gray-200 bg-white px-3 py-2 text-xs font-normal leading-relaxed text-gray-600 shadow-lg group-hover:block">
+        {text}
+      </span>
+    </span>
+  )
+}
+
 function toKelvin(val: number, unit: TempUnit): number {
   return unit === 'C' ? val + 273.15 : val
 }
@@ -63,6 +76,7 @@ export default function PropertiesLookup({ fluid, externalT, externalP }: Props)
     const pStr = pressUnit === 'MPa' ? (externalP / 1e6).toFixed(4)
                : pressUnit === 'bar' ? (externalP / 1e5).toFixed(3)
                : externalP.toFixed(0)
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setT(tStr)
     setP(pStr)
   }, [externalT, externalP]) // eslint-disable-line react-hooks/exhaustive-deps
@@ -203,14 +217,23 @@ export default function PropertiesLookup({ fluid, externalT, externalP }: Props)
                   </tr>
                 ))}
 
-                <tr><td colSpan={2} className="px-4 py-1.5 text-xs font-semibold text-gray-400 bg-gray-50 uppercase tracking-wide">圧力 P₀ における飽和特性</td></tr>
+                <tr>
+                  <td colSpan={2} className="px-4 py-1.5 text-xs font-semibold text-gray-400 bg-gray-50 uppercase tracking-wide">
+                    <span className="inline-flex items-center gap-1.5">
+                      圧力 P₀ における飽和特性
+                      <HelpTip text="P₀は上の入力欄で指定した圧力です。その圧力で二相平衡になる飽和温度、飽和密度、飽和エンタルピーを表示します。" />
+                    </span>
+                  </td>
+                </tr>
                 {[
                   ['飽和温度', props.T_sat_at_P != null
                     ? `${props.T_sat_at_P.toFixed(2)} K  (${(props.T_sat_at_P - 273.15).toFixed(2)} °C)`
                     : 'N/A (臨界圧力超過)'],
+                  ['飽和液密度', props.D_sat_liq_at_P != null ? `${props.D_sat_liq_at_P.toFixed(3)} kg/m³` : 'N/A'],
+                  ['飽和蒸気密度', props.D_sat_vap_at_P != null ? `${props.D_sat_vap_at_P.toFixed(5)} kg/m³` : 'N/A'],
                   ['飽和液エンタルピー', props.H_sat_liq_at_P != null ? `${(props.H_sat_liq_at_P / 1000).toFixed(2)} kJ/kg` : 'N/A'],
                   ['飽和蒸気エンタルピー', props.H_sat_vap_at_P != null ? `${(props.H_sat_vap_at_P / 1000).toFixed(2)} kJ/kg` : 'N/A'],
-                  ['蒸発潜熱', props.latent_heat_at_P != null ? `${(props.latent_heat_at_P / 1000).toFixed(2)} kJ/kg` : 'N/A'],
+                  ['潜熱', props.latent_heat_at_P != null ? `${(props.latent_heat_at_P / 1000).toFixed(2)} kJ/kg` : 'N/A'],
                 ].map(([label, value]) => (
                   <tr key={label} className="hover:bg-gray-50">
                     <td className="px-4 py-2.5 text-gray-700">{label}</td>
@@ -218,32 +241,23 @@ export default function PropertiesLookup({ fluid, externalT, externalP }: Props)
                   </tr>
                 ))}
 
-                <tr><td colSpan={2} className="px-4 py-1.5 text-xs font-semibold text-gray-400 bg-gray-50 uppercase tracking-wide">温度 T₀ における飽和蒸気圧</td></tr>
-                <tr className="hover:bg-gray-50">
-                  <td className="px-4 py-2.5 text-gray-700">飽和蒸気圧</td>
-                  <td className="px-4 py-2.5 text-right font-mono text-gray-900 text-xs">
-                    {props.P_sat_at_T != null
-                      ? `${(props.P_sat_at_T / 1e6).toFixed(4)} MPa  (${(props.P_sat_at_T / 1e5).toFixed(3)} bar)`
-                      : 'N/A (臨界温度超過)'}
+                <tr>
+                  <td colSpan={2} className="px-4 py-1.5 text-xs font-semibold text-gray-400 bg-gray-50 uppercase tracking-wide">
+                    <span className="inline-flex items-center gap-1.5">
+                      温度 T₀ における飽和特性
+                      <HelpTip text="T₀は上の入力欄で指定した温度です。その温度で二相平衡になる飽和圧力、飽和密度、飽和エンタルピーを表示します。" />
+                    </span>
                   </td>
                 </tr>
-
-                <tr><td colSpan={2} className="px-4 py-1.5 text-xs font-semibold text-gray-400 bg-gray-50 uppercase tracking-wide">臨界点</td></tr>
                 {[
-                  ['臨界温度', `${props.T_crit.toFixed(2)} K  (${(props.T_crit - 273.15).toFixed(2)} °C)`],
-                  ['臨界圧力', `${(props.P_crit / 1e6).toFixed(4)} MPa  (${(props.P_crit / 1e5).toFixed(3)} bar)`],
-                  ['臨界密度', `${props.D_crit.toFixed(3)} kg/m³`],
-                ].map(([label, value]) => (
-                  <tr key={label} className="hover:bg-gray-50">
-                    <td className="px-4 py-2.5 text-gray-700">{label}</td>
-                    <td className="px-4 py-2.5 text-right font-mono text-gray-900 text-xs">{value}</td>
-                  </tr>
-                ))}
-
-                <tr><td colSpan={2} className="px-4 py-1.5 text-xs font-semibold text-gray-400 bg-gray-50 uppercase tracking-wide">三重点</td></tr>
-                {[
-                  ['三重点温度', `${props.T_triple.toFixed(2)} K  (${(props.T_triple - 273.15).toFixed(2)} °C)`],
-                  ['三重点圧力', `${(props.P_triple / 1e6).toFixed(4)} MPa  (${(props.P_triple / 1e5).toFixed(4)} bar)`],
+                  ['飽和圧力', props.P_sat_at_T != null
+                    ? `${(props.P_sat_at_T / 1e6).toFixed(4)} MPa  (${(props.P_sat_at_T / 1e5).toFixed(3)} bar)`
+                    : 'N/A (臨界温度超過)'],
+                  ['飽和液密度', props.D_sat_liq_at_T != null ? `${props.D_sat_liq_at_T.toFixed(3)} kg/m³` : 'N/A'],
+                  ['飽和蒸気密度', props.D_sat_vap_at_T != null ? `${props.D_sat_vap_at_T.toFixed(5)} kg/m³` : 'N/A'],
+                  ['飽和液エンタルピー', props.H_sat_liq_at_T != null ? `${(props.H_sat_liq_at_T / 1000).toFixed(2)} kJ/kg` : 'N/A'],
+                  ['飽和蒸気エンタルピー', props.H_sat_vap_at_T != null ? `${(props.H_sat_vap_at_T / 1000).toFixed(2)} kJ/kg` : 'N/A'],
+                  ['潜熱', props.latent_heat_at_T != null ? `${(props.latent_heat_at_T / 1000).toFixed(2)} kJ/kg` : 'N/A'],
                 ].map(([label, value]) => (
                   <tr key={label} className="hover:bg-gray-50">
                     <td className="px-4 py-2.5 text-gray-700">{label}</td>

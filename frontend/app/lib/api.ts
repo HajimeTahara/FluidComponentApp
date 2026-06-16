@@ -17,11 +17,18 @@ export type Properties = {
   L: number | null
   // P₀における飽和特性
   T_sat_at_P: number | null
+  D_sat_liq_at_P: number | null
+  D_sat_vap_at_P: number | null
   H_sat_liq_at_P: number | null
   H_sat_vap_at_P: number | null
   latent_heat_at_P: number | null
   // T₀における飽和蒸気圧
   P_sat_at_T: number | null
+  D_sat_liq_at_T: number | null
+  D_sat_vap_at_T: number | null
+  H_sat_liq_at_T: number | null
+  H_sat_vap_at_T: number | null
+  latent_heat_at_T: number | null
   // 臨界点
   T_crit: number
   P_crit: number
