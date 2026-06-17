@@ -182,6 +182,28 @@ export type PipeSegmentResult = {
   head_m?: number
   hydraulic_power_kw?: number
   shaft_power_kw?: number
+  heat_duty_kw?: number
+  UA_w_per_k?: number
+  exchange_temperature_K?: number
+  heat_transfer_coeff_w_m2_k?: number
+  heat_transfer_area_m2?: number
+  rated_flow_m3h?: number
+  nominal_pressure_drop_kpa?: number
+  diameter_in_mm?: number
+  diameter_out_mm?: number
+  upstream_diameter_mm?: number
+  downstream_diameter_mm?: number
+  loss_coefficient?: number
+  loss_mode?: string
+  reducer_kind?: string
+  diameter_mm?: number
+  angle_deg?: number
+  zeta90?: number
+  valve_zeta_full_open?: number
+  valve_opening_percent?: number
+  valve_relative_capacity?: number
+  valve_characteristic?: string
+  valve_rangeability?: number
   regime: string
   Q1_m3h?: number  // tee: flow to first outlet (regime === 'split')
   Q2_m3h?: number  // tee: flow to second outlet
@@ -190,11 +212,16 @@ export type PipeSegmentResult = {
   P_to_kpa?: number
   P_in_kpa?: number
   P_out_kpa?: number
+  T_K?: number
+  T_in_K?: number
+  T_out_K?: number
 }
 export type PipeNetworkResult = {
   nodes: Record<string, PipeSegmentResult>
   source_pressures: Record<string, number>  // boundary/source pressure kPa
   source_flows: Record<string, number>      // boundary/source flow m³/h
+  source_temperatures?: Record<string, number>  // boundary/source temperature K
+  boundary_temperatures?: Record<string, number> // defined boundary temperatures K
 }
 
 export async function calcPipeNetwork(payload: PipeNetworkPayload): Promise<PipeNetworkResult> {

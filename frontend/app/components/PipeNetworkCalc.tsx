@@ -50,6 +50,9 @@ type NodeRotation = 0 | 90 | 180 | 270
 type PumpCurveMode = 'quadratic' | 'table'
 type PumpCurvePoint = { q: number; h: number }
 type PressureUnit = 'm' | 'Pa' | 'kPa' | 'MPa' | 'bar'
+type ReducerLossMode = 'auto' | 'manual'
+type ElbowLossMode = 'auto' | 'manual'
+type ValveCharacteristic = 'linear' | 'quickOpening' | 'equalPercentage'
 
 const PRESSURE_UNITS: PressureUnit[] = ['m', 'Pa', 'kPa', 'MPa', 'bar']
 const G_ACCEL = 9.80665
@@ -78,8 +81,27 @@ function formatPressure(kpa: number, unit: PressureUnit, rho: number): string {
   return kpaToUnit(kpa, unit, rho).toFixed(pressureDecimals(unit))
 }
 
+function valveRelativeCapacity(data: NetworkNodeData, openingPercent = data.valveOpening ?? 100): number {
+  const opening = Math.min(Math.max(openingPercent, 0), 100) / 100
+  if (opening <= 0) return 1e-6
+  if ((data.valveCharacteristic ?? 'linear') === 'quickOpening') {
+    return Math.max(Math.sqrt(opening), 1e-6)
+  }
+  if ((data.valveCharacteristic ?? 'linear') === 'equalPercentage') {
+    const rangeability = Math.max(data.valveRangeability ?? 50, 1.000001)
+    return Math.max(rangeability ** (opening - 1), 1e-6)
+  }
+  return Math.max(opening, 1e-6)
+}
+
+function valveEffectiveZeta(data: NetworkNodeData, openingPercent = data.valveOpening ?? 100): number {
+  const zetaFullOpen = Math.max(data.valveZetaFullOpen ?? 1, 0)
+  const relativeCapacity = valveRelativeCapacity(data, openingPercent)
+  return zetaFullOpen > 0 ? zetaFullOpen / (relativeCapacity ** 2) : 0
+}
+
 type NetworkNodeData = {
-  nodeType: 'boundary' | 'source' | 'pipe' | 'pump' | 'tee' | 'sink'
+  nodeType: 'boundary' | 'source' | 'pipe' | 'pump' | 'heatExchanger' | 'reducer' | 'elbow' | 'valve' | 'tee' | 'sink'
   label: string
   // boundary/source/sink: unified boundary condition
   // flow: Q is fixed input → P is computed result
@@ -87,8 +109,10 @@ type NetworkNodeData = {
   boundaryType?: 'flow' | 'pressure'
   flowRate?: number       // flow-type: m³/h
   pressure?: number       // pressure-type: kPa
+  temperature?: number    // boundary temperature: K
   calcPressure?: number   // flow-type result: required pressure kPa
   calcFlow?: number       // pressure-type result: computed flow m³/h
+  calcTemperature?: number // propagated boundary/source temperature K
   portLeftConnected?: boolean
   portRightConnected?: boolean
   portInConnected?: boolean
@@ -117,9 +141,30 @@ type NetworkNodeData = {
   speed?: number          // rpm: 現在の回転数（相似則でPQ特性をスケーリング）
   pumpCurveMode?: PumpCurveMode
   pumpCurvePoints?: PumpCurvePoint[]
+  // heat exchanger
+  exchangeTemperature?: number // K
+  heatTransferCoeff?: number   // W/m²/K
+  heatTransferArea?: number    // m²
+  nominalPressureDrop?: number // kPa at ratedFlow
+  // reducer / expander
+  diameterIn?: number          // mm
+  diameterOut?: number         // mm
+  lossMode?: ReducerLossMode
+  lossCoefficient?: number
+  // elbow
+  elbowLossMode?: ElbowLossMode
+  angle?: number               // deg
+  zeta90?: number
+  // valve
+  valveCharacteristic?: ValveCharacteristic
+  valveOpening?: number         // %
+  valveZetaFullOpen?: number
+  valveRangeability?: number
   // tee (flow split is physics-based; no manual parameter)
+  teeMode?: 'split' | 'merge'
   // result
   result?: PipeSegmentResult
+  resultVisibleSymbols?: string[]
   [key: string]: unknown
 }
 
@@ -288,6 +333,53 @@ function SvgPump({ className = '' }) {
   )
 }
 
+function SvgHeatExchanger({ className = '' }) {
+  return (
+    <svg viewBox="0 0 24 24" className={className} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="6" width="18" height="12" rx="2" />
+      <path d="M6 9h12" />
+      <path d="M6 15h12" />
+      <path d="M8 3v3" />
+      <path d="M16 18v3" />
+      <path d="M9 12h6" />
+      <path d="M13 10l2 2-2 2" />
+    </svg>
+  )
+}
+
+function SvgReducer({ className = '' }) {
+  return (
+    <svg viewBox="0 0 24 24" className={className} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M2 8h6l4 4-4 4H2" />
+      <path d="M12 12h10" />
+      <path d="M18 9l4 3-4 3" />
+    </svg>
+  )
+}
+
+function SvgElbow({ className = '' }) {
+  return (
+    <svg viewBox="0 0 24 24" className={className} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M4 20v-7a9 9 0 0 1 9-9h7" />
+      <path d="M17 1l3 3-3 3" />
+      <path d="M1 17l3 3 3-3" />
+    </svg>
+  )
+}
+
+function SvgValve({ className = '' }) {
+  return (
+    <svg viewBox="0 0 24 24" className={className} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M3 8l8 4-8 4V8z" />
+      <path d="M21 8l-8 4 8 4V8z" />
+      <path d="M12 12V5" />
+      <path d="M8 5h8" />
+      <path d="M3 12H1" />
+      <path d="M23 12h-2" />
+    </svg>
+  )
+}
+
 function SvgRotate({ className = '' }) {
   return (
     <svg viewBox="0 0 24 24" className={className} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -330,6 +422,7 @@ function BoundaryNode({ data, selected }: NodeProps) {
   const pressureLabel = displayedPressure !== undefined
     ? `${formatPressure(displayedPressure, unit, rho)} ${unit}`
     : null
+  const displayedTemperature = d.calcTemperature ?? d.result?.T_K ?? d.temperature
   return (
     <div className={`relative px-3 py-2 rounded-xl border-2 bg-teal-50 min-w-[130px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-teal-500'}`}>
       <Handle type="target" position={inPosition} style={portHandleStyle('#14b8a6', 'in')} />
@@ -348,6 +441,9 @@ function BoundaryNode({ data, selected }: NodeProps) {
         </>
       ) : (
         <div className="text-xs text-teal-600 pl-5">圧力固定</div>
+      )}
+      {displayedTemperature !== undefined && (
+        <div className="text-xs text-teal-500 pl-5">T: {displayedTemperature.toFixed(2)} K</div>
       )}
       {d.showPressureResults && pressureLabel && (d.portOutConnected ?? d.portRightConnected) && (
         <div className={pressureBadgeClass(outPosition)}>
@@ -383,6 +479,9 @@ function PipeNode({ data, selected }: NodeProps) {
       <div className="text-xs text-sky-500 pl-5">{shapeLabel} · L={d.length ?? 50} m</div>
       {d.result && (
         <div className="text-xs font-bold text-red-500 mt-0.5 pl-5">ΔP: {formatPressure(d.result.dP_kpa, unit, rho)} {unit}</div>
+      )}
+      {d.result?.T_in_K !== undefined && (
+        <div className="text-xs text-sky-500 pl-5">T: {d.result.T_in_K.toFixed(2)} K</div>
       )}
       {d.showPressureResults && d.result?.P_to_kpa !== undefined && (d.portOutConnected ?? d.portRightConnected) && (
         <div className={pressureBadgeClass(outPosition)}>
@@ -420,6 +519,9 @@ function PumpNode({ data, selected }: NodeProps) {
       {d.result?.boost_kpa !== undefined && (
         <div className="text-xs font-bold text-emerald-600 mt-0.5 pl-5">+ΔP: {formatPressure(d.result.boost_kpa, unit, rho)} {unit}</div>
       )}
+      {d.result?.T_in_K !== undefined && (
+        <div className="text-xs text-violet-500 pl-5">T: {d.result.T_in_K.toFixed(2)} K</div>
+      )}
       {d.showPressureResults && d.result?.P_to_kpa !== undefined && (d.portOutConnected ?? d.portRightConnected) && (
         <div className={pressureBadgeClass(outPosition)}>
           {formatPressure(d.result.P_to_kpa, unit, rho)} {unit}
@@ -430,17 +532,176 @@ function PumpNode({ data, selected }: NodeProps) {
   )
 }
 
+function HeatExchangerNode({ data, selected }: NodeProps) {
+  const d = data as unknown as NetworkNodeData
+  const inPosition = orientPosition(Position.Left, d)
+  const outPosition = orientPosition(Position.Right, d)
+  const unit = d.pressureUnit ?? 'kPa'
+  const rho = d.rho ?? 1000
+  return (
+    <div className={`relative px-3 py-2 rounded border-2 bg-orange-50 min-w-[160px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-orange-500'}`}>
+      <Handle type="target" position={inPosition} style={portHandleStyle('#f97316', 'in')} />
+      {d.showPressureResults && d.result?.P_from_kpa !== undefined && (d.portInConnected ?? d.portLeftConnected) && (
+        <div className={pressureBadgeClass(inPosition)}>
+          {formatPressure(d.result.P_from_kpa, unit, rho)} {unit}
+        </div>
+      )}
+      <div className="flex items-center gap-1.5 mb-0.5">
+        <SvgHeatExchanger className="w-4 h-4 text-orange-600 shrink-0" />
+        <span className="text-xs font-bold text-orange-700">{d.label}</span>
+      </div>
+      <div className="text-xs text-orange-500 pl-5">U={d.heatTransferCoeff ?? 500} · A={d.heatTransferArea ?? 10}</div>
+      <div className="text-xs text-orange-500 pl-5">Qr={d.ratedFlow ?? 10} m³/h · ΔPn={d.nominalPressureDrop ?? 10} kPa</div>
+      {d.result?.heat_duty_kw !== undefined && (
+        <div className="text-xs font-bold text-orange-600 mt-0.5 pl-5">Q熱: {d.result.heat_duty_kw.toFixed(3)} kW</div>
+      )}
+      {d.result?.T_in_K !== undefined && d.result?.T_out_K !== undefined && (
+        <div className="text-xs text-orange-500 pl-5">{d.result.T_in_K.toFixed(2)} → {d.result.T_out_K.toFixed(2)} K</div>
+      )}
+      {d.showPressureResults && d.result?.P_to_kpa !== undefined && (d.portOutConnected ?? d.portRightConnected) && (
+        <div className={pressureBadgeClass(outPosition)}>
+          {formatPressure(d.result.P_to_kpa, unit, rho)} {unit}
+        </div>
+      )}
+      <Handle type="source" position={outPosition} style={portHandleStyle('#f97316', 'out')} />
+    </div>
+  )
+}
+
+function ReducerNode({ data, selected }: NodeProps) {
+  const d = data as unknown as NetworkNodeData
+  const inPosition = orientPosition(Position.Left, d)
+  const outPosition = orientPosition(Position.Right, d)
+  const unit = d.pressureUnit ?? 'kPa'
+  const rho = d.rho ?? 1000
+  const kindLabel = d.result?.reducer_kind === 'expansion'
+    ? '拡大'
+    : d.result?.reducer_kind === 'contraction'
+      ? '縮小'
+      : '拡縮'
+  return (
+    <div className={`relative px-3 py-2 rounded border-2 bg-lime-50 min-w-[150px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-lime-500'}`}>
+      <Handle type="target" position={inPosition} style={portHandleStyle('#84cc16', 'in')} />
+      {d.showPressureResults && d.result?.P_from_kpa !== undefined && (d.portInConnected ?? d.portLeftConnected) && (
+        <div className={pressureBadgeClass(inPosition)}>
+          {formatPressure(d.result.P_from_kpa, unit, rho)} {unit}
+        </div>
+      )}
+      <div className="flex items-center gap-1.5 mb-0.5">
+        <SvgReducer className="w-4 h-4 text-lime-700 shrink-0" />
+        <span className="text-xs font-bold text-lime-800">{d.label}</span>
+      </div>
+      <div className="text-xs text-lime-600 pl-5">D: {d.diameterIn ?? 100} → {d.diameterOut ?? 50} mm</div>
+      {d.result && (
+        <div className="text-xs font-bold text-red-500 mt-0.5 pl-5">ΔP: {formatPressure(d.result.dP_kpa, unit, rho)} {unit}</div>
+      )}
+      {d.result?.loss_coefficient !== undefined && (
+        <div className="text-xs text-lime-600 pl-5">{kindLabel} · ζ={d.result.loss_coefficient.toFixed(3)}</div>
+      )}
+      {d.showPressureResults && d.result?.P_to_kpa !== undefined && (d.portOutConnected ?? d.portRightConnected) && (
+        <div className={pressureBadgeClass(outPosition)}>
+          {formatPressure(d.result.P_to_kpa, unit, rho)} {unit}
+        </div>
+      )}
+      <Handle type="source" position={outPosition} style={portHandleStyle('#84cc16', 'out')} />
+    </div>
+  )
+}
+
+function ElbowNode({ data, selected }: NodeProps) {
+  const d = data as unknown as NetworkNodeData
+  const inPosition = orientPosition(Position.Left, d)
+  const outPosition = orientPosition(Position.Right, d)
+  const unit = d.pressureUnit ?? 'kPa'
+  const rho = d.rho ?? 1000
+  return (
+    <div className={`relative px-3 py-2 rounded border-2 bg-cyan-50 min-w-[145px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-cyan-500'}`}>
+      <Handle type="target" position={inPosition} style={portHandleStyle('#06b6d4', 'in')} />
+      {d.showPressureResults && d.result?.P_from_kpa !== undefined && (d.portInConnected ?? d.portLeftConnected) && (
+        <div className={pressureBadgeClass(inPosition)}>
+          {formatPressure(d.result.P_from_kpa, unit, rho)} {unit}
+        </div>
+      )}
+      <div className="flex items-center gap-1.5 mb-0.5">
+        <SvgElbow className="w-4 h-4 text-cyan-700 shrink-0" />
+        <span className="text-xs font-bold text-cyan-800">{d.label}</span>
+      </div>
+      <div className="text-xs text-cyan-600 pl-5">θ={d.angle ?? 90}° · D={d.diameter ?? 100} mm</div>
+      {d.result && (
+        <div className="text-xs font-bold text-red-500 mt-0.5 pl-5">ΔP: {formatPressure(d.result.dP_kpa, unit, rho)} {unit}</div>
+      )}
+      {d.result?.loss_coefficient !== undefined && (
+        <div className="text-xs text-cyan-600 pl-5">ζ={d.result.loss_coefficient.toFixed(3)}</div>
+      )}
+      {d.showPressureResults && d.result?.P_to_kpa !== undefined && (d.portOutConnected ?? d.portRightConnected) && (
+        <div className={pressureBadgeClass(outPosition)}>
+          {formatPressure(d.result.P_to_kpa, unit, rho)} {unit}
+        </div>
+      )}
+      <Handle type="source" position={outPosition} style={portHandleStyle('#06b6d4', 'out')} />
+    </div>
+  )
+}
+
+function ValveNode({ data, selected }: NodeProps) {
+  const d = data as unknown as NetworkNodeData
+  const inPosition = orientPosition(Position.Left, d)
+  const outPosition = orientPosition(Position.Right, d)
+  const unit = d.pressureUnit ?? 'kPa'
+  const rho = d.rho ?? 1000
+  const characteristicLabel = d.valveCharacteristic === 'quickOpening'
+    ? 'クイック'
+    : d.valveCharacteristic === 'equalPercentage'
+      ? 'EQ%'
+      : 'リニア'
+  return (
+    <div className={`relative px-3 py-2 rounded border-2 bg-rose-50 min-w-[150px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-rose-500'}`}>
+      <Handle type="target" position={inPosition} style={portHandleStyle('#f43f5e', 'in')} />
+      {d.showPressureResults && d.result?.P_from_kpa !== undefined && (d.portInConnected ?? d.portLeftConnected) && (
+        <div className={pressureBadgeClass(inPosition)}>
+          {formatPressure(d.result.P_from_kpa, unit, rho)} {unit}
+        </div>
+      )}
+      <div className="flex items-center gap-1.5 mb-0.5">
+        <SvgValve className="w-4 h-4 text-rose-700 shrink-0" />
+        <span className="text-xs font-bold text-rose-800">{d.label}</span>
+      </div>
+      <div className="text-xs text-rose-600 pl-5">{characteristicLabel} · 開度 {d.valveOpening ?? 100}%</div>
+      {d.result && (
+        <div className="text-xs font-bold text-red-500 mt-0.5 pl-5">ΔP: {formatPressure(d.result.dP_kpa, unit, rho)} {unit}</div>
+      )}
+      {d.result?.loss_coefficient !== undefined && (
+        <div className="text-xs text-rose-600 pl-5">ζeff={d.result.loss_coefficient.toFixed(3)}</div>
+      )}
+      {d.showPressureResults && d.result?.P_to_kpa !== undefined && (d.portOutConnected ?? d.portRightConnected) && (
+        <div className={pressureBadgeClass(outPosition)}>
+          {formatPressure(d.result.P_to_kpa, unit, rho)} {unit}
+        </div>
+      )}
+      <Handle type="source" position={outPosition} style={portHandleStyle('#f43f5e', 'out')} />
+    </div>
+  )
+}
+
 function TeeNode({ data, selected }: NodeProps) {
   const d = data as unknown as NetworkNodeData
   const r = d.result
   const unit = d.pressureUnit ?? 'kPa'
   const rho = d.rho ?? 1000
+  const mode = d.teeMode ?? 'split'
   const inPosition = orientPosition(Position.Left, d)
-  const out1Position = orientPosition(Position.Right, d)
-  const out2Position = orientPosition(Position.Bottom, d)
+  const branchPosition = orientPosition(Position.Bottom, d)
+  const outPosition = orientPosition(Position.Right, d)
   return (
     <div className={`px-3 py-3 rounded border-2 bg-amber-50 min-w-[110px] text-center ${selected ? 'border-blue-500 shadow-lg' : 'border-amber-400'}`}>
-      <Handle type="target" position={inPosition} id="in" style={portHandleStyle('#f59e0b', 'in')} />
+      {mode === 'split' ? (
+        <Handle type="target" position={inPosition} id="in" style={portHandleStyle('#f59e0b', 'in')} />
+      ) : (
+        <>
+          <Handle type="target" position={inPosition} id="in-1" style={portHandleStyle('#f59e0b', 'in')} />
+          <Handle type="target" position={branchPosition} id="in-2" style={portHandleStyle('#f59e0b', 'in')} />
+        </>
+      )}
       <div className="flex items-center justify-center gap-1.5 mb-0.5">
         <SvgTee className="w-4 h-4 text-amber-600 shrink-0" />
         <span className="text-xs font-bold text-amber-700">{d.label}</span>
@@ -448,17 +709,26 @@ function TeeNode({ data, selected }: NodeProps) {
       {r?.regime === 'split' ? (
         <div className="text-xs text-amber-600 font-medium tabular-nums">
           {r.P_kpa !== undefined && <div>P: {formatPressure(r.P_kpa, unit, rho)} {unit}</div>}
+          {r.T_K !== undefined && <div>T: {r.T_K.toFixed(2)} K</div>}
           <div>{r.Q1_m3h?.toFixed(2)} / {r.Q2_m3h?.toFixed(2)} m³/h</div>
         </div>
       ) : r?.regime === 'junction' && r.P_kpa !== undefined ? (
         <div className="text-xs text-amber-600 font-medium tabular-nums">
           P: {formatPressure(r.P_kpa, unit, rho)} {unit}
+          {r.T_K !== undefined && <div>T: {r.T_K.toFixed(2)} K</div>}
+          <div>{r.Q_m3h.toFixed(2)} m³/h</div>
         </div>
       ) : (
-        <div className="text-xs text-amber-400">圧損バランス分配</div>
+        <div className="text-xs text-amber-400">{mode === 'split' ? '圧損バランス分配' : '合流節点'}</div>
       )}
-      <Handle type="source" position={out1Position} id="out-1" style={portHandleStyle('#f59e0b', 'out')} />
-      <Handle type="source" position={out2Position} id="out-2" style={portHandleStyle('#f59e0b', 'out')} />
+      {mode === 'split' ? (
+        <>
+          <Handle type="source" position={outPosition} id="out-1" style={portHandleStyle('#f59e0b', 'out')} />
+          <Handle type="source" position={branchPosition} id="out-2" style={portHandleStyle('#f59e0b', 'out')} />
+        </>
+      ) : (
+        <Handle type="source" position={outPosition} id="out" style={portHandleStyle('#f59e0b', 'out')} />
+      )}
     </div>
   )
 }
@@ -482,12 +752,18 @@ function SinkNode({ data, selected }: NodeProps) {
           {d.result && (
             <div className="text-xs font-bold text-blue-600">Q: {d.result.Q_m3h.toFixed(2)} m³/h</div>
           )}
+          {d.result?.T_K !== undefined && (
+            <div className="text-xs text-rose-400">T: {d.result.T_K.toFixed(2)} K</div>
+          )}
         </>
       ) : (
         <>
           <div className="text-xs text-rose-400">自由出口 (P=0)</div>
           {d.result && (
             <div className="text-xs font-bold text-blue-600">Q: {d.result.Q_m3h.toFixed(2)} m³/h</div>
+          )}
+          {d.result?.T_K !== undefined && (
+            <div className="text-xs text-rose-400">T: {d.result.T_K.toFixed(2)} K</div>
           )}
         </>
       )}
@@ -501,7 +777,12 @@ const nodeTypes: Record<string, any> = {
   source: SourceNode,
   pipe: PipeNode,
   pump: PumpNode,
+  heatExchanger: HeatExchangerNode,
+  reducer: ReducerNode,
+  elbow: ElbowNode,
+  valve: ValveNode,
   tee: TeeNode,
+  teeMerge: TeeNode,
   sink: SinkNode,
 }
 
@@ -518,6 +799,7 @@ function FlowEdge({
   targetPosition,
   style,
   data,
+  selected,
 }: EdgeProps<FlowEdgeType>) {
   const [edgePath, labelX, labelY] = getSmoothStepPath({
     sourceX,
@@ -533,7 +815,12 @@ function FlowEdge({
       <BaseEdge
         id={id}
         path={edgePath}
-        style={{ stroke: '#94a3b8', strokeWidth: 2.5, ...style }}
+        style={{
+          stroke: selected ? '#f97316' : '#94a3b8',
+          strokeWidth: selected ? 6 : 2.5,
+          filter: selected ? 'drop-shadow(0 0 8px rgba(194, 65, 12, 0.95)) drop-shadow(0 0 3px rgba(249, 115, 22, 0.9))' : undefined,
+          ...style,
+        }}
       />
       {data?.flowLabel && data.labelVisible !== false && (
         <EdgeLabelRenderer>
@@ -562,13 +849,18 @@ const PALETTE = [
   { type: 'boundary', label: '境界',  sub: 'P / Q',  color: 'text-teal-300',    Icon: SvgSource },
   { type: 'pipe',   label: 'パイプ',  sub: '直管',  color: 'text-sky-300',    Icon: SvgPipe },
   { type: 'pump',   label: 'ポンプ',  sub: 'PQ',    color: 'text-violet-300', Icon: SvgPump },
+  { type: 'heatExchanger', label: '熱交換器', sub: 'UA', color: 'text-orange-300', Icon: SvgHeatExchanger },
+  { type: 'reducer', label: '拡縮管', sub: 'ζ', color: 'text-lime-300', Icon: SvgReducer },
+  { type: 'elbow', label: 'エルボ', sub: 'θ/ζ', color: 'text-cyan-300', Icon: SvgElbow },
+  { type: 'valve', label: 'バルブ', sub: '開度/PQ', color: 'text-rose-300', Icon: SvgValve },
   { type: 'tee',    label: 'T字管',   sub: '分岐',  color: 'text-amber-300',  Icon: SvgTee },
+  { type: 'teeMerge', label: 'T字管', sub: '合流', color: 'text-amber-300', Icon: SvgTee },
 ]
 
 function defaultData(type: string, n: number): NetworkNodeData {
   switch (type) {
-    case 'boundary': return { nodeType: 'boundary', label: `境界${n}`, boundaryType: 'pressure', pressure: 101.325, flowRate: 10 }
-    case 'source': return { nodeType: 'source', label: `ソース${n}`, boundaryType: 'flow', flowRate: 10, pressure: 100 }
+    case 'boundary': return { nodeType: 'boundary', label: `境界${n}`, boundaryType: 'pressure', pressure: 101.325, flowRate: 10, temperature: 293.15 }
+    case 'source': return { nodeType: 'source', label: `ソース${n}`, boundaryType: 'flow', flowRate: 10, pressure: 100, temperature: 293.15 }
     case 'pipe':   return {
       nodeType: 'pipe', label: `パイプ${n}`,
       pipeShape: 'circular',
@@ -590,9 +882,41 @@ function defaultData(type: string, n: number): NetworkNodeData {
         { q: 51.96, h: 0 },
       ],
     }
-    case 'tee':  return { nodeType: 'tee',  label: `T字管${n}` }
-    case 'sink': return { nodeType: 'sink', label: `シンク${n}`, boundaryType: 'pressure', pressure: 101.325 }
-    default:     return { nodeType: 'boundary', label: `${type}${n}`, boundaryType: 'pressure', pressure: 101.325, flowRate: 10 }
+    case 'heatExchanger': return {
+      nodeType: 'heatExchanger', label: `熱交換器${n}`,
+      exchangeTemperature: 303.15,
+      heatTransferCoeff: 500,
+      heatTransferArea: 10,
+      ratedFlow: 10,
+      nominalPressureDrop: 10,
+    }
+    case 'reducer': return {
+      nodeType: 'reducer', label: `拡縮管${n}`,
+      diameterIn: 100,
+      diameterOut: 50,
+      lossMode: 'auto',
+      lossCoefficient: 0.5,
+    }
+    case 'elbow': return {
+      nodeType: 'elbow', label: `エルボ${n}`,
+      diameter: 100,
+      angle: 90,
+      elbowLossMode: 'auto',
+      lossCoefficient: 0.75,
+      zeta90: 0.75,
+    }
+    case 'valve': return {
+      nodeType: 'valve', label: `バルブ${n}`,
+      diameter: 100,
+      valveCharacteristic: 'linear',
+      valveOpening: 100,
+      valveZetaFullOpen: 1.0,
+      valveRangeability: 50,
+    }
+    case 'tee':  return { nodeType: 'tee',  label: `分岐T字管${n}`, teeMode: 'split' }
+    case 'teeMerge': return { nodeType: 'tee', label: `合流T字管${n}`, teeMode: 'merge' }
+    case 'sink': return { nodeType: 'sink', label: `シンク${n}`, boundaryType: 'pressure', pressure: 101.325, temperature: 293.15 }
+    default:     return { nodeType: 'boundary', label: `${type}${n}`, boundaryType: 'pressure', pressure: 101.325, flowRate: 10, temperature: 293.15 }
   }
 }
 
@@ -640,19 +964,40 @@ function NumField({ label, unit, value, onChange }: {
 // ── Unified result table: 項目 / 記号 / 値 / 単位 ──────────────────
 
 type ResultRow = { item: string; symbol: string; value: string; unit: string; highlight?: boolean }
-type ResultTheme = 'sky' | 'violet' | 'amber' | 'blue'
+type ResultTheme = 'sky' | 'violet' | 'orange' | 'amber' | 'blue' | 'rose'
 
 const RESULT_THEME_CLASSES: Record<ResultTheme, { bg: string; border: string; title: string }> = {
   sky:    { bg: 'bg-sky-50',    border: 'border-sky-100',    title: 'text-sky-600' },
   violet: { bg: 'bg-violet-50', border: 'border-violet-100', title: 'text-violet-600' },
+  orange: { bg: 'bg-orange-50', border: 'border-orange-100', title: 'text-orange-600' },
   amber:  { bg: 'bg-amber-50',  border: 'border-amber-100',  title: 'text-amber-600' },
   blue:   { bg: 'bg-blue-50',   border: 'border-blue-100',   title: 'text-blue-600' },
+  rose:   { bg: 'bg-rose-50',   border: 'border-rose-100',   title: 'text-rose-600' },
 }
 
-function ResultTable({ title, rows, theme = 'sky', note }: {
-  title: string; rows: ResultRow[]; theme?: ResultTheme; note?: string
+function resultSymbols(rows: ResultRow[]): string[] {
+  return rows.map(row => row.symbol)
+}
+
+function filterVisibleRows(rows: ResultRow[] | null, data: NetworkNodeData): ResultRow[] | null {
+  if (!rows) return null
+  const visible = data.resultVisibleSymbols
+  if (!visible) return []
+  const visibleSet = new Set(visible)
+  return rows.filter(row => visibleSet.has(row.symbol))
+}
+
+function ResultTable({ title, rows, theme = 'sky', note, selectedSymbols, onToggleSymbol }: {
+  title: string
+  rows: ResultRow[]
+  theme?: ResultTheme
+  note?: string
+  selectedSymbols?: string[]
+  onToggleSymbol?: (symbol: string, checked: boolean, allSymbols: string[]) => void
 }) {
   const c = RESULT_THEME_CLASSES[theme]
+  const allSymbols = resultSymbols(rows)
+  const selectedSet = selectedSymbols ? new Set(selectedSymbols) : null
   return (
     <div className={`rounded-lg p-3 border ${c.bg} ${c.border}`}>
       <div className={`text-xs font-semibold mb-2 ${c.title}`}>{title}</div>
@@ -660,6 +1005,7 @@ function ResultTable({ title, rows, theme = 'sky', note }: {
       <table className="w-full text-sm border-collapse">
         <thead>
           <tr className="text-xs text-gray-400">
+            <th className="w-6 pb-1" />
             <th className="text-left font-medium pb-1">項目</th>
             <th className="text-left font-medium pb-1">記号</th>
             <th className="text-right font-medium pb-1">値</th>
@@ -668,7 +1014,15 @@ function ResultTable({ title, rows, theme = 'sky', note }: {
         </thead>
         <tbody>
           {rows.map(r => (
-            <tr key={r.item} className="border-t border-black/5">
+            <tr key={r.symbol} className="border-t border-black/5">
+              <td className="py-1 pr-2">
+                <input
+                  type="checkbox"
+                  checked={selectedSet ? selectedSet.has(r.symbol) : false}
+                  onChange={e => onToggleSymbol?.(r.symbol, e.target.checked, allSymbols)}
+                  className="h-3.5 w-3.5 accent-blue-600"
+                />
+              </td>
               <td className="py-1 text-xs text-gray-500 whitespace-nowrap">{r.item}</td>
               <td className="py-1 text-xs text-gray-400 italic whitespace-nowrap">{r.symbol}</td>
               <td className={`py-1 text-right tabular-nums font-medium whitespace-nowrap ${r.highlight ? 'text-red-600 font-bold' : 'text-gray-800'}`}>
@@ -692,6 +1046,8 @@ function pipeResultRows(result: PipeSegmentResult, unit: PressureUnit, rho: numb
     { item: '圧力損失',    symbol: 'ΔP', value: formatPressure(result.dP_kpa, unit, rho), unit, highlight: true },
     ...(result.P_in_kpa  !== undefined ? [{ item: '上流圧', symbol: 'P_in',  value: formatPressure(result.P_in_kpa,  unit, rho), unit }] : []),
     ...(result.P_out_kpa !== undefined ? [{ item: '下流圧', symbol: 'P_out', value: formatPressure(result.P_out_kpa, unit, rho), unit }] : []),
+    ...(result.T_in_K  !== undefined ? [{ item: '入口温度', symbol: 'T_in',  value: result.T_in_K.toFixed(3), unit: 'K' }] : []),
+    ...(result.T_out_K !== undefined ? [{ item: '出口温度', symbol: 'T_out', value: result.T_out_K.toFixed(3), unit: 'K' }] : []),
   ]
 }
 
@@ -704,16 +1060,104 @@ function pumpResultRows(result: PipeSegmentResult, unit: PressureUnit, rho: numb
     { item: '消費動力', symbol: 'P_s', value: (result.shaft_power_kw ?? 0).toFixed(4),     unit: 'kW', highlight: true },
     ...(result.P_from_kpa !== undefined ? [{ item: '入口圧', symbol: 'P_in',  value: formatPressure(result.P_from_kpa, unit, rho), unit }] : []),
     ...(result.P_to_kpa   !== undefined ? [{ item: '出口圧', symbol: 'P_out', value: formatPressure(result.P_to_kpa,   unit, rho), unit }] : []),
+    ...(result.T_in_K     !== undefined ? [{ item: '入口温度', symbol: 'T_in', value: result.T_in_K.toFixed(3), unit: 'K' }] : []),
+    ...(result.T_out_K    !== undefined ? [{ item: '出口温度', symbol: 'T_out', value: result.T_out_K.toFixed(3), unit: 'K' }] : []),
+  ]
+}
+
+function heatExchangerResultRows(result: PipeSegmentResult, unit: PressureUnit, rho: number): ResultRow[] {
+  return [
+    { item: '流量',       symbol: 'Q',     value: result.Q_m3h.toFixed(3), unit: 'm³/h' },
+    { item: '圧力損失',   symbol: 'ΔP',    value: formatPressure(result.dP_kpa, unit, rho), unit, highlight: true },
+    { item: '熱交換量',   symbol: 'Q_heat', value: (result.heat_duty_kw ?? 0).toFixed(4), unit: 'kW', highlight: true },
+    { item: '入口温度',   symbol: 'T_in',  value: result.T_in_K !== undefined ? result.T_in_K.toFixed(3) : '—', unit: 'K' },
+    { item: '出口温度',   symbol: 'T_out', value: result.T_out_K !== undefined ? result.T_out_K.toFixed(3) : '—', unit: 'K', highlight: true },
+    ...(result.exchange_temperature_K !== undefined ? [{ item: '熱交換温度', symbol: 'T_env', value: result.exchange_temperature_K.toFixed(3), unit: 'K' }] : []),
+    ...(result.UA_w_per_k !== undefined ? [{ item: 'UA', symbol: 'UA', value: result.UA_w_per_k.toFixed(3), unit: 'W/K' }] : []),
+    ...(result.rated_flow_m3h !== undefined ? [{ item: '定格流量', symbol: 'Q_r', value: result.rated_flow_m3h.toFixed(3), unit: 'm³/h' }] : []),
+    ...(result.nominal_pressure_drop_kpa !== undefined ? [{ item: 'ノミナル圧損', symbol: 'ΔP_n', value: formatPressure(result.nominal_pressure_drop_kpa, unit, rho), unit }] : []),
+    ...(result.P_in_kpa  !== undefined ? [{ item: '上流圧', symbol: 'P_in',  value: formatPressure(result.P_in_kpa,  unit, rho), unit }] : []),
+    ...(result.P_out_kpa !== undefined ? [{ item: '下流圧', symbol: 'P_out', value: formatPressure(result.P_out_kpa, unit, rho), unit }] : []),
+  ]
+}
+
+function reducerResultRows(result: PipeSegmentResult, unit: PressureUnit, rho: number): ResultRow[] {
+  const kind = result.reducer_kind === 'expansion'
+    ? '拡大'
+    : result.reducer_kind === 'contraction'
+      ? '縮小'
+      : result.reducer_kind === 'manual'
+        ? '手動'
+        : '拡縮'
+  return [
+    { item: '流量',       symbol: 'Q',  value: result.Q_m3h.toFixed(3), unit: 'm³/h' },
+    { item: '基準流速',   symbol: 'v',  value: result.v.toFixed(4),     unit: 'm/s' },
+    { item: '圧力損失',   symbol: 'ΔP', value: formatPressure(result.dP_kpa, unit, rho), unit, highlight: true },
+    ...(result.loss_coefficient !== undefined ? [{ item: '抵抗係数', symbol: 'ζ', value: result.loss_coefficient.toFixed(4), unit: '-' }] : []),
+    ...(result.upstream_diameter_mm !== undefined ? [{ item: '上流径', symbol: 'D_up', value: result.upstream_diameter_mm.toFixed(3), unit: 'mm' }] : []),
+    ...(result.downstream_diameter_mm !== undefined ? [{ item: '下流径', symbol: 'D_down', value: result.downstream_diameter_mm.toFixed(3), unit: 'mm' }] : []),
+    { item: '流動形態', symbol: 'type', value: kind, unit: '-' },
+    ...(result.P_in_kpa  !== undefined ? [{ item: '上流圧', symbol: 'P_in',  value: formatPressure(result.P_in_kpa,  unit, rho), unit }] : []),
+    ...(result.P_out_kpa !== undefined ? [{ item: '下流圧', symbol: 'P_out', value: formatPressure(result.P_out_kpa, unit, rho), unit }] : []),
+    ...(result.T_in_K  !== undefined ? [{ item: '入口温度', symbol: 'T_in',  value: result.T_in_K.toFixed(3), unit: 'K' }] : []),
+    ...(result.T_out_K !== undefined ? [{ item: '出口温度', symbol: 'T_out', value: result.T_out_K.toFixed(3), unit: 'K' }] : []),
+  ]
+}
+
+function elbowResultRows(result: PipeSegmentResult, unit: PressureUnit, rho: number): ResultRow[] {
+  return [
+    { item: '流量',       symbol: 'Q',  value: result.Q_m3h.toFixed(3), unit: 'm³/h' },
+    { item: '流速',       symbol: 'v',  value: result.v.toFixed(4),     unit: 'm/s' },
+    { item: '圧力損失',   symbol: 'ΔP', value: formatPressure(result.dP_kpa, unit, rho), unit, highlight: true },
+    ...(result.angle_deg !== undefined ? [{ item: '角度', symbol: 'θ', value: result.angle_deg.toFixed(1), unit: 'deg' }] : []),
+    ...(result.diameter_mm !== undefined ? [{ item: '基準径', symbol: 'D', value: result.diameter_mm.toFixed(3), unit: 'mm' }] : []),
+    ...(result.loss_coefficient !== undefined ? [{ item: '抵抗係数', symbol: 'ζ', value: result.loss_coefficient.toFixed(4), unit: '-' }] : []),
+    ...(result.zeta90 !== undefined ? [{ item: '90度基準ζ', symbol: 'ζ90', value: result.zeta90.toFixed(4), unit: '-' }] : []),
+    ...(result.P_in_kpa  !== undefined ? [{ item: '上流圧', symbol: 'P_in',  value: formatPressure(result.P_in_kpa,  unit, rho), unit }] : []),
+    ...(result.P_out_kpa !== undefined ? [{ item: '下流圧', symbol: 'P_out', value: formatPressure(result.P_out_kpa, unit, rho), unit }] : []),
+    ...(result.T_in_K  !== undefined ? [{ item: '入口温度', symbol: 'T_in',  value: result.T_in_K.toFixed(3), unit: 'K' }] : []),
+    ...(result.T_out_K !== undefined ? [{ item: '出口温度', symbol: 'T_out', value: result.T_out_K.toFixed(3), unit: 'K' }] : []),
+  ]
+}
+
+function valveCharacteristicLabel(characteristic: string | undefined): string {
+  if (characteristic === 'quickOpening') return 'クイックオープン'
+  if (characteristic === 'equalPercentage') return 'イコールパーセント'
+  return 'リニア'
+}
+
+function valveResultRows(result: PipeSegmentResult, unit: PressureUnit, rho: number): ResultRow[] {
+  return [
+    { item: '流量',       symbol: 'Q',  value: result.Q_m3h.toFixed(3), unit: 'm³/h' },
+    { item: '流速',       symbol: 'v',  value: result.v.toFixed(4),     unit: 'm/s' },
+    { item: '圧力損失',   symbol: 'ΔP', value: formatPressure(result.dP_kpa, unit, rho), unit, highlight: true },
+    ...(result.valve_opening_percent !== undefined ? [{ item: '開度', symbol: 'open', value: result.valve_opening_percent.toFixed(1), unit: '%' }] : []),
+    ...(result.valve_characteristic !== undefined ? [{ item: '特性', symbol: 'type', value: valveCharacteristicLabel(result.valve_characteristic), unit: '-' }] : []),
+    ...(result.valve_relative_capacity !== undefined ? [{ item: '相対Cv', symbol: 'Cv_rel', value: result.valve_relative_capacity.toFixed(4), unit: '-' }] : []),
+    ...(result.loss_coefficient !== undefined ? [{ item: '有効抵抗係数', symbol: 'ζeff', value: result.loss_coefficient.toFixed(4), unit: '-' }] : []),
+    ...(result.valve_zeta_full_open !== undefined ? [{ item: '全開時ζ', symbol: 'ζ_open', value: result.valve_zeta_full_open.toFixed(4), unit: '-' }] : []),
+    ...(result.diameter_mm !== undefined ? [{ item: '基準径', symbol: 'D', value: result.diameter_mm.toFixed(3), unit: 'mm' }] : []),
+    ...(result.P_in_kpa  !== undefined ? [{ item: '上流圧', symbol: 'P_in',  value: formatPressure(result.P_in_kpa,  unit, rho), unit }] : []),
+    ...(result.P_out_kpa !== undefined ? [{ item: '下流圧', symbol: 'P_out', value: formatPressure(result.P_out_kpa, unit, rho), unit }] : []),
+    ...(result.T_in_K  !== undefined ? [{ item: '入口温度', symbol: 'T_in',  value: result.T_in_K.toFixed(3), unit: 'K' }] : []),
+    ...(result.T_out_K !== undefined ? [{ item: '出口温度', symbol: 'T_out', value: result.T_out_K.toFixed(3), unit: 'K' }] : []),
   ]
 }
 
 function boundaryResultRows(d: NetworkNodeData, unit: PressureUnit, rho: number): ResultRow[] | null {
   const isFlow = (d.boundaryType ?? 'flow') === 'flow'
+  const temp = d.calcTemperature ?? d.result?.T_K ?? d.temperature
   if (isFlow && d.calcPressure !== undefined) {
-    return [{ item: '境界圧力', symbol: 'P', value: formatPressure(d.calcPressure, unit, rho), unit, highlight: true }]
+    return [
+      { item: '境界圧力', symbol: 'P', value: formatPressure(d.calcPressure, unit, rho), unit, highlight: true },
+      ...(temp !== undefined ? [{ item: '流体温度', symbol: 'T', value: temp.toFixed(3), unit: 'K' }] : []),
+    ]
   }
   if (!isFlow && d.calcFlow !== undefined) {
-    return [{ item: '境界流量', symbol: 'Q', value: d.calcFlow.toFixed(3), unit: 'm³/h', highlight: true }]
+    return [
+      { item: '境界流量', symbol: 'Q', value: d.calcFlow.toFixed(3), unit: 'm³/h', highlight: true },
+      ...(temp !== undefined ? [{ item: '流体温度', symbol: 'T', value: temp.toFixed(3), unit: 'K' }] : []),
+    ]
   }
   return null
 }
@@ -724,6 +1168,7 @@ function teeResultRows(d: NetworkNodeData, unit: PressureUnit, rho: number): Res
     return [
       { item: '圧力',   symbol: 'P', value: r.P_kpa !== undefined ? formatPressure(r.P_kpa, unit, rho) : '—', unit, highlight: true },
       { item: '通過流量', symbol: 'Q', value: r.Q_m3h.toFixed(3), unit: 'm³/h' },
+      ...(r.T_K !== undefined ? [{ item: '流体温度', symbol: 'T', value: r.T_K.toFixed(3), unit: 'K' }] : []),
     ]
   }
   if (r?.regime === 'split') {
@@ -736,6 +1181,7 @@ function teeResultRows(d: NetworkNodeData, unit: PressureUnit, rho: number): Res
       { item: '出口流量2', symbol: 'Q₂', value: q2 !== undefined ? q2.toFixed(3) : '—',                 unit: 'm³/h', highlight: true },
       { item: '分配率1',   symbol: 'η₁', value: (q1 !== undefined && q !== 0) ? (q1 / q * 100).toFixed(1) : '—', unit: '%' },
       { item: '分配率2',   symbol: 'η₂', value: (q2 !== undefined && q !== 0) ? (q2 / q * 100).toFixed(1) : '—', unit: '%' },
+      ...(r.T_K !== undefined ? [{ item: '流体温度', symbol: 'T', value: r.T_K.toFixed(3), unit: 'K' }] : []),
     ]
   }
   return null
@@ -744,15 +1190,25 @@ function teeResultRows(d: NetworkNodeData, unit: PressureUnit, rho: number): Res
 function componentTypeLabel(nodeType: string): string {
   if (nodeType === 'pipe') return 'パイプ'
   if (nodeType === 'pump') return 'ポンプ'
+  if (nodeType === 'heatExchanger') return '熱交換器'
+  if (nodeType === 'reducer') return '拡縮管'
+  if (nodeType === 'elbow') return 'エルボ'
+  if (nodeType === 'valve') return 'バルブ'
   if (nodeType === 'tee')  return 'T字管'
   return '境界'
 }
 
 function componentResultRows(d: NetworkNodeData, unit: PressureUnit, rho: number): ResultRow[] | null {
-  if (d.nodeType === 'pipe') return d.result ? pipeResultRows(d.result, unit, rho) : null
-  if (d.nodeType === 'pump') return d.result ? pumpResultRows(d.result, unit, rho) : null
-  if (d.nodeType === 'tee')  return teeResultRows(d, unit, rho)
-  return boundaryResultRows(d, unit, rho)
+  const rows =
+    d.nodeType === 'pipe' ? (d.result ? pipeResultRows(d.result, unit, rho) : null)
+    : d.nodeType === 'pump' ? (d.result ? pumpResultRows(d.result, unit, rho) : null)
+    : d.nodeType === 'heatExchanger' ? (d.result ? heatExchangerResultRows(d.result, unit, rho) : null)
+    : d.nodeType === 'reducer' ? (d.result ? reducerResultRows(d.result, unit, rho) : null)
+    : d.nodeType === 'elbow' ? (d.result ? elbowResultRows(d.result, unit, rho) : null)
+    : d.nodeType === 'valve' ? (d.result ? valveResultRows(d.result, unit, rho) : null)
+    : d.nodeType === 'tee' ? teeResultRows(d, unit, rho)
+    : boundaryResultRows(d, unit, rho)
+  return filterVisibleRows(rows, d)
 }
 
 function NodeParamPanel({ node, onChange }: {
@@ -780,11 +1236,19 @@ function NodeParamPanel({ node, onChange }: {
   const Icon = isBoundaryNode ? SvgSource
     : d.nodeType === 'pipe' ? SvgPipe
     : d.nodeType === 'pump' ? SvgPump
+    : d.nodeType === 'heatExchanger' ? SvgHeatExchanger
+    : d.nodeType === 'reducer' ? SvgReducer
+    : d.nodeType === 'elbow' ? SvgElbow
+    : d.nodeType === 'valve' ? SvgValve
     : SvgTee
 
   const iconColor = isBoundaryNode ? 'text-teal-600'
     : d.nodeType === 'pipe' ? 'text-sky-600'
     : d.nodeType === 'pump' ? 'text-violet-600'
+    : d.nodeType === 'heatExchanger' ? 'text-orange-600'
+    : d.nodeType === 'reducer' ? 'text-lime-700'
+    : d.nodeType === 'elbow' ? 'text-cyan-700'
+    : d.nodeType === 'valve' ? 'text-rose-700'
     : 'text-amber-600'
 
   return (
@@ -820,6 +1284,7 @@ function NodeParamPanel({ node, onChange }: {
         ) : (
           <NumField label="圧力 P" unit="kPa" value={d.pressure ?? 100} onChange={v => onChange({ pressure: v })} />
         )}
+        <NumField label="流体温度 T" unit="K" value={d.temperature ?? 293.15} onChange={v => onChange({ temperature: v })} />
       </>)}
 
       {/* ── Pipe ── */}
@@ -974,6 +1439,174 @@ function NodeParamPanel({ node, onChange }: {
 
         <NumField label="効率 η" unit="%" value={d.efficiency ?? 70} onChange={v => onChange({ efficiency: v })} />
       </>)}
+
+      {/* ── Heat Exchanger ── */}
+      {d.nodeType === 'heatExchanger' && (<>
+        <NumField label="熱交換温度 T_env" unit="K" value={d.exchangeTemperature ?? 303.15} onChange={v => onChange({ exchangeTemperature: v })} />
+        <NumField label="総括熱伝達率 U" unit="W/m²/K" value={d.heatTransferCoeff ?? 500} onChange={v => onChange({ heatTransferCoeff: v })} />
+        <NumField label="熱交換面積 A" unit="m²" value={d.heatTransferArea ?? 10} onChange={v => onChange({ heatTransferArea: v })} />
+        <NumField label="定格流量 Qr" unit="m³/h" value={d.ratedFlow ?? 10} onChange={v => onChange({ ratedFlow: v })} />
+        <NumField label="ノミナル圧損 ΔPn" unit="kPa" value={d.nominalPressureDrop ?? 10} onChange={v => onChange({ nominalPressureDrop: v })} />
+      </>)}
+
+      {/* ── Reducer / Expander ── */}
+      {d.nodeType === 'reducer' && (<>
+        <NumField label="入口径 D_in" unit="mm" value={d.diameterIn ?? 100} onChange={v => onChange({ diameterIn: v })} />
+        <NumField label="出口径 D_out" unit="mm" value={d.diameterOut ?? 50} onChange={v => onChange({ diameterOut: v })} />
+        <div className="flex flex-col gap-1.5">
+          <label className="text-xs font-medium text-gray-600">抵抗係数モード</label>
+          <div className="grid grid-cols-2 gap-2">
+            {([
+              ['auto', '自動'],
+              ['manual', '手動'],
+            ] as const).map(([mode, label]) => (
+              <button
+                key={mode}
+                type="button"
+                onClick={() => onChange({ lossMode: mode })}
+                className={`rounded-md border px-3 py-2 text-sm font-medium transition-colors ${
+                  (d.lossMode ?? 'auto') === mode
+                    ? 'border-lime-400 bg-lime-50 text-lime-700'
+                    : 'border-gray-200 bg-white text-gray-600 hover:bg-gray-50'
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+        {(d.lossMode ?? 'auto') === 'manual' && (
+          <NumField label="抵抗係数 ζ" unit="-" value={d.lossCoefficient ?? 0.5} onChange={v => onChange({ lossCoefficient: v })} />
+        )}
+      </>)}
+
+      {/* ── Elbow ── */}
+      {d.nodeType === 'elbow' && (<>
+        <NumField label="基準径 D" unit="mm" value={d.diameter ?? 100} onChange={v => onChange({ diameter: v })} />
+        <NumField label="角度 θ" unit="deg" value={d.angle ?? 90} onChange={v => onChange({ angle: v })} />
+        <div className="grid grid-cols-3 gap-2">
+          {[90, 45, 30].map(angle => (
+            <button
+              key={angle}
+              type="button"
+              onClick={() => onChange({ angle })}
+              className="rounded-md border border-cyan-200 bg-white px-2 py-1.5 text-sm font-medium text-cyan-700 hover:bg-cyan-50"
+            >
+              {angle}°
+            </button>
+          ))}
+        </div>
+        <div className="flex flex-col gap-1.5">
+          <label className="text-xs font-medium text-gray-600">抵抗係数モード</label>
+          <div className="grid grid-cols-2 gap-2">
+            {([
+              ['auto', '自動'],
+              ['manual', '手動'],
+            ] as const).map(([mode, label]) => (
+              <button
+                key={mode}
+                type="button"
+                onClick={() => onChange({ elbowLossMode: mode })}
+                className={`rounded-md border px-3 py-2 text-sm font-medium transition-colors ${
+                  (d.elbowLossMode ?? 'auto') === mode
+                    ? 'border-cyan-400 bg-cyan-50 text-cyan-700'
+                    : 'border-gray-200 bg-white text-gray-600 hover:bg-gray-50'
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+        {(d.elbowLossMode ?? 'auto') === 'auto' ? (
+          <NumField label="90度基準 ζ90" unit="-" value={d.zeta90 ?? 0.75} onChange={v => onChange({ zeta90: v })} />
+        ) : (
+          <NumField label="抵抗係数 ζ" unit="-" value={d.lossCoefficient ?? 0.75} onChange={v => onChange({ lossCoefficient: v })} />
+        )}
+      </>)}
+
+      {/* ── Valve ── */}
+      {d.nodeType === 'valve' && (<>
+        <NumField label="基準径 D" unit="mm" value={d.diameter ?? 100} onChange={v => onChange({ diameter: v })} />
+        <div className="flex flex-col gap-1.5">
+          <label className="text-xs font-medium text-gray-600">PQ特性</label>
+          <div className="grid grid-cols-1 gap-2">
+            {([
+              ['linear', 'リニア'],
+              ['quickOpening', 'クイックオープン'],
+              ['equalPercentage', 'イコールパーセント'],
+            ] as const).map(([mode, label]) => (
+              <button
+                key={mode}
+                type="button"
+                onClick={() => onChange({ valveCharacteristic: mode })}
+                className={`rounded-md border px-3 py-2 text-sm font-medium transition-colors ${
+                  (d.valveCharacteristic ?? 'linear') === mode
+                    ? 'border-rose-400 bg-rose-50 text-rose-700'
+                    : 'border-gray-200 bg-white text-gray-600 hover:bg-gray-50'
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="flex flex-col gap-1.5">
+          <div className="flex items-center justify-between gap-3">
+            <label className="text-xs font-medium text-gray-600">開度</label>
+            <span className="text-sm font-semibold tabular-nums text-rose-700">{(d.valveOpening ?? 100).toFixed(1)} %</span>
+          </div>
+          <input
+            type="range"
+            min={0}
+            max={100}
+            step={1}
+            value={d.valveOpening ?? 100}
+            onChange={e => onChange({ valveOpening: Number(e.target.value) })}
+            className="w-full accent-rose-500"
+          />
+        </div>
+        <NumField label="全開時抵抗係数 ζopen" unit="-" value={d.valveZetaFullOpen ?? 1.0} onChange={v => onChange({ valveZetaFullOpen: v })} />
+        {(d.valveCharacteristic ?? 'linear') === 'equalPercentage' && (
+          <NumField label="レンジアビリティ R" unit="-" value={d.valveRangeability ?? 50} onChange={v => onChange({ valveRangeability: v })} />
+        )}
+        <div className="rounded-lg border border-rose-100 bg-rose-50 p-3 text-sm text-rose-700">
+          <div className="flex justify-between gap-3">
+            <span className="text-xs text-rose-500">相対Cv</span>
+            <span className="font-semibold tabular-nums">{valveRelativeCapacity(d).toFixed(4)}</span>
+          </div>
+          <div className="mt-1 flex justify-between gap-3">
+            <span className="text-xs text-rose-500">有効ζ</span>
+            <span className="font-semibold tabular-nums">{valveEffectiveZeta(d).toFixed(4)}</span>
+          </div>
+        </div>
+      </>)}
+
+      {/* ── Tee ── */}
+      {d.nodeType === 'tee' && (
+        <div className="flex flex-col gap-1.5">
+          <label className="text-xs font-medium text-gray-600">T字管モード</label>
+          <div className="grid grid-cols-2 gap-2">
+            {([
+              ['split', '分岐'],
+              ['merge', '合流'],
+            ] as const).map(([mode, label]) => (
+              <button
+                key={mode}
+                type="button"
+                onClick={() => onChange({ teeMode: mode })}
+                className={`rounded-md border px-3 py-2 text-sm font-medium transition-colors ${
+                  (d.teeMode ?? 'split') === mode
+                    ? 'border-amber-400 bg-amber-50 text-amber-700'
+                    : 'border-gray-200 bg-white text-gray-600 hover:bg-gray-50'
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -982,10 +1615,11 @@ const REGIME_TEXT_LABEL: Record<string, string> = {
   laminar: '層流', transitional: '遷移域', turbulent: '乱流', junction: '節点',
 }
 
-function ResultsPanel({ node, pressureUnit, rho }: {
+function ResultsPanel({ node, pressureUnit, rho, onToggleResultSymbol }: {
   node: Node | null
   pressureUnit: PressureUnit
   rho: number
+  onToggleResultSymbol: (nodeId: string, symbol: string, checked: boolean, allSymbols: string[]) => void
 }) {
   const empty = (
     <div className="flex flex-col items-center justify-center h-28 text-center gap-2">
@@ -1013,6 +1647,8 @@ function ResultsPanel({ node, pressureUnit, rho }: {
           theme="blue"
           title={isFlow ? '計算結果 — 境界圧力' : '計算結果 — 境界流量'}
           rows={rows}
+          selectedSymbols={d.resultVisibleSymbols}
+          onToggleSymbol={(symbol, checked, allSymbols) => onToggleResultSymbol(node.id, symbol, checked, allSymbols)}
         />
       )
     }
@@ -1027,6 +1663,8 @@ function ResultsPanel({ node, pressureUnit, rho }: {
         title="計算結果 — パイプ"
         note={`流動域: ${REGIME_TEXT_LABEL[d.result.regime] ?? d.result.regime}`}
         rows={pipeResultRows(d.result, pressureUnit, rho)}
+        selectedSymbols={d.resultVisibleSymbols}
+        onToggleSymbol={(symbol, checked, allSymbols) => onToggleResultSymbol(node.id, symbol, checked, allSymbols)}
       />
     )
   }
@@ -1038,6 +1676,60 @@ function ResultsPanel({ node, pressureUnit, rho }: {
         theme="violet"
         title="計算結果 — ポンプ"
         rows={pumpResultRows(d.result, pressureUnit, rho)}
+        selectedSymbols={d.resultVisibleSymbols}
+        onToggleSymbol={(symbol, checked, allSymbols) => onToggleResultSymbol(node.id, symbol, checked, allSymbols)}
+      />
+    )
+  }
+
+  if (d.nodeType === 'heatExchanger') {
+    if (!d.result) return empty
+    return (
+      <ResultTable
+        theme="orange"
+        title="計算結果 — 熱交換器"
+        rows={heatExchangerResultRows(d.result, pressureUnit, rho)}
+        selectedSymbols={d.resultVisibleSymbols}
+        onToggleSymbol={(symbol, checked, allSymbols) => onToggleResultSymbol(node.id, symbol, checked, allSymbols)}
+      />
+    )
+  }
+
+  if (d.nodeType === 'reducer') {
+    if (!d.result) return empty
+    return (
+      <ResultTable
+        theme="sky"
+        title="計算結果 — 拡縮管"
+        rows={reducerResultRows(d.result, pressureUnit, rho)}
+        selectedSymbols={d.resultVisibleSymbols}
+        onToggleSymbol={(symbol, checked, allSymbols) => onToggleResultSymbol(node.id, symbol, checked, allSymbols)}
+      />
+    )
+  }
+
+  if (d.nodeType === 'elbow') {
+    if (!d.result) return empty
+    return (
+      <ResultTable
+        theme="blue"
+        title="計算結果 — エルボ"
+        rows={elbowResultRows(d.result, pressureUnit, rho)}
+        selectedSymbols={d.resultVisibleSymbols}
+        onToggleSymbol={(symbol, checked, allSymbols) => onToggleResultSymbol(node.id, symbol, checked, allSymbols)}
+      />
+    )
+  }
+
+  if (d.nodeType === 'valve') {
+    if (!d.result) return empty
+    return (
+      <ResultTable
+        theme="rose"
+        title="計算結果 — バルブ"
+        rows={valveResultRows(d.result, pressureUnit, rho)}
+        selectedSymbols={d.resultVisibleSymbols}
+        onToggleSymbol={(symbol, checked, allSymbols) => onToggleResultSymbol(node.id, symbol, checked, allSymbols)}
       />
     )
   }
@@ -1050,6 +1742,8 @@ function ResultsPanel({ node, pressureUnit, rho }: {
           theme="amber"
           title={d.result?.regime === 'junction' ? '計算結果 — 節点圧' : '計算結果 — 圧損バランス分配'}
           rows={rows}
+          selectedSymbols={d.resultVisibleSymbols}
+          onToggleSymbol={(symbol, checked, allSymbols) => onToggleResultSymbol(node.id, symbol, checked, allSymbols)}
         />
       )
     }
@@ -1091,11 +1785,17 @@ function AnalysisPanel({ node, density, viscosity, pressureUnit, rho }: {
   const d = node?.data as unknown as NetworkNodeData | undefined
   const isPipe = d?.nodeType === 'pipe'
   const isPump = d?.nodeType === 'pump'
+  const isHeatExchanger = d?.nodeType === 'heatExchanger'
+  const isReducer = d?.nodeType === 'reducer'
+  const isElbow = d?.nodeType === 'elbow'
+  const isValve = d?.nodeType === 'valve'
 
   const [chartData, setChartData] = useState<PressureDropResult | null>(null)
   const [fetching,  setFetching]  = useState(false)
   const [fetchErr,  setFetchErr]  = useState<string | null>(null)
   const pumpQMax = isPump && d ? pumpMaxFlow(d) : null
+  const heatExchangerRatedFlow = isHeatExchanger && d ? Math.max(d.ratedFlow ?? 10, 1e-9) : null
+  const heatExchangerNominalDp = isHeatExchanger && d ? Math.max(d.nominalPressureDrop ?? 10, 0) : null
 
   // Fetch curve whenever the selected pipe's params or fluid props change (debounced)
   useEffect(() => {
@@ -1158,6 +1858,150 @@ function AnalysisPanel({ node, density, viscosity, pressureUnit, rho }: {
   ])
 
   const traces = useMemo(() => {
+    if (isValve && d) {
+      const diameter = Math.max(d.diameter ?? 100, 1e-9) / 1000
+      const area = Math.PI * diameter ** 2 / 4
+      const zeta = d.result?.loss_coefficient ?? valveEffectiveZeta(d)
+      const resultQ = Math.abs(d.result?.Q_m3h ?? 0)
+      const qMax = Math.max(resultQ * 1.2, area * 5 * 3600, 1)
+      const flowRates = Array.from({ length: 100 }, (_, i) => qMax * i / 99)
+      const out: object[] = [{
+        x: flowRates,
+        y: flowRates.map(q => {
+          const qM3s = q / 3600
+          const v = area > 0 ? qM3s / area : 0
+          return kpaToUnit(zeta * rho * v ** 2 / 2 / 1000, pressureUnit, rho)
+        }),
+        type: 'scatter',
+        mode: 'lines',
+        name: `${valveCharacteristicLabel(d.valveCharacteristic)} ${d.valveOpening ?? 100}%`,
+        line: { color: '#e11d48', width: 2.8 },
+        hovertemplate: `Q: %{x:.2f} m³/h<br>ΔP: %{y:.3f} ${pressureUnit}<extra></extra>`,
+      }]
+      if (d.result) {
+        out.push({
+          x: [d.result.Q_m3h],
+          y: [kpaToUnit(d.result.dP_kpa, pressureUnit, rho)],
+          type: 'scatter',
+          mode: 'markers',
+          name: '動作点',
+          marker: { color: '#059669', size: 12, symbol: 'circle', line: { color: '#fff', width: 2 } },
+          hovertemplate: `Q: %{x:.2f} m³/h<br>ΔP: %{y:.3f} ${pressureUnit}<extra>動作点</extra>`,
+        })
+      }
+      return out
+    }
+
+    if (isElbow && d) {
+      const diameter = Math.max(d.diameter ?? 100, 1e-9) / 1000
+      const area = Math.PI * diameter ** 2 / 4
+      const zeta = d.result?.loss_coefficient ?? (
+        (d.elbowLossMode ?? 'auto') === 'manual'
+          ? Math.max(d.lossCoefficient ?? 0.75, 0)
+          : Math.max(d.zeta90 ?? 0.75, 0) * (Math.max(d.angle ?? 90, 0) / 90)
+      )
+      const resultQ = Math.abs(d.result?.Q_m3h ?? 0)
+      const qMax = Math.max(resultQ * 1.2, area * 5 * 3600, 1)
+      const flowRates = Array.from({ length: 100 }, (_, i) => qMax * i / 99)
+      const out: object[] = [{
+        x: flowRates,
+        y: flowRates.map(q => {
+          const qM3s = q / 3600
+          const v = area > 0 ? qM3s / area : 0
+          return kpaToUnit(zeta * rho * v ** 2 / 2 / 1000, pressureUnit, rho)
+        }),
+        type: 'scatter',
+        mode: 'lines',
+        name: 'ζ特性',
+        line: { color: '#0891b2', width: 2.8 },
+        hovertemplate: `Q: %{x:.2f} m³/h<br>ΔP: %{y:.3f} ${pressureUnit}<extra></extra>`,
+      }]
+      if (d.result) {
+        out.push({
+          x: [d.result.Q_m3h],
+          y: [kpaToUnit(d.result.dP_kpa, pressureUnit, rho)],
+          type: 'scatter',
+          mode: 'markers',
+          name: '動作点',
+          marker: { color: '#059669', size: 12, symbol: 'circle', line: { color: '#fff', width: 2 } },
+          hovertemplate: `Q: %{x:.2f} m³/h<br>ΔP: %{y:.3f} ${pressureUnit}<extra>動作点</extra>`,
+        })
+      }
+      return out
+    }
+
+    if (isReducer && d) {
+      const dIn = Math.max(d.diameterIn ?? 100, 1e-9) / 1000
+      const dOut = Math.max(d.diameterOut ?? 50, 1e-9) / 1000
+      const smallArea = Math.PI * Math.min(dIn, dOut) ** 2 / 4
+      const zeta = d.result?.loss_coefficient ?? Math.max(d.lossCoefficient ?? 0.5, 0)
+      const resultQ = Math.abs(d.result?.Q_m3h ?? 0)
+      const qMax = Math.max(resultQ * 1.2, smallArea * 5 * 3600, 1)
+      const flowRates = Array.from({ length: 100 }, (_, i) => qMax * i / 99)
+      const out: object[] = [{
+        x: flowRates,
+        y: flowRates.map(q => {
+          const qM3s = q / 3600
+          const v = smallArea > 0 ? qM3s / smallArea : 0
+          return kpaToUnit(zeta * rho * v ** 2 / 2 / 1000, pressureUnit, rho)
+        }),
+        type: 'scatter',
+        mode: 'lines',
+        name: 'ζ特性',
+        line: { color: '#65a30d', width: 2.8 },
+        hovertemplate: `Q: %{x:.2f} m³/h<br>ΔP: %{y:.3f} ${pressureUnit}<extra></extra>`,
+      }]
+      if (d.result) {
+        out.push({
+          x: [d.result.Q_m3h],
+          y: [kpaToUnit(d.result.dP_kpa, pressureUnit, rho)],
+          type: 'scatter',
+          mode: 'markers',
+          name: '動作点',
+          marker: { color: '#059669', size: 12, symbol: 'circle', line: { color: '#fff', width: 2 } },
+          hovertemplate: `Q: %{x:.2f} m³/h<br>ΔP: %{y:.3f} ${pressureUnit}<extra>動作点</extra>`,
+        })
+      }
+      return out
+    }
+
+    if (isHeatExchanger && d) {
+      const qRated = Math.max(d.ratedFlow ?? 10, 1e-9)
+      const dpNominal = Math.max(d.nominalPressureDrop ?? 10, 0)
+      const resultQ = Math.abs(d.result?.Q_m3h ?? 0)
+      const qMax = Math.max(qRated * 2, resultQ * 1.2, 1)
+      const flowRates = Array.from({ length: 100 }, (_, i) => qMax * i / 99)
+      const out: object[] = [{
+        x: flowRates,
+        y: flowRates.map(q => kpaToUnit(dpNominal * (q / qRated) ** 2, pressureUnit, rho)),
+        type: 'scatter',
+        mode: 'lines',
+        name: 'PQ特性',
+        line: { color: '#f97316', width: 2.8 },
+        hovertemplate: `Q: %{x:.2f} m³/h<br>ΔP: %{y:.3f} ${pressureUnit}<extra></extra>`,
+      }, {
+        x: [qRated],
+        y: [kpaToUnit(dpNominal, pressureUnit, rho)],
+        type: 'scatter',
+        mode: 'markers',
+        name: '定格点',
+        marker: { color: '#f59e0b', size: 10, symbol: 'diamond', line: { color: '#fff', width: 2 } },
+        hovertemplate: `Qr: %{x:.2f} m³/h<br>ΔPn: %{y:.3f} ${pressureUnit}<extra>定格点</extra>`,
+      }]
+      if (d.result) {
+        out.push({
+          x: [d.result.Q_m3h],
+          y: [kpaToUnit(d.result.dP_kpa, pressureUnit, rho)],
+          type: 'scatter',
+          mode: 'markers',
+          name: '動作点',
+          marker: { color: '#059669', size: 12, symbol: 'circle', line: { color: '#fff', width: 2 } },
+          hovertemplate: `Q: %{x:.2f} m³/h<br>ΔP: %{y:.3f} ${pressureUnit}<extra>動作点</extra>`,
+        })
+      }
+      return out
+    }
+
     if (isPump && d) {
       const qMax = Math.max(pumpMaxFlow(d) * 1.12, 1)
       const flowRates = Array.from({ length: 100 }, (_, i) => qMax * i / 99)
@@ -1212,12 +2056,12 @@ function AnalysisPanel({ node, density, viscosity, pressureUnit, rho }: {
       })
     }
     return out
-  }, [chartData, d, isPump, pressureUnit, rho])
+  }, [chartData, d, isElbow, isHeatExchanger, isPump, isReducer, isValve, pressureUnit, rho])
 
-  if (!node || (!isPipe && !isPump)) {
+  if (!node || (!isPipe && !isPump && !isHeatExchanger && !isReducer && !isElbow && !isValve)) {
     return (
       <div className="flex items-center justify-center h-48">
-        <p className="text-sm text-gray-300">パイプまたはポンプを選択すると特性曲線を表示します</p>
+        <p className="text-sm text-gray-300">パイプ、ポンプ、熱交換器、拡縮管、エルボ、バルブを選択すると特性曲線を表示します</p>
       </div>
     )
   }
@@ -1230,12 +2074,12 @@ function AnalysisPanel({ node, density, viscosity, pressureUnit, rho }: {
       {fetchErr && (
         <div className="text-sm text-red-500 py-2">{fetchErr}</div>
       )}
-      {(chartData || isPump) && !fetching && (
+      {(chartData || isPump || isHeatExchanger || isReducer || isElbow || isValve) && !fetching && (
         <Plot
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           data={traces as any}
           layout={{
-            title: { text: isPump ? '流量–揚程特性（PQ）' : '流量–圧損特性（Darcy-Weisbach）', font: { size: 13 } },
+            title: { text: isPump ? '流量–揚程特性（PQ）' : isHeatExchanger ? '流量–圧損特性（熱交換器）' : isReducer ? '流量–圧損特性（拡縮管）' : isElbow ? '流量–圧損特性（エルボ）' : isValve ? '流量–圧損特性（バルブ）' : '流量–圧損特性（Darcy-Weisbach）', font: { size: 13 } },
             xaxis: { title: { text: '流量 Q [m³/h]' }, showgrid: true, gridcolor: '#f1f5f9', zeroline: false },
             yaxis: { title: { text: isPump ? '揚程 H [m]' : `ΔP [${pressureUnit}]` }, showgrid: true, gridcolor: '#f1f5f9', zeroline: false },
             annotations: pumpQMax !== null ? [{
@@ -1250,6 +2094,18 @@ function AnalysisPanel({ node, density, viscosity, pressureUnit, rho }: {
               borderwidth: 1,
               bgcolor: '#ffffff',
               font: { size: 13, color: '#0f172a' },
+            }] : heatExchangerRatedFlow !== null && heatExchangerNominalDp !== null ? [{
+              x: heatExchangerRatedFlow,
+              y: kpaToUnit(heatExchangerNominalDp, pressureUnit, rho),
+              ax: 30,
+              ay: -60,
+              text: `Qr / ΔPn:<br>${heatExchangerRatedFlow.toFixed(1)} m³/h<br>${kpaToUnit(heatExchangerNominalDp, pressureUnit, rho).toFixed(3)} ${pressureUnit}`,
+              showarrow: true,
+              arrowhead: 2,
+              bordercolor: '#f97316',
+              borderwidth: 1,
+              bgcolor: '#ffffff',
+              font: { size: 13, color: '#9a3412' },
             }] : [],
             legend: { orientation: 'h' as const, y: -0.22, x: 0 },
             margin: { l: 60, r: 24, t: 44, b: 70 },
@@ -1305,7 +2161,7 @@ function buildSystemComponents(runHistory: CalcRun[], pressureUnit: PressureUnit
   for (const run of runHistory) {
     for (const n of run.nodes) {
       const rows = componentResultRows(n.data, pressureUnit, rho)
-      if (!rows) continue
+      if (!rows || rows.length === 0) continue
       if (!byId.has(n.id)) order.push(n.id)
       byId.set(n.id, { id: n.id, label: n.data.label, typeLabel: componentTypeLabel(n.data.nodeType), rows })
     }
@@ -1313,11 +2169,33 @@ function buildSystemComponents(runHistory: CalcRun[], pressureUnit: PressureUnit
   return order.map(id => byId.get(id)!)
 }
 
-function SystemResultsTable({ components, runHistory, pressureUnit, rho }: {
+function numericValue(value: string): number | null {
+  const n = Number.parseFloat(value.replace(/,/g, ''))
+  return Number.isFinite(n) ? n : null
+}
+
+function decimalPlaces(value: string): number {
+  const match = value.match(/\.(\d+)/)
+  return match ? match[1].length : 0
+}
+
+function formatDelta(value: string, baseline: string): string | null {
+  const current = numericValue(value)
+  const base = numericValue(baseline)
+  if (current === null || base === null) return null
+  const diff = current - base
+  const decimals = Math.max(decimalPlaces(value), decimalPlaces(baseline))
+  const sign = diff > 0 ? '+' : ''
+  return `${sign}${diff.toFixed(decimals)}`
+}
+
+function SystemResultsTable({ components, runHistory, pressureUnit, rho, baselineRunId, onBaselineChange }: {
   components: SystemComponent[]
   runHistory: CalcRun[]
   pressureUnit: PressureUnit
   rho: number
+  baselineRunId: string | null
+  onBaselineChange: (runId: string | null) => void
 }) {
   const cellValue = (run: CalcRun, componentId: string, symbol: string): string => {
     const nodeData = run.nodes.find(n => n.id === componentId)?.data
@@ -1325,10 +2203,40 @@ function SystemResultsTable({ components, runHistory, pressureUnit, rho }: {
     const row = rows?.find(r => r.symbol === symbol)
     return row ? row.value : '—'
   }
+  const baselineRun = baselineRunId ? runHistory.find(run => run.id === baselineRunId) : null
+
+  if (components.length === 0) {
+    return (
+      <div className="flex h-24 items-center justify-center text-center text-sm text-gray-400">
+        結果表示で項目にチェックを入れると一覧に追加されます
+      </div>
+    )
+  }
 
   return (
     <table className="w-full text-sm border-collapse">
       <thead>
+        <tr className="text-xs text-gray-400">
+          <th className="py-1 pr-3" />
+          <th className="py-1 pr-3" />
+          <th className="py-1 pr-3" />
+          <th className="text-left font-medium py-1 pr-3">ベースライン</th>
+          {runHistory.map((run, i) => (
+            <th key={run.id} className="text-right font-medium py-1 pr-3 whitespace-nowrap">
+              <label className="inline-flex cursor-pointer select-none items-center justify-end gap-1.5">
+              <input
+                type="radio"
+                name="baseline-run"
+                checked={baselineRunId === run.id}
+                onChange={() => onBaselineChange(run.id)}
+                className="h-3.5 w-3.5 accent-blue-600"
+              />
+                <span className={baselineRunId === run.id ? 'text-blue-600' : ''}>実行{i + 1}</span>
+              </label>
+              <div className="text-[10px] text-gray-300 font-normal">{new Date(run.timestamp).toLocaleTimeString('ja-JP')}</div>
+            </th>
+          ))}
+        </tr>
         <tr className="text-xs text-gray-400 border-b border-gray-200">
           <th className="text-left font-medium py-2 pr-3">部品</th>
           <th className="text-left font-medium py-2 pr-3">種別</th>
@@ -1336,8 +2244,7 @@ function SystemResultsTable({ components, runHistory, pressureUnit, rho }: {
           <th className="text-left font-medium py-2 pr-3">単位</th>
           {runHistory.map((run, i) => (
             <th key={run.id} className="text-right font-medium py-2 pr-3 whitespace-nowrap">
-              実行{i + 1}
-              <div className="text-[10px] text-gray-300 font-normal">{new Date(run.timestamp).toLocaleTimeString('ja-JP')}</div>
+              <span className={baselineRunId === run.id ? 'text-blue-600' : ''}>実行{i + 1}</span>
             </th>
           ))}
         </tr>
@@ -1357,14 +2264,24 @@ function SystemResultsTable({ components, runHistory, pressureUnit, rho }: {
             )}
             <td className="py-1.5 pr-3 text-gray-600 whitespace-nowrap">{row.item}</td>
             <td className="py-1.5 pr-3 text-gray-400 whitespace-nowrap">{row.unit}</td>
-            {runHistory.map(run => (
-              <td
-                key={run.id}
-                className={`py-1.5 pr-3 text-right tabular-nums whitespace-nowrap ${row.highlight ? 'font-semibold text-gray-800' : 'text-gray-700'}`}
-              >
-                {cellValue(run, comp.id, row.symbol)}
-              </td>
-            ))}
+            {runHistory.map(run => {
+              const value = cellValue(run, comp.id, row.symbol)
+              const baselineValue = baselineRun ? cellValue(baselineRun, comp.id, row.symbol) : '—'
+              const delta = baselineRun && baselineRun.id !== run.id ? formatDelta(value, baselineValue) : null
+              return (
+                <td
+                  key={run.id}
+                  className={`py-1.5 pr-3 text-right tabular-nums whitespace-nowrap ${row.highlight ? 'font-semibold text-gray-800' : 'text-gray-700'}`}
+                >
+                  <div>{value}</div>
+                  {delta !== null && (
+                    <div className={`text-[11px] font-normal ${numericValue(delta) && numericValue(delta)! > 0 ? 'text-rose-500' : numericValue(delta) && numericValue(delta)! < 0 ? 'text-blue-500' : 'text-gray-400'}`}>
+                      ({delta})
+                    </div>
+                  )}
+                </td>
+              )
+            })}
           </tr>
         )))}
       </tbody>
@@ -1422,11 +2339,47 @@ function PipeNetworkCalcInner() {
   const [error,     setError]     = useState<string | null>(null)
   const [totalDp,   setTotalDp]   = useState<number | null>(null)
   const [runHistory, setRunHistory] = useState<CalcRun[]>([])
+  const [baselineRunId, setBaselineRunId] = useState<string | null>(null)
   const systemComponents = useMemo(
     () => buildSystemComponents(runHistory, pressureUnit, rho),
     [runHistory, pressureUnit, rho],
   )
-  const clearRunHistory = () => setRunHistory([])
+  const clearRunHistory = () => {
+    setRunHistory([])
+    setBaselineRunId(null)
+  }
+
+  const updateResultSymbolSelection = useCallback((
+    nodeId: string,
+    symbol: string,
+    checked: boolean,
+    allSymbols: string[],
+  ) => {
+    const nextData = (data: NetworkNodeData): NetworkNodeData => {
+      const current = data.resultVisibleSymbols ?? []
+      const selected = new Set(current)
+      if (checked) {
+        selected.add(symbol)
+      } else {
+        selected.delete(symbol)
+      }
+      return {
+        ...data,
+        resultVisibleSymbols: allSymbols.filter(s => selected.has(s)),
+      }
+    }
+
+    setNodes(prev => prev.map(n => {
+      if (n.id !== nodeId) return n
+      return { ...n, data: nextData(n.data as unknown as NetworkNodeData) as NetworkNodeData }
+    }))
+    setRunHistory(prev => prev.map(run => ({
+      ...run,
+      nodes: run.nodes.map(n => (
+        n.id === nodeId ? { ...n, data: nextData(n.data) } : n
+      )),
+    })))
+  }, [setNodes])
 
   const clearSketch = () => {
     if (!window.confirm('ダイアグラムをすべて削除します。よろしいですか？')) return
@@ -1436,6 +2389,7 @@ function PipeNetworkCalcInner() {
     setTotalDp(null)
     setError(null)
     setRunHistory([])
+    setBaselineRunId(null)
   }
 
   // CoolProp auto-fill
@@ -1550,11 +2504,13 @@ function PipeNetworkCalcInner() {
         const nodeResult  = res.nodes[id]
         const srcPressure = res.source_pressures[id]
         const srcFlow     = res.source_flows[id]
+        const srcTemp     = res.source_temperatures?.[id] ?? res.boundary_temperatures?.[id]
         return {
           ...d,
           ...(nodeResult  !== undefined ? { result: nodeResult }        : {}),
           ...(srcPressure !== undefined ? { calcPressure: srcPressure } : {}),
           ...(srcFlow     !== undefined ? { calcFlow: srcFlow }         : {}),
+          ...(srcTemp     !== undefined ? { calcTemperature: srcTemp }  : {}),
         } as NetworkNodeData
       }
 
@@ -1579,8 +2535,8 @@ function PipeNetworkCalcInner() {
         const sourceData = nodeById.get(edge.source)?.data as unknown as NetworkNodeData | undefined
         const targetData = nodeById.get(edge.target)?.data as unknown as NetworkNodeData | undefined
         const elementId =
-          sourceData?.nodeType === 'pipe' || sourceData?.nodeType === 'pump' ? edge.source
-          : targetData?.nodeType === 'pipe' || targetData?.nodeType === 'pump' ? edge.target
+          sourceData?.nodeType === 'pipe' || sourceData?.nodeType === 'pump' || sourceData?.nodeType === 'heatExchanger' || sourceData?.nodeType === 'reducer' || sourceData?.nodeType === 'elbow' || sourceData?.nodeType === 'valve' ? edge.source
+          : targetData?.nodeType === 'pipe' || targetData?.nodeType === 'pump' || targetData?.nodeType === 'heatExchanger' || targetData?.nodeType === 'reducer' || targetData?.nodeType === 'elbow' || targetData?.nodeType === 'valve' ? edge.target
           : null
         if (!elementId) return undefined
 
@@ -1718,19 +2674,20 @@ function PipeNetworkCalcInner() {
             <div className="px-2 py-2 text-xs font-semibold text-slate-400 uppercase tracking-wide border-b border-slate-700 text-center">
               部品
             </div>
-            {PALETTE.map(item => (
-              <div
-                key={item.type}
-                draggable
-                onDragStart={e => onDragStart(e, item.type)}
-                className="py-3 px-2 border-b border-slate-700 cursor-grab active:cursor-grabbing hover:bg-slate-700 transition-colors flex flex-col items-center gap-1"
-              >
-                <item.Icon className={`w-8 h-8 ${item.color}`} />
-                <div className={`text-xs font-medium ${item.color}`}>{item.label}</div>
-                <div className="text-xs text-slate-500">{item.sub}</div>
-              </div>
-            ))}
-            <div className="flex-1" />
+            <div className="min-h-0 flex-1 overflow-y-auto">
+              {PALETTE.map(item => (
+                <div
+                  key={item.type}
+                  draggable
+                  onDragStart={e => onDragStart(e, item.type)}
+                  className="py-3 px-2 border-b border-slate-700 cursor-grab active:cursor-grabbing hover:bg-slate-700 transition-colors flex flex-col items-center gap-1"
+                >
+                  <item.Icon className={`w-8 h-8 ${item.color}`} />
+                  <div className={`text-xs font-medium ${item.color}`}>{item.label}</div>
+                  <div className="text-xs text-slate-500">{item.sub}</div>
+                </div>
+              ))}
+            </div>
             <div className="px-2 py-2 text-xs text-slate-600 border-t border-slate-700 text-center">
               Del/BS で削除
             </div>
@@ -1816,7 +2773,12 @@ function PipeNetworkCalcInner() {
             <h3 className="text-sm font-semibold text-gray-600 mb-4 pb-3 border-b border-gray-100">
               結果表示
             </h3>
-            <ResultsPanel node={selectedNode} pressureUnit={pressureUnit} rho={rho} />
+            <ResultsPanel
+              node={selectedNode}
+              pressureUnit={pressureUnit}
+              rho={rho}
+              onToggleResultSymbol={updateResultSymbolSelection}
+            />
           </div>
         </div>
 
@@ -1853,7 +2815,14 @@ function PipeNetworkCalcInner() {
 
         {runHistory.length > 0 ? (
           <div className="overflow-x-auto">
-            <SystemResultsTable components={systemComponents} runHistory={runHistory} pressureUnit={pressureUnit} rho={rho} />
+            <SystemResultsTable
+              components={systemComponents}
+              runHistory={runHistory}
+              pressureUnit={pressureUnit}
+              rho={rho}
+              baselineRunId={baselineRunId}
+              onBaselineChange={setBaselineRunId}
+            />
           </div>
         ) : (
           <div className="flex flex-col items-center justify-center h-32 text-center gap-2">

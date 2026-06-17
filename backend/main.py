@@ -670,8 +670,17 @@ def _path_total_backpressure(
         if not node:
             break
 
-        if node.node_type == "pipe":
-            seg = _calc_pipe_segment(node.params, Q_m3s, rho, mu, method)
+        if node.node_type in ("pipe", "heatExchanger", "reducer", "elbow", "valve"):
+            if node.node_type == "heatExchanger":
+                seg = {"dP_kpa": _heat_exchanger_pressure_drop_kpa(node.params, Q_m3s)}
+            elif node.node_type == "reducer":
+                seg = {"dP_kpa": _reducer_pressure_drop_kpa(node.params, Q_m3s, rho)}
+            elif node.node_type == "elbow":
+                seg = {"dP_kpa": _elbow_pressure_drop_kpa(node.params, Q_m3s, rho)}
+            elif node.node_type == "valve":
+                seg = {"dP_kpa": _valve_pressure_drop_kpa(node.params, Q_m3s, rho)}
+            else:
+                seg = _calc_pipe_segment(node.params, Q_m3s, rho, mu, method)
             # dP_kpa は常に正。Q の符号で「正方向に圧力が落ちる」か「上がる」かを決める
             total += seg["dP_kpa"] if Q_m3s >= 0 else -seg["dP_kpa"]
         elif node.node_type == "sink" or node.node_type == "boundary":
@@ -726,7 +735,184 @@ def _boundary_type(node_params: dict) -> str:
 
 
 BOUNDARY_NODE_TYPES = {"source", "sink", "boundary"}
-TWO_PORT_NODE_TYPES = {"pipe", "pump"}
+TWO_PORT_NODE_TYPES = {"pipe", "pump", "heatExchanger", "reducer", "elbow", "valve"}
+DEFAULT_TEMPERATURE_K = 293.15
+DEFAULT_SPECIFIC_HEAT_J_KG_K = 4184.0
+
+
+def _node_temperature_k(node: PipeNetworkNode | None) -> float:
+    if node is None:
+        return DEFAULT_TEMPERATURE_K
+    return float(node.params.get("temperature", DEFAULT_TEMPERATURE_K))
+
+
+def _round_temperature(value: float | None) -> float | None:
+    if value is None or not np.isfinite(value):
+        return None
+    return round(float(value), 3)
+
+
+def _heat_exchange_state(params: dict, q_m3s: float, rho: float, t_in_k: float) -> dict[str, float]:
+    q_abs = abs(q_m3s)
+    exchange_temp = float(params.get("exchangeTemperature", DEFAULT_TEMPERATURE_K))
+    u_value = max(float(params.get("heatTransferCoeff", 500.0)), 0.0)
+    area = max(float(params.get("heatTransferArea", 10.0)), 0.0)
+    cp = max(float(params.get("specificHeat", DEFAULT_SPECIFIC_HEAT_J_KG_K)), 1e-9)
+    ua_w_k = u_value * area
+    mdot = rho * q_abs
+
+    if mdot <= 1e-12 or ua_w_k <= 0:
+        t_out_k = t_in_k
+    else:
+        t_out_k = exchange_temp + (t_in_k - exchange_temp) * np.exp(-ua_w_k / (mdot * cp))
+
+    heat_kw = mdot * cp * (t_out_k - t_in_k) / 1000.0
+    return {
+        "T_in_K": round(float(t_in_k), 3),
+        "T_out_K": round(float(t_out_k), 3),
+        "heat_duty_kw": round(float(heat_kw), 6),
+        "UA_w_per_k": round(float(ua_w_k), 6),
+    }
+
+
+def _heat_exchanger_pressure_drop_kpa(params: dict, q_m3s: float) -> float:
+    rated_flow_m3h = max(float(params.get("ratedFlow", 10.0)), 1e-9)
+    nominal_dp_kpa = max(float(params.get("nominalPressureDrop", 10.0)), 0.0)
+    q_m3h = abs(q_m3s) * 3600.0
+    return nominal_dp_kpa * (q_m3h / rated_flow_m3h) ** 2
+
+
+def _heat_exchanger_flow_for_pressure_drop(params: dict, dp_kpa: float) -> float:
+    nominal_dp_kpa = max(float(params.get("nominalPressureDrop", 10.0)), 0.0)
+    rated_flow_m3h = max(float(params.get("ratedFlow", 10.0)), 1e-9)
+    if dp_kpa <= 1e-12 or nominal_dp_kpa <= 1e-12:
+        return 0.0
+    return rated_flow_m3h * np.sqrt(dp_kpa / nominal_dp_kpa) / 3600.0
+
+
+def _reducer_areas(params: dict, q_m3s: float) -> tuple[float, float, float, float]:
+    d_in = max(float(params.get("diameterIn", 100.0)) / 1000.0, 1e-9)
+    d_out = max(float(params.get("diameterOut", 50.0)) / 1000.0, 1e-9)
+    upstream_d = d_in if q_m3s >= 0 else d_out
+    downstream_d = d_out if q_m3s >= 0 else d_in
+    upstream_a = np.pi * upstream_d ** 2 / 4.0
+    downstream_a = np.pi * downstream_d ** 2 / 4.0
+    return upstream_d, downstream_d, upstream_a, downstream_a
+
+
+def _reducer_loss_coefficient(params: dict, q_m3s: float) -> tuple[float, str]:
+    mode = params.get("lossMode", "auto")
+    upstream_d, downstream_d, upstream_a, downstream_a = _reducer_areas(params, q_m3s)
+    if mode == "manual":
+        return max(float(params.get("lossCoefficient", 0.5)), 0.0), "manual"
+
+    small_a = min(upstream_a, downstream_a)
+    large_a = max(upstream_a, downstream_a)
+    beta_area = small_a / large_a if large_a > 0 else 1.0
+    if downstream_d > upstream_d:
+        zeta = (1.0 - beta_area) ** 2
+        return max(zeta, 0.0), "expansion"
+
+    beta_d = min(upstream_d, downstream_d) / max(upstream_d, downstream_d)
+    contraction_cc = max(0.62 + 0.38 * beta_d ** 3, 1e-9)
+    zeta = (1.0 / contraction_cc - 1.0) ** 2
+    return max(zeta, 0.0), "contraction"
+
+
+def _reducer_pressure_drop_kpa(params: dict, q_m3s: float, rho: float) -> float:
+    _, _, upstream_a, downstream_a = _reducer_areas(params, q_m3s)
+    ref_area = min(upstream_a, downstream_a)
+    v_ref = abs(q_m3s) / ref_area if ref_area > 0 else 0.0
+    zeta, _ = _reducer_loss_coefficient(params, q_m3s)
+    return zeta * rho * v_ref ** 2 / 2.0 / 1000.0
+
+
+def _reducer_flow_for_pressure_drop(params: dict, dp_kpa: float, rho: float) -> float:
+    if dp_kpa <= 1e-12:
+        return 0.0
+    # ζ can change with direction, but not with flow magnitude for a fixed direction.
+    zeta, _ = _reducer_loss_coefficient(params, 1.0)
+    _, _, upstream_a, downstream_a = _reducer_areas(params, 1.0)
+    ref_area = min(upstream_a, downstream_a)
+    if zeta <= 1e-12 or ref_area <= 0:
+        return 0.0
+    return ref_area * np.sqrt(2.0 * dp_kpa * 1000.0 / (rho * zeta))
+
+
+def _elbow_area(params: dict) -> float:
+    diameter = max(float(params.get("diameter", 100.0)) / 1000.0, 1e-9)
+    return np.pi * diameter ** 2 / 4.0
+
+
+def _elbow_loss_coefficient(params: dict) -> tuple[float, str]:
+    if params.get("elbowLossMode", params.get("lossMode", "auto")) == "manual":
+        return max(float(params.get("lossCoefficient", 0.7)), 0.0), "manual"
+    angle = max(float(params.get("angle", 90.0)), 0.0)
+    zeta90 = max(float(params.get("zeta90", 0.75)), 0.0)
+    exponent = max(float(params.get("angleExponent", 1.0)), 0.0)
+    if angle <= 0 or zeta90 <= 0:
+        return 0.0, "auto"
+    return zeta90 * (angle / 90.0) ** exponent, "auto"
+
+
+def _elbow_pressure_drop_kpa(params: dict, q_m3s: float, rho: float) -> float:
+    area = _elbow_area(params)
+    v = abs(q_m3s) / area if area > 0 else 0.0
+    zeta, _ = _elbow_loss_coefficient(params)
+    return zeta * rho * v ** 2 / 2.0 / 1000.0
+
+
+def _elbow_flow_for_pressure_drop(params: dict, dp_kpa: float, rho: float) -> float:
+    if dp_kpa <= 1e-12:
+        return 0.0
+    area = _elbow_area(params)
+    zeta, _ = _elbow_loss_coefficient(params)
+    if area <= 0 or zeta <= 1e-12:
+        return 0.0
+    return area * np.sqrt(2.0 * dp_kpa * 1000.0 / (rho * zeta))
+
+
+def _valve_area(params: dict) -> float:
+    diameter = max(float(params.get("diameter", 100.0)) / 1000.0, 1e-9)
+    return np.pi * diameter ** 2 / 4.0
+
+
+def _valve_relative_capacity(params: dict) -> tuple[float, str]:
+    characteristic = str(params.get("valveCharacteristic", "linear"))
+    opening = min(max(float(params.get("valveOpening", 100.0)), 0.0), 100.0) / 100.0
+    if opening <= 0:
+        return 1e-6, characteristic
+    if characteristic == "quickOpening":
+        return max(np.sqrt(opening), 1e-6), characteristic
+    if characteristic == "equalPercentage":
+        rangeability = max(float(params.get("valveRangeability", 50.0)), 1.000001)
+        return max(rangeability ** (opening - 1.0), 1e-6), characteristic
+    return max(opening, 1e-6), "linear"
+
+
+def _valve_loss_coefficient(params: dict) -> tuple[float, float, str]:
+    zeta_full_open = max(float(params.get("valveZetaFullOpen", 1.0)), 0.0)
+    relative_capacity, characteristic = _valve_relative_capacity(params)
+    if zeta_full_open <= 0:
+        return 0.0, relative_capacity, characteristic
+    return zeta_full_open / (relative_capacity ** 2), relative_capacity, characteristic
+
+
+def _valve_pressure_drop_kpa(params: dict, q_m3s: float, rho: float) -> float:
+    area = _valve_area(params)
+    v = abs(q_m3s) / area if area > 0 else 0.0
+    zeta, _, _ = _valve_loss_coefficient(params)
+    return zeta * rho * v ** 2 / 2.0 / 1000.0
+
+
+def _valve_flow_for_pressure_drop(params: dict, dp_kpa: float, rho: float) -> float:
+    if dp_kpa <= 1e-12:
+        return 0.0
+    area = _valve_area(params)
+    zeta, _, _ = _valve_loss_coefficient(params)
+    if area <= 0 or zeta <= 1e-12:
+        return 0.0
+    return area * np.sqrt(2.0 * dp_kpa * 1000.0 / (rho * zeta))
 
 
 def _pipe_flow_for_pressure_drop(
@@ -890,6 +1076,175 @@ def _calc_pump_segment(params: dict, q_m3s: float, rho: float) -> dict:
     }
 
 
+def _calc_heat_exchanger_segment(
+    params: dict,
+    q_m3s: float,
+    rho: float,
+    mu: float,
+    method: str,
+) -> dict:
+    return {
+        "Q_m3h": round(q_m3s * 3600.0, 4),
+        "v": 0.0,
+        "Re": 0.0,
+        "f": 0.0,
+        "dP_kpa": round(_heat_exchanger_pressure_drop_kpa(params, q_m3s), 6),
+        "regime": "heatExchanger",
+        "exchange_temperature_K": round(float(params.get("exchangeTemperature", DEFAULT_TEMPERATURE_K)), 3),
+        "heat_transfer_coeff_w_m2_k": round(float(params.get("heatTransferCoeff", 500.0)), 6),
+        "heat_transfer_area_m2": round(float(params.get("heatTransferArea", 10.0)), 6),
+        "rated_flow_m3h": round(float(params.get("ratedFlow", 10.0)), 6),
+        "nominal_pressure_drop_kpa": round(float(params.get("nominalPressureDrop", 10.0)), 6),
+    }
+
+
+def _calc_reducer_segment(params: dict, q_m3s: float, rho: float) -> dict:
+    upstream_d, downstream_d, upstream_a, downstream_a = _reducer_areas(params, q_m3s)
+    ref_area = min(upstream_a, downstream_a)
+    v_ref = abs(q_m3s) / ref_area if ref_area > 0 else 0.0
+    zeta, reducer_kind = _reducer_loss_coefficient(params, q_m3s)
+    return {
+        "Q_m3h": round(q_m3s * 3600.0, 4),
+        "v": round(np.sign(q_m3s) * v_ref, 4),
+        "Re": 0.0,
+        "f": 0.0,
+        "dP_kpa": round(_reducer_pressure_drop_kpa(params, q_m3s, rho), 6),
+        "regime": "reducer",
+        "diameter_in_mm": round(float(params.get("diameterIn", 100.0)), 6),
+        "diameter_out_mm": round(float(params.get("diameterOut", 50.0)), 6),
+        "upstream_diameter_mm": round(upstream_d * 1000.0, 6),
+        "downstream_diameter_mm": round(downstream_d * 1000.0, 6),
+        "loss_coefficient": round(zeta, 6),
+        "loss_mode": params.get("lossMode", "auto"),
+        "reducer_kind": reducer_kind,
+    }
+
+
+def _calc_elbow_segment(params: dict, q_m3s: float, rho: float) -> dict:
+    area = _elbow_area(params)
+    v = abs(q_m3s) / area if area > 0 else 0.0
+    zeta, mode = _elbow_loss_coefficient(params)
+    return {
+        "Q_m3h": round(q_m3s * 3600.0, 4),
+        "v": round(np.sign(q_m3s) * v, 4),
+        "Re": 0.0,
+        "f": 0.0,
+        "dP_kpa": round(_elbow_pressure_drop_kpa(params, q_m3s, rho), 6),
+        "regime": "elbow",
+        "diameter_mm": round(float(params.get("diameter", 100.0)), 6),
+        "angle_deg": round(float(params.get("angle", 90.0)), 6),
+        "loss_coefficient": round(zeta, 6),
+        "loss_mode": mode,
+        "zeta90": round(float(params.get("zeta90", 0.75)), 6),
+    }
+
+
+def _calc_valve_segment(params: dict, q_m3s: float, rho: float) -> dict:
+    area = _valve_area(params)
+    v = abs(q_m3s) / area if area > 0 else 0.0
+    zeta, relative_capacity, characteristic = _valve_loss_coefficient(params)
+    return {
+        "Q_m3h": round(q_m3s * 3600.0, 4),
+        "v": round(np.sign(q_m3s) * v, 4),
+        "Re": 0.0,
+        "f": 0.0,
+        "dP_kpa": round(_valve_pressure_drop_kpa(params, q_m3s, rho), 6),
+        "regime": "valve",
+        "diameter_mm": round(float(params.get("diameter", 100.0)), 6),
+        "loss_coefficient": round(zeta, 6),
+        "valve_zeta_full_open": round(float(params.get("valveZetaFullOpen", 1.0)), 6),
+        "valve_opening_percent": round(min(max(float(params.get("valveOpening", 100.0)), 0.0), 100.0), 6),
+        "valve_relative_capacity": round(relative_capacity, 6),
+        "valve_characteristic": characteristic,
+        "valve_rangeability": round(float(params.get("valveRangeability", 50.0)), 6),
+    }
+
+
+def _apply_boundary_temperatures(
+    req: PipeNetworkRequest,
+    nodes_dict: dict[str, PipeNetworkNode],
+    point_for_node: dict[str, str],
+    links: list[dict[str, Any]],
+    link_flows: dict[str, float],
+    results: dict[str, Any],
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Attach isothermal temperatures to network results based on upstream flow direction."""
+    point_temps: dict[str, float] = {}
+    boundary_temps: dict[str, float] = {}
+    boundary_mixed: dict[str, list[tuple[float, float]]] = defaultdict(list)
+
+    for node in req.nodes:
+        if node.node_type in BOUNDARY_NODE_TYPES:
+            p_id = point_for_node.get(node.id)
+            if p_id is None:
+                continue
+            temp = _node_temperature_k(node)
+            boundary_temps[node.id] = round(temp, 3)
+            if _boundary_type(node.params) == "flow":
+                q_weight = abs(float(node.params.get("flowRate", 0.0)))
+                if q_weight > 1e-12:
+                    boundary_mixed[p_id].append((q_weight, temp))
+            else:
+                point_temps.setdefault(p_id, temp)
+
+    for p_id, contributions in boundary_mixed.items():
+        total_q = sum(q for q, _ in contributions)
+        if total_q > 1e-12:
+            point_temps[p_id] = sum(q * t for q, t in contributions) / total_q
+
+    for _ in range(len(links) + len(point_temps) + 1):
+        changed = False
+        mixed: dict[str, list[tuple[float, float]]] = defaultdict(list)
+
+        for link in links:
+            q = link_flows.get(link["id"], 0.0)
+            if abs(q) < 1e-12:
+                continue
+            up = link["a"] if q >= 0 else link["b"]
+            down = link["b"] if q >= 0 else link["a"]
+            t_up = point_temps.get(up)
+            if t_up is None:
+                continue
+            seg = results.get(link["id"], {})
+            if link["kind"] == "heatExchanger":
+                heat = _heat_exchange_state(link["params"], q, req.density, t_up)
+                seg.update(heat)
+                t_down = heat["T_out_K"]
+            else:
+                seg["T_in_K"] = _round_temperature(t_up)
+                seg["T_out_K"] = _round_temperature(t_up)
+                t_down = t_up
+            mixed[down].append((abs(q), t_down))
+
+        for pid, contributions in mixed.items():
+            total_q = sum(q for q, _ in contributions)
+            if total_q <= 1e-12:
+                continue
+            mixed_temp = sum(q * t for q, t in contributions) / total_q
+            if pid not in point_temps or abs(point_temps[pid] - mixed_temp) > 1e-9:
+                point_temps[pid] = mixed_temp
+                changed = True
+
+        if not changed:
+            break
+
+    source_temperatures: dict[str, float] = {}
+    for node in req.nodes:
+        p_id = point_for_node.get(node.id)
+        if p_id is None:
+            continue
+        temp = point_temps.get(p_id, boundary_temps.get(node.id))
+        rounded = _round_temperature(temp)
+        if rounded is None:
+            continue
+        if node.node_type in BOUNDARY_NODE_TYPES:
+            source_temperatures[node.id] = rounded
+        if node.id in results:
+            results[node.id]["T_K"] = rounded
+
+    return source_temperatures, boundary_temps
+
+
 def _solve_boundary_network(
     req: PipeNetworkRequest,
     nodes_dict: dict[str, PipeNetworkNode],
@@ -985,7 +1340,16 @@ def _solve_boundary_network(
             return _pump_flow_for_required_boost(link["params"], required_boost, rho)
 
         dp = p[link["a"]] - p[link["b"]]
-        q_abs = _pipe_flow_for_pressure_drop(link["params"], abs(dp), rho, mu, req.friction_method)
+        if link["kind"] == "heatExchanger":
+            q_abs = _heat_exchanger_flow_for_pressure_drop(link["params"], abs(dp))
+        elif link["kind"] == "reducer":
+            q_abs = _reducer_flow_for_pressure_drop(link["params"], abs(dp), rho)
+        elif link["kind"] == "elbow":
+            q_abs = _elbow_flow_for_pressure_drop(link["params"], abs(dp), rho)
+        elif link["kind"] == "valve":
+            q_abs = _valve_flow_for_pressure_drop(link["params"], abs(dp), rho)
+        else:
+            q_abs = _pipe_flow_for_pressure_drop(link["params"], abs(dp), rho, mu, req.friction_method)
         return q_abs if dp >= 0 else -q_abs
 
     def residual(x: np.ndarray) -> np.ndarray:
@@ -1033,6 +1397,18 @@ def _solve_boundary_network(
                 if link["kind"] == "pump":
                     boost_est = _pump_boost_kpa(link["params"], abs(q) * 3600.0, rho)
                     p_from = p_next - boost_est
+                elif link["kind"] == "heatExchanger":
+                    dp_est = _heat_exchanger_pressure_drop_kpa(link["params"], q)
+                    p_from = p_next + (dp_est if q > 0 else -dp_est)
+                elif link["kind"] == "reducer":
+                    dp_est = _reducer_pressure_drop_kpa(link["params"], q, rho)
+                    p_from = p_next + (dp_est if q > 0 else -dp_est)
+                elif link["kind"] == "elbow":
+                    dp_est = _elbow_pressure_drop_kpa(link["params"], q, rho)
+                    p_from = p_next + (dp_est if q > 0 else -dp_est)
+                elif link["kind"] == "valve":
+                    dp_est = _valve_pressure_drop_kpa(link["params"], q, rho)
+                    p_from = p_next + (dp_est if q > 0 else -dp_est)
                 else:
                     dp_est = _calc_pipe_segment(link["params"], abs(q), rho, mu, req.friction_method)["dP_kpa"]
                     p_from = p_next + (dp_est if q > 0 else -dp_est)
@@ -1054,7 +1430,16 @@ def _solve_boundary_network(
                 return mean_p - dp_est if adjacent["a"] == nid else mean_p + dp_est
             if abs(q) < 1e-12:
                 return mean_p
-            dp_est = _calc_pipe_segment(adjacent["params"], abs(q), rho, mu, req.friction_method)["dP_kpa"]
+            if adjacent["kind"] == "heatExchanger":
+                dp_est = _heat_exchanger_pressure_drop_kpa(adjacent["params"], q)
+            elif adjacent["kind"] == "reducer":
+                dp_est = _reducer_pressure_drop_kpa(adjacent["params"], q, rho)
+            elif adjacent["kind"] == "elbow":
+                dp_est = _elbow_pressure_drop_kpa(adjacent["params"], q, rho)
+            elif adjacent["kind"] == "valve":
+                dp_est = _valve_pressure_drop_kpa(adjacent["params"], q, rho)
+            else:
+                dp_est = _calc_pipe_segment(adjacent["params"], abs(q), rho, mu, req.friction_method)["dP_kpa"]
             return mean_p + (dp_est if q > 0 else -dp_est)
 
         x0 = np.array([initial_pressure(nid) for nid in unknown_ids], dtype=float)
@@ -1076,6 +1461,14 @@ def _solve_boundary_network(
         link_flows[link["id"]] = q
         if link["kind"] == "pump":
             seg = _calc_pump_segment(link["params"], q, rho)
+        elif link["kind"] == "heatExchanger":
+            seg = _calc_heat_exchanger_segment(link["params"], q, rho, mu, req.friction_method)
+        elif link["kind"] == "reducer":
+            seg = _calc_reducer_segment(link["params"], q, rho)
+        elif link["kind"] == "elbow":
+            seg = _calc_elbow_segment(link["params"], q, rho)
+        elif link["kind"] == "valve":
+            seg = _calc_valve_segment(link["params"], q, rho)
         else:
             seg = _calc_pipe_segment(link["params"], q, rho, mu, req.friction_method)
         seg.update({
@@ -1129,7 +1522,22 @@ def _solve_boundary_network(
                 tee_result["Q2_m3h"] = round(outlet_flows[1], 4)
             results[n.id] = tee_result
 
-    return {"nodes": results, "source_pressures": source_pressures, "source_flows": source_flows}
+    point_for_node = {
+        n.id: find(n.id)
+        for n in req.nodes
+        if n.node_type in BOUNDARY_NODE_TYPES or n.node_type == "tee"
+    }
+    source_temperatures, boundary_temperatures = _apply_boundary_temperatures(
+        req, nodes_dict, point_for_node, links, link_flows, results
+    )
+
+    return {
+        "nodes": results,
+        "source_pressures": source_pressures,
+        "source_flows": source_flows,
+        "source_temperatures": source_temperatures,
+        "boundary_temperatures": boundary_temperatures,
+    }
 
 
 @app.post("/pipe-network")
@@ -1165,9 +1573,17 @@ def calc_pipe_network(req: PipeNetworkRequest):
     results: dict[str, Any] = {}
     source_pressures: dict[str, float] = {}  # src.id → 入口圧力 kPa
     source_flows: dict[str, float] = {}      # src.id → 流量 m³/h (符号付き)
+    source_temperatures: dict[str, float] = {}
+    boundary_temperatures: dict[str, float] = {
+        n.id: round(_node_temperature_k(n), 3)
+        for n in req.nodes
+        if n.node_type in BOUNDARY_NODE_TYPES
+    }
 
     for src in (n for n in req.nodes if n.node_type == "source" or (n.node_type == "boundary" and _boundary_type(n.params) == "flow")):
         btype = _boundary_type(src.params)
+        T_src = _node_temperature_k(src)
+        source_temperatures[src.id] = round(T_src, 3)
 
         # ── 圧力境界: P固定 → Q逆算 ─────────────────────────────────────
         if btype == "pressure":
@@ -1210,22 +1626,28 @@ def calc_pipe_network(req: PipeNetworkRequest):
         remaining: dict[str, int] = {nid: deg for nid, deg in global_in_deg.items()}
         pending_Q:  dict[str, float] = defaultdict(float)
         pending_dp: dict[str, float] = {}
+        pending_TQ: dict[str, float] = defaultdict(float)
+        pending_TW: dict[str, float] = defaultdict(float)
 
-        def _enqueue(queue_: list, tid: str, q_in: float, dp_in: float) -> None:
+        def _enqueue(queue_: list, tid: str, q_in: float, dp_in: float, temp_in: float) -> None:
             """全入力が揃ったタイミングでキューへ追加する。"""
             pending_Q[tid] += q_in
+            temp_weight = max(abs(q_in), 1e-12)
+            pending_TQ[tid] += temp_weight * temp_in
+            pending_TW[tid] += temp_weight
             if tid not in pending_dp:
                 pending_dp[tid] = dp_in
             remaining[tid] = remaining.get(tid, 1) - 1
             if remaining.get(tid, 0) <= 0:
-                queue_.append((tid, pending_Q[tid], pending_dp[tid]))
+                mixed_temp = pending_TQ[tid] / pending_TW[tid] if pending_TW[tid] > 0 else temp_in
+                queue_.append((tid, pending_Q[tid], pending_dp[tid], mixed_temp))
 
-        bfs: list[tuple[str, float, float]] = []
+        bfs: list[tuple[str, float, float, float]] = []
         for tid, _ in outgoing.get(src.id, []):
-            _enqueue(bfs, tid, Q_total, 0.0)
+            _enqueue(bfs, tid, Q_total, 0.0, T_src)
 
         while bfs:
-            nid, Q, cum_dp = bfs.pop(0)
+            nid, Q, cum_dp, T_in = bfs.pop(0)
             node = nodes_dict.get(nid)
             if not node:
                 continue
@@ -1238,21 +1660,48 @@ def calc_pipe_network(req: PipeNetworkRequest):
                     # 流量ソース: シンクの背圧＋到達ΔPからソース必要圧を更新
                     source_pressures[src.id] = max(source_pressures.get(src.id, 0.0), sink_p + cum_dp)
                 if nid in results:
+                    prev_q = abs(float(results[nid]["Q_m3h"])) / 3600.0
+                    curr_q = abs(Q)
+                    prev_t = float(results[nid].get("T_K", T_in))
+                    total_w = prev_q + curr_q
+                    results[nid]["T_K"] = _round_temperature((prev_q * prev_t + curr_q * T_in) / total_w if total_w > 0 else T_in)
                     results[nid]["Q_m3h"] = round(results[nid]["Q_m3h"] + Q * 3600, 4)
                 else:
                     results[nid] = {
                         "Q_m3h": round(Q * 3600, 4),
                         "P_kpa": round(sink_p, 4),
+                        "T_K": _round_temperature(T_in),
                         "_cum_dp": round(cum_dp, 6),
                         "v": 0.0, "Re": 0.0, "f": 0.0, "dP_kpa": 0.0,
                         "regime": "boundary" if node.node_type == "boundary" else "sink",
                     }
                 continue
 
-            # ── パイプ ──────────────────────────────────────────────────
+            # ── 2ポート要素 ─────────────────────────────────────────────
             next_cum_dp = cum_dp
-            if node.node_type == "pipe":
-                seg = _calc_pipe_segment(node.params, Q, rho, mu, req.friction_method)
+            T_out = T_in
+            if node.node_type in ("pipe", "heatExchanger", "reducer", "elbow", "valve"):
+                if node.node_type == "heatExchanger":
+                    seg = _calc_heat_exchanger_segment(node.params, Q, rho, mu, req.friction_method)
+                    heat = _heat_exchange_state(node.params, Q, rho, T_in)
+                    seg.update(heat)
+                    T_out = heat["T_out_K"]
+                elif node.node_type == "reducer":
+                    seg = _calc_reducer_segment(node.params, Q, rho)
+                    seg["T_in_K"] = _round_temperature(T_in)
+                    seg["T_out_K"] = _round_temperature(T_in)
+                elif node.node_type == "elbow":
+                    seg = _calc_elbow_segment(node.params, Q, rho)
+                    seg["T_in_K"] = _round_temperature(T_in)
+                    seg["T_out_K"] = _round_temperature(T_in)
+                elif node.node_type == "valve":
+                    seg = _calc_valve_segment(node.params, Q, rho)
+                    seg["T_in_K"] = _round_temperature(T_in)
+                    seg["T_out_K"] = _round_temperature(T_in)
+                else:
+                    seg = _calc_pipe_segment(node.params, Q, rho, mu, req.friction_method)
+                    seg["T_in_K"] = _round_temperature(T_in)
+                    seg["T_out_K"] = _round_temperature(T_in)
                 seg["_cum_dp_in"] = round(cum_dp, 6)
                 results[nid] = seg
                 # cum_dp = ソースからの累積ΔP。逆流(Q<0)では圧力が「回収」される
@@ -1265,7 +1714,7 @@ def calc_pipe_network(req: PipeNetworkRequest):
                 continue
 
             # ── T字管: 圧損バランスで自動分配（逆流も許可）─────────────
-            if node.node_type == "tee" and n_down >= 2:
+            if node.node_type == "tee" and node.params.get("teeMode", "split") != "merge" and n_down >= 2:
                 tid1, _ = downstream[0]
                 tid2, _ = downstream[1]
                 fv_bfs: frozenset = frozenset(
@@ -1295,19 +1744,27 @@ def calc_pipe_network(req: PipeNetworkRequest):
                     "Q_m3h":  round(Q * 3600, 4),
                     "Q1_m3h": round(q1_opt * 3600, 4),
                     "Q2_m3h": round(q2_opt * 3600, 4),
+                    "T_K": _round_temperature(T_in),
                     "_cum_dp": round(next_cum_dp, 6),
                     "v": 0.0, "Re": 0.0, "f": 0.0, "dP_kpa": 0.0, "regime": "split",
                 }
-                _enqueue(bfs, tid1, q1_opt, next_cum_dp)
-                _enqueue(bfs, tid2, q2_opt, next_cum_dp)
+                _enqueue(bfs, tid1, q1_opt, next_cum_dp, T_out)
+                _enqueue(bfs, tid2, q2_opt, next_cum_dp, T_out)
             else:
+                if node.node_type == "tee":
+                    results[nid] = {
+                        "Q_m3h": round(Q * 3600, 4),
+                        "T_K": _round_temperature(T_in),
+                        "_cum_dp": round(next_cum_dp, 6),
+                        "v": 0.0, "Re": 0.0, "f": 0.0, "dP_kpa": 0.0, "regime": "junction",
+                    }
                 for tid, _ in downstream:
-                    _enqueue(bfs, tid, Q, next_cum_dp)
+                    _enqueue(bfs, tid, Q, next_cum_dp, T_out)
 
         # ── 流量シンクの入口圧力を後処理で算出 ─────────────────────────
         P_src_kpa = source_pressures.get(src.id, 0.0)
         for nid, r in results.items():
-            if r.get("regime") in ("laminar", "transitional", "turbulent"):
+            if r.get("regime") in ("laminar", "transitional", "turbulent", "heatExchanger", "reducer", "elbow", "valve"):
                 cd_in = r.pop("_cum_dp_in", None)
                 cd_out = r.pop("_cum_dp_out", None)
                 if cd_in is not None and cd_out is not None:
@@ -1322,6 +1779,10 @@ def calc_pipe_network(req: PipeNetworkRequest):
                 cd = r.pop("_cum_dp")
                 r["P_kpa"] = round(P_src_kpa - cd, 4)
                 continue
+            if r.get("regime") == "junction" and "_cum_dp" in r:
+                cd = r.pop("_cum_dp")
+                r["P_kpa"] = round(P_src_kpa - cd, 4)
+                continue
             if r.get("regime") in ("sink", "boundary") and "_cum_dp" in r:
                 cd = r.pop("_cum_dp")
                 sink_node = nodes_dict.get(nid)
@@ -1330,7 +1791,13 @@ def calc_pipe_network(req: PipeNetworkRequest):
                 elif sink_node and _boundary_type(sink_node.params) == "pressure":
                     r["P_kpa"] = round(float(sink_node.params.get("pressure", r.get("P_kpa", 0.0))), 4)
 
-    return {"nodes": results, "source_pressures": source_pressures, "source_flows": source_flows}
+    return {
+        "nodes": results,
+        "source_pressures": source_pressures,
+        "source_flows": source_flows,
+        "source_temperatures": source_temperatures,
+        "boundary_temperatures": boundary_temperatures,
+    }
 
 
 @app.get("/fluids/{fluid}/saturation/csv")
