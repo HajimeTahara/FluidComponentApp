@@ -777,6 +777,7 @@ def _pump_curve_points(params: dict) -> list[tuple[float, float]]:
 
 
 def _pump_zero_head_flow(params: dict) -> float:
+    """基準回転数におけるH=0となる流量[m³/h]（相似則適用前の基準値）。"""
     q_rated = max(float(params.get("ratedFlow", 30.0)), 1e-9)
     h_rated = float(params.get("ratedHead", 20.0))
     h_shutoff = float(params.get("shutoffHead", max(h_rated, 0.0)))
@@ -786,8 +787,17 @@ def _pump_zero_head_flow(params: dict) -> float:
     return q_rated * (h_shutoff / drop_at_rated) ** 0.5
 
 
-def _pump_head_m(params: dict, q_m3h: float) -> float:
-    """PQ特性から揚程[m]を返す。ポンプ方向はIN→OUT固定。"""
+def _pump_speed_ratio(params: dict) -> float:
+    """現在回転数 / 基準回転数。基準回転数<=0なら1.0として扱う。"""
+    rated_speed = float(params.get("ratedSpeed", 1450.0))
+    if rated_speed <= 0:
+        return 1.0
+    speed = float(params.get("speed", rated_speed))
+    return max(speed, 0.0) / rated_speed
+
+
+def _pump_head_m_at_rated(params: dict, q_m3h: float) -> float:
+    """基準回転数のPQ特性（簡易曲線 or テーブル）から揚程[m]を返す。"""
     if params.get("pumpCurveMode") == "table":
         points = _pump_curve_points(params)
         if len(points) >= 2:
@@ -815,15 +825,36 @@ def _pump_head_m(params: dict, q_m3h: float) -> float:
     return max(h_shutoff - curve * (max(q_m3h, 0.0) ** 2), 0.0)
 
 
+def _pump_head_m(params: dict, q_m3h: float) -> float:
+    """PQ特性から揚程[m]を返す。ポンプ方向はIN→OUT固定。
+    相似則 (Q∝N, H∝N²) で基準回転数の特性を現在回転数に変換する。
+    """
+    r = _pump_speed_ratio(params)
+    if r <= 1e-9:
+        return 0.0
+    q_at_rated = max(q_m3h, 0.0) / r
+    h_at_rated = _pump_head_m_at_rated(params, q_at_rated)
+    return h_at_rated * r ** 2
+
+
+def _pump_max_flow(params: dict) -> float:
+    """現在回転数におけるH=0となる流量[m³/h]（相似則適用後）。"""
+    r = _pump_speed_ratio(params)
+    if params.get("pumpCurveMode") == "table":
+        points = _pump_curve_points(params)
+        q_at_rated = points[-1][0] if len(points) >= 2 else _pump_zero_head_flow(params)
+    else:
+        q_at_rated = _pump_zero_head_flow(params)
+    return q_at_rated * r
+
+
 def _pump_boost_kpa(params: dict, q_m3h: float, rho: float) -> float:
     return rho * 9.80665 * _pump_head_m(params, q_m3h) / 1000.0
 
 
 def _pump_flow_for_required_boost(params: dict, boost_kpa: float, rho: float) -> float:
     """要求昇圧[kPa]に対応するポンプ流量[m³/s]を返す。逆流は許可しない。"""
-    points = _pump_curve_points(params) if params.get("pumpCurveMode") == "table" else []
-    q_max = points[-1][0] if len(points) >= 2 else _pump_zero_head_flow(params)
-    q_max = max(q_max, 1e-9)
+    q_max = max(_pump_max_flow(params), 1e-9)
     boost_zero = _pump_boost_kpa(params, 0.0, rho)
     boost_max = _pump_boost_kpa(params, q_max, rho)
 
@@ -1018,7 +1049,7 @@ def _solve_boundary_network(
             if adjacent["kind"] == "pump":
                 q_est_m3h = abs(q) * 3600.0
                 if q_est_m3h < 1e-9:
-                    q_est_m3h = _pump_zero_head_flow(adjacent["params"]) * 0.95
+                    q_est_m3h = _pump_max_flow(adjacent["params"]) * 0.95
                 dp_est = _pump_boost_kpa(adjacent["params"], q_est_m3h, rho)
                 return mean_p - dp_est if adjacent["a"] == nid else mean_p + dp_est
             if abs(q) < 1e-12:

@@ -49,6 +49,34 @@ type PipeShape = 'circular' | 'annulus' | 'rectangular'
 type NodeRotation = 0 | 90 | 180 | 270
 type PumpCurveMode = 'quadratic' | 'table'
 type PumpCurvePoint = { q: number; h: number }
+type PressureUnit = 'm' | 'Pa' | 'kPa' | 'MPa' | 'bar'
+
+const PRESSURE_UNITS: PressureUnit[] = ['m', 'Pa', 'kPa', 'MPa', 'bar']
+const G_ACCEL = 9.80665
+
+function kpaToUnit(kpa: number, unit: PressureUnit, rho: number): number {
+  switch (unit) {
+    case 'Pa':  return kpa * 1000
+    case 'MPa': return kpa / 1000
+    case 'bar': return kpa / 100
+    case 'm':   return (kpa * 1000) / ((rho > 0 ? rho : 1000) * G_ACCEL)
+    default:    return kpa
+  }
+}
+
+function pressureDecimals(unit: PressureUnit): number {
+  switch (unit) {
+    case 'Pa':  return 0
+    case 'MPa': return 6
+    case 'bar': return 4
+    case 'm':   return 3
+    default:    return 3
+  }
+}
+
+function formatPressure(kpa: number, unit: PressureUnit, rho: number): string {
+  return kpaToUnit(kpa, unit, rho).toFixed(pressureDecimals(unit))
+}
 
 type NetworkNodeData = {
   nodeType: 'boundary' | 'source' | 'pipe' | 'pump' | 'tee' | 'sink'
@@ -66,6 +94,8 @@ type NetworkNodeData = {
   portInConnected?: boolean
   portOutConnected?: boolean
   showPressureResults?: boolean
+  pressureUnit?: PressureUnit
+  rho?: number
   rotation?: NodeRotation
   flipped?: boolean
   // pipe
@@ -83,6 +113,8 @@ type NetworkNodeData = {
   ratedHead?: number      // m
   shutoffHead?: number    // m
   efficiency?: number     // %
+  ratedSpeed?: number     // rpm: PQ特性(簡易曲線/テーブル)の基準回転数
+  speed?: number          // rpm: 現在の回転数（相似則でPQ特性をスケーリング）
   pumpCurveMode?: PumpCurveMode
   pumpCurvePoints?: PumpCurvePoint[]
   // tee (flow split is physics-based; no manual parameter)
@@ -149,6 +181,7 @@ function pumpCurvePointsFor(data: NetworkNodeData): PumpCurvePoint[] {
 }
 
 function pumpZeroHeadFlow(data: NetworkNodeData): number {
+  // 基準回転数におけるH=0となる流量（相似則適用前）
   const ratedFlow = Math.max(data.ratedFlow ?? 30, 1e-9)
   const ratedHead = data.ratedHead ?? 20
   const shutoffHead = data.shutoffHead ?? Math.max(ratedHead, 0)
@@ -157,7 +190,27 @@ function pumpZeroHeadFlow(data: NetworkNodeData): number {
   return ratedFlow * Math.sqrt(shutoffHead / dropAtRated)
 }
 
-function pumpHeadAt(data: NetworkNodeData, q: number): number {
+function pumpSpeedRatio(data: NetworkNodeData): number {
+  const ratedSpeed = data.ratedSpeed ?? 1450
+  if (ratedSpeed <= 0) return 1
+  const speed = data.speed ?? ratedSpeed
+  return Math.max(speed, 0) / ratedSpeed
+}
+
+function pumpMaxFlow(data: NetworkNodeData): number {
+  // 現在回転数におけるH=0となる流量（相似則適用後）
+  const r = pumpSpeedRatio(data)
+  if ((data.pumpCurveMode ?? 'quadratic') === 'table') {
+    const points = pumpCurvePointsFor(data)
+      .filter(p => Number.isFinite(p.q) && Number.isFinite(p.h) && p.q >= 0 && p.h >= 0)
+      .sort((a, b) => a.q - b.q)
+    const qAtRated = points.length >= 2 ? points[points.length - 1].q : pumpZeroHeadFlow(data)
+    return qAtRated * r
+  }
+  return pumpZeroHeadFlow(data) * r
+}
+
+function pumpHeadAtRated(data: NetworkNodeData, q: number): number {
   if ((data.pumpCurveMode ?? 'quadratic') === 'table') {
     const points = pumpCurvePointsFor(data)
       .filter(p => Number.isFinite(p.q) && Number.isFinite(p.h) && p.q >= 0 && p.h >= 0)
@@ -183,6 +236,15 @@ function pumpHeadAt(data: NetworkNodeData, q: number): number {
   const curve = Math.max((shutoffHead - ratedHead) / (ratedFlow ** 2), 0)
   if (curve <= 1e-12) return Math.max(shutoffHead, ratedHead, 0)
   return Math.max(shutoffHead - curve * (Math.max(q, 0) ** 2), 0)
+}
+
+function pumpHeadAt(data: NetworkNodeData, q: number): number {
+  // 相似則 (Q∝N, H∝N²) で基準回転数の特性を現在回転数に変換する
+  const r = pumpSpeedRatio(data)
+  if (r <= 1e-9) return 0
+  const qAtRated = Math.max(q, 0) / r
+  const hAtRated = pumpHeadAtRated(data, qAtRated)
+  return Math.max(hAtRated * r * r, 0)
 }
 
 // ── SVG icons ──────────────────────────────────────────────────────
@@ -262,9 +324,11 @@ function BoundaryNode({ data, selected }: NodeProps) {
   const isFlow = (d.boundaryType ?? 'flow') === 'flow'
   const inPosition = orientPosition(Position.Left, d)
   const outPosition = orientPosition(Position.Right, d)
+  const unit = d.pressureUnit ?? 'kPa'
+  const rho = d.rho ?? 1000
   const displayedPressure = d.calcPressure ?? d.result?.P_kpa ?? d.pressure
   const pressureLabel = displayedPressure !== undefined
-    ? `${displayedPressure.toFixed(1)} kPa`
+    ? `${formatPressure(displayedPressure, unit, rho)} ${unit}`
     : null
   return (
     <div className={`relative px-3 py-2 rounded-xl border-2 bg-teal-50 min-w-[130px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-teal-500'}`}>
@@ -301,13 +365,15 @@ function PipeNode({ data, selected }: NodeProps) {
   const d = data as unknown as NetworkNodeData
   const inPosition = orientPosition(Position.Left, d)
   const outPosition = orientPosition(Position.Right, d)
+  const unit = d.pressureUnit ?? 'kPa'
+  const rho = d.rho ?? 1000
   const shapeLabel = d.pipeShape === 'annulus' ? '中空円' : d.pipeShape === 'rectangular' ? '矩形' : '円管'
   return (
     <div className={`relative px-3 py-2 rounded border-2 bg-sky-50 min-w-[140px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-sky-400'}`}>
       <Handle type="target" position={inPosition} style={portHandleStyle('#38bdf8', 'in')} />
       {d.showPressureResults && d.result?.P_from_kpa !== undefined && (d.portInConnected ?? d.portLeftConnected) && (
         <div className={pressureBadgeClass(inPosition)}>
-          {d.result.P_from_kpa.toFixed(1)} kPa
+          {formatPressure(d.result.P_from_kpa, unit, rho)} {unit}
         </div>
       )}
       <div className="flex items-center gap-1.5 mb-0.5">
@@ -316,11 +382,11 @@ function PipeNode({ data, selected }: NodeProps) {
       </div>
       <div className="text-xs text-sky-500 pl-5">{shapeLabel} · L={d.length ?? 50} m</div>
       {d.result && (
-        <div className="text-xs font-bold text-red-500 mt-0.5 pl-5">ΔP: {d.result.dP_kpa.toFixed(2)} kPa</div>
+        <div className="text-xs font-bold text-red-500 mt-0.5 pl-5">ΔP: {formatPressure(d.result.dP_kpa, unit, rho)} {unit}</div>
       )}
       {d.showPressureResults && d.result?.P_to_kpa !== undefined && (d.portOutConnected ?? d.portRightConnected) && (
         <div className={pressureBadgeClass(outPosition)}>
-          {d.result.P_to_kpa.toFixed(1)} kPa
+          {formatPressure(d.result.P_to_kpa, unit, rho)} {unit}
         </div>
       )}
       <Handle type="source" position={outPosition} style={portHandleStyle('#38bdf8', 'out')} />
@@ -332,12 +398,14 @@ function PumpNode({ data, selected }: NodeProps) {
   const d = data as unknown as NetworkNodeData
   const inPosition = orientPosition(Position.Left, d)
   const outPosition = orientPosition(Position.Right, d)
+  const unit = d.pressureUnit ?? 'kPa'
+  const rho = d.rho ?? 1000
   return (
     <div className={`relative px-3 py-2 rounded border-2 bg-violet-50 min-w-[150px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-violet-500'}`}>
       <Handle type="target" position={inPosition} style={portHandleStyle('#8b5cf6', 'in')} />
       {d.showPressureResults && d.result?.P_from_kpa !== undefined && (d.portInConnected ?? d.portLeftConnected) && (
         <div className={pressureBadgeClass(inPosition)}>
-          {d.result.P_from_kpa.toFixed(1)} kPa
+          {formatPressure(d.result.P_from_kpa, unit, rho)} {unit}
         </div>
       )}
       <div className="flex items-center gap-1.5 mb-0.5">
@@ -350,11 +418,11 @@ function PumpNode({ data, selected }: NodeProps) {
           : `H0=${d.shutoffHead ?? 30} m · Qr=${d.ratedFlow ?? 30} m³/h`}
       </div>
       {d.result?.boost_kpa !== undefined && (
-        <div className="text-xs font-bold text-emerald-600 mt-0.5 pl-5">+ΔP: {d.result.boost_kpa.toFixed(2)} kPa</div>
+        <div className="text-xs font-bold text-emerald-600 mt-0.5 pl-5">+ΔP: {formatPressure(d.result.boost_kpa, unit, rho)} {unit}</div>
       )}
       {d.showPressureResults && d.result?.P_to_kpa !== undefined && (d.portOutConnected ?? d.portRightConnected) && (
         <div className={pressureBadgeClass(outPosition)}>
-          {d.result.P_to_kpa.toFixed(1)} kPa
+          {formatPressure(d.result.P_to_kpa, unit, rho)} {unit}
         </div>
       )}
       <Handle type="source" position={outPosition} style={portHandleStyle('#8b5cf6', 'out')} />
@@ -365,6 +433,8 @@ function PumpNode({ data, selected }: NodeProps) {
 function TeeNode({ data, selected }: NodeProps) {
   const d = data as unknown as NetworkNodeData
   const r = d.result
+  const unit = d.pressureUnit ?? 'kPa'
+  const rho = d.rho ?? 1000
   const inPosition = orientPosition(Position.Left, d)
   const out1Position = orientPosition(Position.Right, d)
   const out2Position = orientPosition(Position.Bottom, d)
@@ -377,12 +447,12 @@ function TeeNode({ data, selected }: NodeProps) {
       </div>
       {r?.regime === 'split' ? (
         <div className="text-xs text-amber-600 font-medium tabular-nums">
-          {r.P_kpa !== undefined && <div>P: {r.P_kpa.toFixed(2)} kPa</div>}
+          {r.P_kpa !== undefined && <div>P: {formatPressure(r.P_kpa, unit, rho)} {unit}</div>}
           <div>{r.Q1_m3h?.toFixed(2)} / {r.Q2_m3h?.toFixed(2)} m³/h</div>
         </div>
       ) : r?.regime === 'junction' && r.P_kpa !== undefined ? (
         <div className="text-xs text-amber-600 font-medium tabular-nums">
-          P: {r.P_kpa.toFixed(2)} kPa
+          P: {formatPressure(r.P_kpa, unit, rho)} {unit}
         </div>
       ) : (
         <div className="text-xs text-amber-400">圧損バランス分配</div>
@@ -396,6 +466,8 @@ function TeeNode({ data, selected }: NodeProps) {
 function SinkNode({ data, selected }: NodeProps) {
   const d = data as unknown as NetworkNodeData
   const isPressure = (d.boundaryType ?? 'pressure') === 'pressure'
+  const unit = d.pressureUnit ?? 'kPa'
+  const rho = d.rho ?? 1000
   const inPosition = orientPosition(Position.Left, d)
   return (
     <div className={`px-3 py-2 rounded-xl border-2 bg-rose-50 min-w-[110px] ${selected ? 'border-blue-500 shadow-lg' : 'border-rose-400'}`}>
@@ -406,7 +478,7 @@ function SinkNode({ data, selected }: NodeProps) {
       </div>
       {isPressure ? (
         <>
-          <div className="text-xs text-rose-400">P: {d.pressure ?? 0} kPa</div>
+          <div className="text-xs text-rose-400">P: {formatPressure(d.pressure ?? 0, unit, rho)} {unit}</div>
           {d.result && (
             <div className="text-xs font-bold text-blue-600">Q: {d.result.Q_m3h.toFixed(2)} m³/h</div>
           )}
@@ -510,6 +582,7 @@ function defaultData(type: string, n: number): NetworkNodeData {
       ratedFlow: 30, ratedHead: 20,
       shutoffHead: 30,
       efficiency: 70,
+      ratedSpeed: 1450, speed: 1450,
       pumpCurveMode: 'quadratic',
       pumpCurvePoints: [
         { q: 0, h: 30 },
@@ -521,6 +594,28 @@ function defaultData(type: string, n: number): NetworkNodeData {
     case 'sink': return { nodeType: 'sink', label: `シンク${n}`, boundaryType: 'pressure', pressure: 101.325 }
     default:     return { nodeType: 'boundary', label: `${type}${n}`, boundaryType: 'pressure', pressure: 101.325, flowRate: 10 }
   }
+}
+
+const DEFAULT_NODE_COUNTER = 4
+
+function createDefaultDiagram(): { nodes: Node[]; edges: Edge[] } {
+  const nodes: Node[] = [
+    {
+      id: 'boundary-1', type: 'boundary', position: { x: 380, y: 20 },
+      data: { ...defaultData('boundary', 1), flipped: true } as NetworkNodeData,
+    },
+    { id: 'pipe-2', type: 'pipe', position: { x: 700, y: 200 }, data: defaultData('pipe', 2) as NetworkNodeData },
+    { id: 'pipe-3', type: 'pipe', position: { x: 60,  y: 200 }, data: defaultData('pipe', 3) as NetworkNodeData },
+    { id: 'pump-4', type: 'pump', position: { x: 380, y: 360 }, data: defaultData('pump', 4) as NetworkNodeData },
+  ]
+  const edgeStyle = { stroke: '#94a3b8', strokeWidth: 2 }
+  const edges: Edge[] = [
+    { id: 'e-boundary-1-pipe-3', source: 'boundary-1', target: 'pipe-3', type: 'flow', style: edgeStyle },
+    { id: 'e-pipe-3-pump-4',     source: 'pipe-3',     target: 'pump-4', type: 'flow', style: edgeStyle },
+    { id: 'e-pump-4-pipe-2',     source: 'pump-4',     target: 'pipe-2', type: 'flow', style: edgeStyle },
+    { id: 'e-pipe-2-boundary-1', source: 'pipe-2',     target: 'boundary-1', type: 'flow', style: edgeStyle },
+  ]
+  return { nodes, edges }
 }
 
 // ── Vertical parameter panel (left column of bottom section) ───────
@@ -542,42 +637,122 @@ function NumField({ label, unit, value, onChange }: {
   )
 }
 
-function ResultGrid({ result }: { result: PipeSegmentResult }) {
-  const regimeLabel =
-    result.regime === 'laminar' ? '層流'
-    : result.regime === 'turbulent' ? '乱流'
-    : result.regime === 'junction' ? '節点'
-    : '遷移域'
-  const rows = [
-    { label: '流量 Q',     value: `${result.Q_m3h.toFixed(3)} m³/h` },
-    { label: '流速 v',     value: `${result.v.toFixed(4)} m/s` },
-    { label: 'Re数',       value: result.Re.toFixed(1) },
-    { label: '摩擦係数 f', value: result.f.toFixed(6) },
-    { label: '流動域',     value: regimeLabel },
-    { label: '圧力損失 ΔP', value: `${result.dP_kpa.toFixed(4)} kPa`, highlight: true },
-    ...(result.P_in_kpa !== undefined ? [
-      { label: '入口圧 P_in', value: `${result.P_in_kpa.toFixed(3)} kPa` },
-    ] : []),
-    ...(result.P_out_kpa !== undefined ? [
-      { label: '出口圧 P_out', value: `${result.P_out_kpa.toFixed(3)} kPa` },
-    ] : []),
-    ...(result.P_from_kpa !== undefined && result.P_to_kpa !== undefined ? [
-      { label: '接続方向 P', value: `${result.P_from_kpa.toFixed(3)} → ${result.P_to_kpa.toFixed(3)} kPa` },
-    ] : []),
-  ]
+// ── Unified result table: 項目 / 記号 / 値 / 単位 ──────────────────
+
+type ResultRow = { item: string; symbol: string; value: string; unit: string; highlight?: boolean }
+type ResultTheme = 'sky' | 'violet' | 'amber' | 'blue'
+
+const RESULT_THEME_CLASSES: Record<ResultTheme, { bg: string; border: string; title: string }> = {
+  sky:    { bg: 'bg-sky-50',    border: 'border-sky-100',    title: 'text-sky-600' },
+  violet: { bg: 'bg-violet-50', border: 'border-violet-100', title: 'text-violet-600' },
+  amber:  { bg: 'bg-amber-50',  border: 'border-amber-100',  title: 'text-amber-600' },
+  blue:   { bg: 'bg-blue-50',   border: 'border-blue-100',   title: 'text-blue-600' },
+}
+
+function ResultTable({ title, rows, theme = 'sky', note }: {
+  title: string; rows: ResultRow[]; theme?: ResultTheme; note?: string
+}) {
+  const c = RESULT_THEME_CLASSES[theme]
   return (
-    <div className="bg-sky-50 rounded-lg p-3 border border-sky-100">
-      <div className="text-xs font-semibold text-sky-600 mb-2">計算結果</div>
-      <div className="flex flex-col gap-1.5">
-        {rows.map(r => (
-          <div key={r.label} className="flex justify-between items-baseline gap-2">
-            <span className="text-xs text-gray-500 shrink-0">{r.label}</span>
-            <span className={`text-sm tabular-nums font-medium ${r.highlight ? 'text-red-600 font-bold' : 'text-gray-800'}`}>{r.value}</span>
-          </div>
-        ))}
-      </div>
+    <div className={`rounded-lg p-3 border ${c.bg} ${c.border}`}>
+      <div className={`text-xs font-semibold mb-2 ${c.title}`}>{title}</div>
+      {note && <div className="text-xs text-gray-500 mb-2">{note}</div>}
+      <table className="w-full text-sm border-collapse">
+        <thead>
+          <tr className="text-xs text-gray-400">
+            <th className="text-left font-medium pb-1">項目</th>
+            <th className="text-left font-medium pb-1">記号</th>
+            <th className="text-right font-medium pb-1">値</th>
+            <th className="text-left font-medium pb-1 pl-2">単位</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(r => (
+            <tr key={r.item} className="border-t border-black/5">
+              <td className="py-1 text-xs text-gray-500 whitespace-nowrap">{r.item}</td>
+              <td className="py-1 text-xs text-gray-400 italic whitespace-nowrap">{r.symbol}</td>
+              <td className={`py-1 text-right tabular-nums font-medium whitespace-nowrap ${r.highlight ? 'text-red-600 font-bold' : 'text-gray-800'}`}>
+                {r.value}
+              </td>
+              <td className="py-1 pl-2 text-xs text-gray-400 whitespace-nowrap">{r.unit}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   )
+}
+
+function pipeResultRows(result: PipeSegmentResult, unit: PressureUnit, rho: number): ResultRow[] {
+  return [
+    { item: '流量',       symbol: 'Q',  value: result.Q_m3h.toFixed(3), unit: 'm³/h' },
+    { item: '流速',       symbol: 'v',  value: result.v.toFixed(4),     unit: 'm/s' },
+    { item: 'レイノルズ数', symbol: 'Re', value: result.Re.toFixed(1),    unit: '–' },
+    { item: '摩擦係数',    symbol: 'f',  value: result.f.toFixed(6),     unit: '–' },
+    { item: '圧力損失',    symbol: 'ΔP', value: formatPressure(result.dP_kpa, unit, rho), unit, highlight: true },
+    ...(result.P_in_kpa  !== undefined ? [{ item: '上流圧', symbol: 'P_in',  value: formatPressure(result.P_in_kpa,  unit, rho), unit }] : []),
+    ...(result.P_out_kpa !== undefined ? [{ item: '下流圧', symbol: 'P_out', value: formatPressure(result.P_out_kpa, unit, rho), unit }] : []),
+  ]
+}
+
+function pumpResultRows(result: PipeSegmentResult, unit: PressureUnit, rho: number): ResultRow[] {
+  return [
+    { item: '流量',   symbol: 'Q',   value: result.Q_m3h.toFixed(3),                       unit: 'm³/h' },
+    { item: '揚程',   symbol: 'H',   value: (result.head_m ?? 0).toFixed(3),               unit: 'm' },
+    { item: '昇圧',   symbol: 'ΔP',  value: formatPressure(result.boost_kpa ?? 0, unit, rho), unit, highlight: true },
+    { item: '理論動力', symbol: 'P_h', value: (result.hydraulic_power_kw ?? 0).toFixed(4), unit: 'kW' },
+    { item: '消費動力', symbol: 'P_s', value: (result.shaft_power_kw ?? 0).toFixed(4),     unit: 'kW', highlight: true },
+    ...(result.P_from_kpa !== undefined ? [{ item: '入口圧', symbol: 'P_in',  value: formatPressure(result.P_from_kpa, unit, rho), unit }] : []),
+    ...(result.P_to_kpa   !== undefined ? [{ item: '出口圧', symbol: 'P_out', value: formatPressure(result.P_to_kpa,   unit, rho), unit }] : []),
+  ]
+}
+
+function boundaryResultRows(d: NetworkNodeData, unit: PressureUnit, rho: number): ResultRow[] | null {
+  const isFlow = (d.boundaryType ?? 'flow') === 'flow'
+  if (isFlow && d.calcPressure !== undefined) {
+    return [{ item: '境界圧力', symbol: 'P', value: formatPressure(d.calcPressure, unit, rho), unit, highlight: true }]
+  }
+  if (!isFlow && d.calcFlow !== undefined) {
+    return [{ item: '境界流量', symbol: 'Q', value: d.calcFlow.toFixed(3), unit: 'm³/h', highlight: true }]
+  }
+  return null
+}
+
+function teeResultRows(d: NetworkNodeData, unit: PressureUnit, rho: number): ResultRow[] | null {
+  const r = d.result
+  if (r?.regime === 'junction') {
+    return [
+      { item: '圧力',   symbol: 'P', value: r.P_kpa !== undefined ? formatPressure(r.P_kpa, unit, rho) : '—', unit, highlight: true },
+      { item: '通過流量', symbol: 'Q', value: r.Q_m3h.toFixed(3), unit: 'm³/h' },
+    ]
+  }
+  if (r?.regime === 'split') {
+    const q  = r.Q_m3h
+    const q1 = r.Q1_m3h
+    const q2 = r.Q2_m3h
+    return [
+      { item: '入口流量',  symbol: 'Q',  value: q.toFixed(3),                                          unit: 'm³/h' },
+      { item: '出口流量1', symbol: 'Q₁', value: q1 !== undefined ? q1.toFixed(3) : '—',                 unit: 'm³/h', highlight: true },
+      { item: '出口流量2', symbol: 'Q₂', value: q2 !== undefined ? q2.toFixed(3) : '—',                 unit: 'm³/h', highlight: true },
+      { item: '分配率1',   symbol: 'η₁', value: (q1 !== undefined && q !== 0) ? (q1 / q * 100).toFixed(1) : '—', unit: '%' },
+      { item: '分配率2',   symbol: 'η₂', value: (q2 !== undefined && q !== 0) ? (q2 / q * 100).toFixed(1) : '—', unit: '%' },
+    ]
+  }
+  return null
+}
+
+function componentTypeLabel(nodeType: string): string {
+  if (nodeType === 'pipe') return 'パイプ'
+  if (nodeType === 'pump') return 'ポンプ'
+  if (nodeType === 'tee')  return 'T字管'
+  return '境界'
+}
+
+function componentResultRows(d: NetworkNodeData, unit: PressureUnit, rho: number): ResultRow[] | null {
+  if (d.nodeType === 'pipe') return d.result ? pipeResultRows(d.result, unit, rho) : null
+  if (d.nodeType === 'pump') return d.result ? pumpResultRows(d.result, unit, rho) : null
+  if (d.nodeType === 'tee')  return teeResultRows(d, unit, rho)
+  return boundaryResultRows(d, unit, rho)
 }
 
 function NodeParamPanel({ node, onChange }: {
@@ -640,29 +815,11 @@ function NodeParamPanel({ node, onChange }: {
           </div>
         </div>
 
-        {(d.boundaryType ?? 'flow') === 'flow' ? (<>
+        {(d.boundaryType ?? 'flow') === 'flow' ? (
           <NumField label="流量 Q" unit="m³/h" value={d.flowRate ?? 10} onChange={v => onChange({ flowRate: v })} />
-          {d.calcPressure !== undefined && (
-            <div className="bg-blue-50 rounded-lg p-4 border border-blue-100">
-              <div className="text-xs font-semibold text-blue-500 mb-1">計算結果 — 境界圧力</div>
-              <div className="text-2xl font-bold text-blue-700 tabular-nums">
-                {d.calcPressure.toFixed(2)}
-                <span className="text-sm font-normal text-blue-500 ml-1">kPa</span>
-              </div>
-            </div>
-          )}
-        </>) : (<>
+        ) : (
           <NumField label="圧力 P" unit="kPa" value={d.pressure ?? 100} onChange={v => onChange({ pressure: v })} />
-          {d.calcFlow !== undefined && (
-            <div className="bg-blue-50 rounded-lg p-4 border border-blue-100">
-              <div className="text-xs font-semibold text-blue-500 mb-1">計算結果 — 境界流量</div>
-              <div className="text-2xl font-bold text-blue-700 tabular-nums">
-                {d.calcFlow.toFixed(3)}
-                <span className="text-sm font-normal text-blue-500 ml-1">m³/h</span>
-              </div>
-            </div>
-          )}
-        </>)}
+        )}
       </>)}
 
       {/* ── Pipe ── */}
@@ -713,7 +870,6 @@ function NodeParamPanel({ node, onChange }: {
           </div>
         </div>
 
-        {d.result && <ResultGrid result={d.result} />}
       </>)}
 
       {/* ── Pump ── */}
@@ -741,6 +897,15 @@ function NodeParamPanel({ node, onChange }: {
           </div>
         </div>
 
+        <div className="rounded-lg border border-violet-100 bg-violet-50/60 p-3 flex flex-col gap-3">
+          <div className="text-xs font-semibold text-violet-600">回転数（相似則）</div>
+          <NumField label="基準回転数 Nr" unit="rpm" value={d.ratedSpeed ?? 1450} onChange={v => onChange({ ratedSpeed: v })} />
+          <NumField label="現在回転数 N"  unit="rpm" value={d.speed ?? d.ratedSpeed ?? 1450} onChange={v => onChange({ speed: v })} />
+          <p className="text-xs text-gray-400 leading-relaxed">
+            PQ特性（簡易曲線・テーブルいずれも）は基準回転数Nrで定義されたものとして扱い、Q∝N、H∝N²でNに応じてスケーリングします。
+          </p>
+        </div>
+
         {(d.pumpCurveMode ?? 'quadratic') === 'quadratic' ? (<>
           <div className="rounded-lg border border-violet-100 bg-violet-50 p-3 text-xs leading-relaxed text-violet-700">
             H(Q) = H0 - aQ²、a = (H0 - Hr) / Qr² としてPQ曲線を作ります。QmaxはH=0となる流量として自動計算します。
@@ -749,10 +914,10 @@ function NodeParamPanel({ node, onChange }: {
           <NumField label="定格揚程 Hr" unit="m" value={d.ratedHead ?? 20} onChange={v => onChange({ ratedHead: v })} />
           <NumField label="閉止揚程 H0" unit="m" value={d.shutoffHead ?? 30} onChange={v => onChange({ shutoffHead: v })} />
           <div className="rounded-lg border border-gray-100 bg-gray-50 p-3 text-sm text-gray-700">
-            <div className="text-xs font-semibold text-gray-500 mb-1">自動計算</div>
+            <div className="text-xs font-semibold text-gray-500 mb-1">自動計算（現在回転数）</div>
             <div className="flex justify-between items-baseline gap-2">
               <span className="text-xs text-gray-500">最大流量 Qmax</span>
-              <span className="font-bold tabular-nums">{pumpZeroHeadFlow(d).toFixed(2)} m³/h</span>
+              <span className="font-bold tabular-nums">{pumpMaxFlow(d).toFixed(2)} m³/h</span>
             </div>
           </div>
         </>) : (
@@ -796,86 +961,111 @@ function NodeParamPanel({ node, onChange }: {
             >
               行を追加
             </button>
+            <p className="text-xs text-violet-400">表の値は基準回転数Nrにおける特性として入力してください。</p>
+            <div className="rounded-lg border border-gray-100 bg-gray-50 p-3 text-sm text-gray-700">
+              <div className="text-xs font-semibold text-gray-500 mb-1">自動計算（現在回転数）</div>
+              <div className="flex justify-between items-baseline gap-2">
+                <span className="text-xs text-gray-500">最大流量 Qmax</span>
+                <span className="font-bold tabular-nums">{pumpMaxFlow(d).toFixed(2)} m³/h</span>
+              </div>
+            </div>
           </div>
         )}
 
         <NumField label="効率 η" unit="%" value={d.efficiency ?? 70} onChange={v => onChange({ efficiency: v })} />
-
-        {d.result && (
-          <div className="bg-violet-50 rounded-lg p-4 border border-violet-100 flex flex-col gap-2">
-            <div className="text-xs font-semibold text-violet-600 mb-1">計算結果 — ポンプ</div>
-            {[
-              { label: '流量 Q', value: `${d.result.Q_m3h.toFixed(3)} m³/h` },
-              { label: '揚程 H', value: `${(d.result.head_m ?? 0).toFixed(3)} m` },
-              { label: '昇圧 +ΔP', value: `${(d.result.boost_kpa ?? 0).toFixed(3)} kPa`, accent: true },
-              { label: '理論動力', value: `${(d.result.hydraulic_power_kw ?? 0).toFixed(4)} kW` },
-              { label: '消費動力', value: `${(d.result.shaft_power_kw ?? 0).toFixed(4)} kW`, accent: true },
-              ...(d.result.P_from_kpa !== undefined && d.result.P_to_kpa !== undefined ? [
-                { label: '入口→出口 P', value: `${d.result.P_from_kpa.toFixed(3)} → ${d.result.P_to_kpa.toFixed(3)} kPa` },
-              ] : []),
-            ].map(row => (
-              <div key={row.label} className="flex justify-between items-baseline gap-2">
-                <span className="text-xs text-gray-500 shrink-0">{row.label}</span>
-                <span className={`text-sm tabular-nums font-medium ${row.accent ? 'text-emerald-700 font-bold' : 'text-gray-800'}`}>
-                  {row.value}
-                </span>
-              </div>
-            ))}
-          </div>
-        )}
       </>)}
-
-      {/* ── Tee ── */}
-      {d.nodeType === 'tee' && (
-        d.result?.regime === 'junction' ? (
-          <div className="bg-amber-50 rounded-lg p-4 border border-amber-100 flex flex-col gap-2">
-            <div className="text-xs font-semibold text-amber-600 mb-1">計算結果 — 節点圧</div>
-            <div className="flex justify-between items-baseline gap-2">
-              <span className="text-xs text-gray-500 shrink-0">圧力 P</span>
-              <span className="text-sm tabular-nums font-bold text-amber-700">
-                {d.result.P_kpa?.toFixed(3) ?? '—'} kPa
-              </span>
-            </div>
-            <div className="flex justify-between items-baseline gap-2">
-              <span className="text-xs text-gray-500 shrink-0">通過流量</span>
-              <span className="text-sm tabular-nums font-medium text-gray-800">
-                {d.result.Q_m3h.toFixed(3)} m³/h
-              </span>
-            </div>
-          </div>
-        ) : d.result?.regime === 'split' ? (
-          <div className="bg-amber-50 rounded-lg p-4 border border-amber-100 flex flex-col gap-2">
-            <div className="text-xs font-semibold text-amber-600 mb-1">計算結果 — 圧損バランス分配</div>
-            {[
-              { label: '入口流量 Q',      value: d.result.Q_m3h.toFixed(3),             unit: 'm³/h' },
-              { label: '右出口 Q₁',       value: d.result.Q1_m3h?.toFixed(3) ?? '—',    unit: 'm³/h', accent: true },
-              { label: '下出口 Q₂',       value: d.result.Q2_m3h?.toFixed(3) ?? '—',    unit: 'm³/h', accent: true },
-              { label: '分配比 Q₁ : Q₂',  value: (d.result.Q1_m3h != null && d.result.Q2_m3h != null)
-                  ? `${(d.result.Q1_m3h / d.result.Q_m3h * 100).toFixed(1)} : ${(d.result.Q2_m3h / d.result.Q_m3h * 100).toFixed(1)} %`
-                  : '—',
-                unit: '' },
-            ].map(row => (
-              <div key={row.label} className="flex justify-between items-baseline gap-2">
-                <span className="text-xs text-gray-500 shrink-0">{row.label}</span>
-                <span className={`text-sm tabular-nums font-medium ${row.accent ? 'text-amber-700 font-bold' : 'text-gray-800'}`}>
-                  {row.value}{row.unit ? ` ${row.unit}` : ''}
-                </span>
-              </div>
-            ))}
-          </div>
-        ) : (
-          <div className="bg-amber-50 rounded-lg p-4 border border-amber-100 text-center flex flex-col items-center gap-2">
-            <SvgTee className="w-8 h-8 text-amber-400" />
-            <p className="text-sm font-medium text-amber-600">圧損バランス自動分配</p>
-            <p className="text-xs text-gray-400 leading-relaxed">
-              下流の配管抵抗が等しくなるよう流量を自動分配します。
-              「計算開始」で分配結果を確認できます。
-            </p>
-          </div>
-        )
-      )}
     </div>
   )
+}
+
+const REGIME_TEXT_LABEL: Record<string, string> = {
+  laminar: '層流', transitional: '遷移域', turbulent: '乱流', junction: '節点',
+}
+
+function ResultsPanel({ node, pressureUnit, rho }: {
+  node: Node | null
+  pressureUnit: PressureUnit
+  rho: number
+}) {
+  const empty = (
+    <div className="flex flex-col items-center justify-center h-28 text-center gap-2">
+      <p className="text-sm text-gray-400">「計算開始」を実行すると<br />結果が表示されます</p>
+    </div>
+  )
+
+  if (!node) {
+    return (
+      <div className="flex flex-col items-center justify-center h-28 text-center gap-2">
+        <p className="text-sm text-gray-400">ノードを選択してください</p>
+      </div>
+    )
+  }
+
+  const d = node.data as unknown as NetworkNodeData
+  const isBoundaryNode = d.nodeType === 'boundary' || d.nodeType === 'source' || d.nodeType === 'sink'
+
+  if (isBoundaryNode) {
+    const isFlow = (d.boundaryType ?? 'flow') === 'flow'
+    const rows = boundaryResultRows(d, pressureUnit, rho)
+    if (rows) {
+      return (
+        <ResultTable
+          theme="blue"
+          title={isFlow ? '計算結果 — 境界圧力' : '計算結果 — 境界流量'}
+          rows={rows}
+        />
+      )
+    }
+    return empty
+  }
+
+  if (d.nodeType === 'pipe') {
+    if (!d.result) return empty
+    return (
+      <ResultTable
+        theme="sky"
+        title="計算結果 — パイプ"
+        note={`流動域: ${REGIME_TEXT_LABEL[d.result.regime] ?? d.result.regime}`}
+        rows={pipeResultRows(d.result, pressureUnit, rho)}
+      />
+    )
+  }
+
+  if (d.nodeType === 'pump') {
+    if (!d.result) return empty
+    return (
+      <ResultTable
+        theme="violet"
+        title="計算結果 — ポンプ"
+        rows={pumpResultRows(d.result, pressureUnit, rho)}
+      />
+    )
+  }
+
+  if (d.nodeType === 'tee') {
+    const rows = teeResultRows(d, pressureUnit, rho)
+    if (rows) {
+      return (
+        <ResultTable
+          theme="amber"
+          title={d.result?.regime === 'junction' ? '計算結果 — 節点圧' : '計算結果 — 圧損バランス分配'}
+          rows={rows}
+        />
+      )
+    }
+    return (
+      <div className="bg-amber-50 rounded-lg p-4 border border-amber-100 text-center flex flex-col items-center gap-2">
+        <SvgTee className="w-8 h-8 text-amber-400" />
+        <p className="text-sm font-medium text-amber-600">圧損バランス自動分配</p>
+        <p className="text-xs text-gray-400 leading-relaxed">
+          下流の配管抵抗が等しくなるよう流量を自動分配します。
+          「計算開始」で分配結果を確認できます。
+        </p>
+      </div>
+    )
+  }
+
+  return empty
 }
 
 // ── Analysis panel: flow-rate vs pressure-drop chart ──────────────
@@ -891,10 +1081,12 @@ const REGIME_LABEL: Record<string, string> = {
   turbulent: '乱流',
 }
 
-function AnalysisPanel({ node, density, viscosity }: {
+function AnalysisPanel({ node, density, viscosity, pressureUnit, rho }: {
   node: Node | null
   density: string
   viscosity: string
+  pressureUnit: PressureUnit
+  rho: number
 }) {
   const d = node?.data as unknown as NetworkNodeData | undefined
   const isPipe = d?.nodeType === 'pipe'
@@ -903,9 +1095,7 @@ function AnalysisPanel({ node, density, viscosity }: {
   const [chartData, setChartData] = useState<PressureDropResult | null>(null)
   const [fetching,  setFetching]  = useState(false)
   const [fetchErr,  setFetchErr]  = useState<string | null>(null)
-  const pumpQMax = isPump && d && (d.pumpCurveMode ?? 'quadratic') === 'quadratic'
-    ? pumpZeroHeadFlow(d)
-    : null
+  const pumpQMax = isPump && d ? pumpMaxFlow(d) : null
 
   // Fetch curve whenever the selected pipe's params or fluid props change (debounced)
   useEffect(() => {
@@ -969,8 +1159,7 @@ function AnalysisPanel({ node, density, viscosity }: {
 
   const traces = useMemo(() => {
     if (isPump && d) {
-      const tableMax = pumpCurvePointsFor(d).reduce((max, point) => Math.max(max, point.q), 0)
-      const qMax = Math.max((d.pumpCurveMode ?? 'quadratic') === 'table' ? tableMax : pumpZeroHeadFlow(d) * 1.12, 1)
+      const qMax = Math.max(pumpMaxFlow(d) * 1.12, 1)
       const flowRates = Array.from({ length: 100 }, (_, i) => qMax * i / 99)
       const out: object[] = [{
         x: flowRates,
@@ -1001,7 +1190,7 @@ function AnalysisPanel({ node, density, viscosity }: {
     }
     chartData.flow_rates.forEach((q, i) => {
       const r = chartData.regimes[i]
-      if (segs[r]) { segs[r].x.push(q); segs[r].y.push(chartData.pressure_drops[i] / 1000) }
+      if (segs[r]) { segs[r].x.push(q); segs[r].y.push(kpaToUnit(chartData.pressure_drops[i] / 1000, pressureUnit, rho)) }
     })
     const out: object[] = Object.entries(segs)
       .filter(([, s]) => s.x.length > 0)
@@ -1010,20 +1199,20 @@ function AnalysisPanel({ node, density, viscosity }: {
         type: 'scatter', mode: 'lines',
         name: REGIME_LABEL[regime] ?? regime,
         line: { color: REGIME_COLOR[regime], width: 2.5 },
-        hovertemplate: 'Q: %{x:.2f} m³/h<br>ΔP: %{y:.3f} kPa<extra></extra>',
+        hovertemplate: `Q: %{x:.2f} m³/h<br>ΔP: %{y:.3f} ${pressureUnit}<extra></extra>`,
       }))
     // Operating point marker (from network calc result)
     if (d?.result) {
       out.push({
-        x: [d.result.Q_m3h], y: [d.result.dP_kpa],
+        x: [d.result.Q_m3h], y: [kpaToUnit(d.result.dP_kpa, pressureUnit, rho)],
         type: 'scatter', mode: 'markers',
         name: '動作点',
         marker: { color: '#7c3aed', size: 12, symbol: 'circle', line: { color: '#fff', width: 2 } },
-        hovertemplate: 'Q: %{x:.2f} m³/h<br>ΔP: %{y:.3f} kPa<extra>動作点</extra>',
+        hovertemplate: `Q: %{x:.2f} m³/h<br>ΔP: %{y:.3f} ${pressureUnit}<extra>動作点</extra>`,
       })
     }
     return out
-  }, [chartData, d, isPump])
+  }, [chartData, d, isPump, pressureUnit, rho])
 
   if (!node || (!isPipe && !isPump)) {
     return (
@@ -1048,7 +1237,7 @@ function AnalysisPanel({ node, density, viscosity }: {
           layout={{
             title: { text: isPump ? '流量–揚程特性（PQ）' : '流量–圧損特性（Darcy-Weisbach）', font: { size: 13 } },
             xaxis: { title: { text: '流量 Q [m³/h]' }, showgrid: true, gridcolor: '#f1f5f9', zeroline: false },
-            yaxis: { title: { text: isPump ? '揚程 H [m]' : 'ΔP [kPa]' }, showgrid: true, gridcolor: '#f1f5f9', zeroline: false },
+            yaxis: { title: { text: isPump ? '揚程 H [m]' : `ΔP [${pressureUnit}]` }, showgrid: true, gridcolor: '#f1f5f9', zeroline: false },
             annotations: pumpQMax !== null ? [{
               x: pumpQMax,
               y: 0,
@@ -1095,20 +1284,115 @@ function InlineField({ label, unit, value, onChange, width = 'w-20' }: {
   )
 }
 
+// ── System results: all-component summary table with run history ──
+// Reuses each component's own 結果表示 row generator (pipeResultRows /
+// pumpResultRows / teeResultRows / boundaryResultRows) so the item list
+// shown here always matches the per-node ResultsPanel exactly.
+
+type CalcRunNode = { id: string; data: NetworkNodeData }
+type CalcRun = { id: string; timestamp: number; nodes: CalcRunNode[] }
+
+type SystemComponent = {
+  id: string
+  label: string
+  typeLabel: string
+  rows: ResultRow[]  // schema (item/symbol/unit) from the most recent run that has data
+}
+
+function buildSystemComponents(runHistory: CalcRun[], pressureUnit: PressureUnit, rho: number): SystemComponent[] {
+  const byId = new Map<string, SystemComponent>()
+  const order: string[] = []
+  for (const run of runHistory) {
+    for (const n of run.nodes) {
+      const rows = componentResultRows(n.data, pressureUnit, rho)
+      if (!rows) continue
+      if (!byId.has(n.id)) order.push(n.id)
+      byId.set(n.id, { id: n.id, label: n.data.label, typeLabel: componentTypeLabel(n.data.nodeType), rows })
+    }
+  }
+  return order.map(id => byId.get(id)!)
+}
+
+function SystemResultsTable({ components, runHistory, pressureUnit, rho }: {
+  components: SystemComponent[]
+  runHistory: CalcRun[]
+  pressureUnit: PressureUnit
+  rho: number
+}) {
+  const cellValue = (run: CalcRun, componentId: string, symbol: string): string => {
+    const nodeData = run.nodes.find(n => n.id === componentId)?.data
+    const rows = nodeData ? componentResultRows(nodeData, pressureUnit, rho) : null
+    const row = rows?.find(r => r.symbol === symbol)
+    return row ? row.value : '—'
+  }
+
+  return (
+    <table className="w-full text-sm border-collapse">
+      <thead>
+        <tr className="text-xs text-gray-400 border-b border-gray-200">
+          <th className="text-left font-medium py-2 pr-3">部品</th>
+          <th className="text-left font-medium py-2 pr-3">種別</th>
+          <th className="text-left font-medium py-2 pr-3">項目</th>
+          <th className="text-left font-medium py-2 pr-3">単位</th>
+          {runHistory.map((run, i) => (
+            <th key={run.id} className="text-right font-medium py-2 pr-3 whitespace-nowrap">
+              実行{i + 1}
+              <div className="text-[10px] text-gray-300 font-normal">{new Date(run.timestamp).toLocaleTimeString('ja-JP')}</div>
+            </th>
+          ))}
+        </tr>
+      </thead>
+      <tbody>
+        {components.map(comp => comp.rows.map((row, ri) => (
+          <tr key={`${comp.id}-${row.symbol}`} className="border-b border-gray-100">
+            {ri === 0 && (
+              <td rowSpan={comp.rows.length} className="py-1.5 pr-3 text-gray-700 font-medium align-top whitespace-nowrap">
+                {comp.label}
+              </td>
+            )}
+            {ri === 0 && (
+              <td rowSpan={comp.rows.length} className="py-1.5 pr-3 text-gray-500 align-top whitespace-nowrap">
+                {comp.typeLabel}
+              </td>
+            )}
+            <td className="py-1.5 pr-3 text-gray-600 whitespace-nowrap">{row.item}</td>
+            <td className="py-1.5 pr-3 text-gray-400 whitespace-nowrap">{row.unit}</td>
+            {runHistory.map(run => (
+              <td
+                key={run.id}
+                className={`py-1.5 pr-3 text-right tabular-nums whitespace-nowrap ${row.highlight ? 'font-semibold text-gray-800' : 'text-gray-700'}`}
+              >
+                {cellValue(run, comp.id, row.symbol)}
+              </td>
+            ))}
+          </tr>
+        )))}
+      </tbody>
+    </table>
+  )
+}
+
 // ── Inner component ────────────────────────────────────────────────
 
 function PipeNetworkCalcInner() {
-  const [nodes, setNodes, onNodesChange] = useNodesState<Node>([])
-  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([])
+  const [defaultDiagram] = useState(() => createDefaultDiagram())
+  const [nodes, setNodes, onNodesChange] = useNodesState<Node>(defaultDiagram.nodes)
+  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>(defaultDiagram.edges)
   const { screenToFlowPosition } = useReactFlow()
   const updateNodeInternals = useUpdateNodeInternals()
-  const nodeCounter = useRef(0)
+  const nodeCounter = useRef(DEFAULT_NODE_COUNTER)
 
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [showPressureResults, setShowPressureResults] = useState(false)
   const [showLineResults, setShowLineResults] = useState(false)
+  const [pressureUnit, setPressureUnit] = useState<PressureUnit>('kPa')
   const selectedNode: Node | null = nodes.find(n => n.id === selectedId) ?? null
   const selectedData = selectedNode?.data as unknown as NetworkNodeData | undefined
+
+  const [density,   setDensity]   = useState('1000')
+  const [viscosity, setViscosity] = useState('1.0')
+  const rho = parseFloat(density) || 1000
+
   const displayNodes = useMemo(() => {
     const inConnected = new Set(edges.map(e => e.target))
     const outConnected = new Set(edges.map(e => e.source))
@@ -1121,9 +1405,11 @@ function PipeNetworkCalcInner() {
         portInConnected: inConnected.has(n.id),
         portOutConnected: outConnected.has(n.id),
         showPressureResults,
+        pressureUnit,
+        rho,
       },
     }))
-  }, [nodes, edges, showPressureResults])
+  }, [nodes, edges, showPressureResults, pressureUnit, rho])
   const displayEdges = useMemo(() => edges.map(e => ({
     ...e,
     data: {
@@ -1132,11 +1418,25 @@ function PipeNetworkCalcInner() {
     },
   })), [edges, showLineResults])
 
-  const [density,   setDensity]   = useState('1000')
-  const [viscosity, setViscosity] = useState('1.0')
   const [loading,   setLoading]   = useState(false)
   const [error,     setError]     = useState<string | null>(null)
   const [totalDp,   setTotalDp]   = useState<number | null>(null)
+  const [runHistory, setRunHistory] = useState<CalcRun[]>([])
+  const systemComponents = useMemo(
+    () => buildSystemComponents(runHistory, pressureUnit, rho),
+    [runHistory, pressureUnit, rho],
+  )
+  const clearRunHistory = () => setRunHistory([])
+
+  const clearSketch = () => {
+    if (!window.confirm('ダイアグラムをすべて削除します。よろしいですか？')) return
+    setNodes([])
+    setEdges([])
+    setSelectedId(null)
+    setTotalDp(null)
+    setError(null)
+    setRunHistory([])
+  }
 
   // CoolProp auto-fill
   const [coolFluid,   setCoolFluid]   = useState('Water')
@@ -1246,21 +1546,29 @@ function PipeNetworkCalcInner() {
         viscosity: parseFloat(viscosity) / 1000,
       })
 
-      setNodes(prev => prev.map(n => {
-        const d = n.data as unknown as NetworkNodeData
-        const nodeResult  = res.nodes[n.id]
-        const srcPressure = res.source_pressures[n.id]
-        const srcFlow     = res.source_flows[n.id]
+      const mergeResult = (d: NetworkNodeData, id: string): NetworkNodeData => {
+        const nodeResult  = res.nodes[id]
+        const srcPressure = res.source_pressures[id]
+        const srcFlow     = res.source_flows[id]
         return {
-          ...n,
-          data: {
-            ...d,
-            ...(nodeResult  !== undefined ? { result: nodeResult }          : {}),
-            ...(srcPressure !== undefined ? { calcPressure: srcPressure }   : {}),
-            ...(srcFlow     !== undefined ? { calcFlow: srcFlow }           : {}),
-          } as NetworkNodeData,
-        }
+          ...d,
+          ...(nodeResult  !== undefined ? { result: nodeResult }        : {}),
+          ...(srcPressure !== undefined ? { calcPressure: srcPressure } : {}),
+          ...(srcFlow     !== undefined ? { calcFlow: srcFlow }         : {}),
+        } as NetworkNodeData
+      }
+
+      setNodes(prev => prev.map(n => ({
+        ...n,
+        data: mergeResult(n.data as unknown as NetworkNodeData, n.id),
+      })))
+
+      const snapshotNodes: CalcRunNode[] = nodes.map(n => ({
+        id: n.id,
+        data: mergeResult(n.data as unknown as NetworkNodeData, n.id),
       }))
+      const runId = `run-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
+      setRunHistory(prev => [...prev, { id: runId, timestamp: Date.now(), nodes: snapshotNodes }])
 
       const nodeById = new Map(nodes.map(n => [n.id, n]))
       const nodeLabel = (id: string) => {
@@ -1361,6 +1669,17 @@ function PipeNetworkCalcInner() {
             流量表示
           </label>
 
+          <div className="flex items-center gap-2 shrink-0">
+            <span className="text-sm text-gray-600">圧力単位</span>
+            <select
+              value={pressureUnit}
+              onChange={e => setPressureUnit(e.target.value as PressureUnit)}
+              className="border border-gray-300 rounded-md px-2 py-1.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+            >
+              {PRESSURE_UNITS.map(u => <option key={u} value={u}>{u}</option>)}
+            </select>
+          </div>
+
           <div className="w-px h-5 bg-gray-200 shrink-0" />
 
           <button
@@ -1370,13 +1689,21 @@ function PipeNetworkCalcInner() {
           >
             {loading ? '計算中...' : '計算開始'}
           </button>
+
+          <button
+            onClick={clearSketch}
+            disabled={nodes.length === 0 && edges.length === 0}
+            className="border border-gray-300 text-gray-600 hover:bg-gray-50 text-sm px-4 py-2 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
+          >
+            スケッチをクリア
+          </button>
           {error && <span className="text-sm text-red-500">{error}</span>}
 
           {totalDp !== null && (
             <div className="ml-auto flex items-center gap-2 shrink-0">
               <span className="text-sm text-gray-500">合計 ΔP:</span>
-              <span className="text-xl font-bold text-red-600 tabular-nums">{totalDp.toFixed(2)}</span>
-              <span className="text-sm text-gray-500">kPa</span>
+              <span className="text-xl font-bold text-red-600 tabular-nums">{formatPressure(totalDp, pressureUnit, rho)}</span>
+              <span className="text-sm text-gray-500">{pressureUnit}</span>
             </div>
           )}
         </div>
@@ -1459,43 +1786,80 @@ function PipeNetworkCalcInner() {
         </div>
       </div>
 
-      {/* ── Section 3: パラメータ設定 + 分析表示 ─────────────── */}
+      {/* ── Section 3: パラメータ設定 + 結果表示 + 分析表示 ──── */}
       <div className="flex gap-5 items-start">
 
-        {/* パラメータ設定 */}
-        <div className="w-72 shrink-0 bg-white rounded-xl border border-gray-200 shadow-sm p-5 min-h-[360px]">
-          <h3 className="text-sm font-semibold text-gray-600 mb-4 pb-3 border-b border-gray-100">
-            パラメータ設定
-          </h3>
-          {selectedNode ? (
-            <NodeParamPanel
-              node={selectedNode}
-              onChange={u => updateNode(selectedNode.id, u)}
-            />
-          ) : (
-            <div className="flex flex-col items-center justify-center h-48 text-center gap-2">
-              <div className="w-10 h-10 rounded-full bg-gray-100 flex items-center justify-center">
-                <svg viewBox="0 0 24 24" className="w-5 h-5 text-gray-400" fill="none" stroke="currentColor" strokeWidth="1.5">
-                  <path d="M15 15l-2 5L9 9l11 4-5 2zm0 0l5 5" strokeLinecap="round" strokeLinejoin="round"/>
-                </svg>
+        {/* パラメータ設定 + 結果表示 */}
+        <div className="w-72 shrink-0 flex flex-col gap-5">
+          <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-5">
+            <h3 className="text-sm font-semibold text-gray-600 mb-4 pb-3 border-b border-gray-100">
+              パラメータ設定
+            </h3>
+            {selectedNode ? (
+              <NodeParamPanel
+                node={selectedNode}
+                onChange={u => updateNode(selectedNode.id, u)}
+              />
+            ) : (
+              <div className="flex flex-col items-center justify-center h-48 text-center gap-2">
+                <div className="w-10 h-10 rounded-full bg-gray-100 flex items-center justify-center">
+                  <svg viewBox="0 0 24 24" className="w-5 h-5 text-gray-400" fill="none" stroke="currentColor" strokeWidth="1.5">
+                    <path d="M15 15l-2 5L9 9l11 4-5 2zm0 0l5 5" strokeLinecap="round" strokeLinejoin="round"/>
+                  </svg>
+                </div>
+                <p className="text-sm text-gray-400">ダイアグラムのノードを<br />クリックして選択</p>
               </div>
-              <p className="text-sm text-gray-400">ダイアグラムのノードを<br />クリックして選択</p>
-            </div>
-          )}
+            )}
+          </div>
+
+          <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-5">
+            <h3 className="text-sm font-semibold text-gray-600 mb-4 pb-3 border-b border-gray-100">
+              結果表示
+            </h3>
+            <ResultsPanel node={selectedNode} pressureUnit={pressureUnit} rho={rho} />
+          </div>
         </div>
 
-        {/* 分析表示 */}
+        {/* コンポーネント特性 */}
         <div className="flex-1 bg-white rounded-xl border border-gray-200 shadow-sm p-5 min-h-[360px]">
           <h3 className="text-sm font-semibold text-gray-600 mb-4 pb-3 border-b border-gray-100">
-            分析表示
+            コンポーネント特性
           </h3>
           <AnalysisPanel
             node={selectedNode}
             density={density}
             viscosity={viscosity}
+            pressureUnit={pressureUnit}
+            rho={rho}
           />
         </div>
 
+      </div>
+
+      {/* ── Section 4: システム結果一覧 ─────────────────────── */}
+      <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-5">
+        <div className="flex items-center justify-between flex-wrap gap-3 mb-4 pb-3 border-b border-gray-100">
+          <h3 className="text-sm font-semibold text-gray-600">システム結果一覧</h3>
+          {runHistory.length > 0 && (
+            <button
+              type="button"
+              onClick={clearRunHistory}
+              className="px-3 py-1.5 rounded-md text-xs font-medium border border-rose-200 bg-white text-rose-600 hover:bg-rose-50"
+            >
+              結果をクリア
+            </button>
+          )}
+        </div>
+
+        {runHistory.length > 0 ? (
+          <div className="overflow-x-auto">
+            <SystemResultsTable components={systemComponents} runHistory={runHistory} pressureUnit={pressureUnit} rho={rho} />
+          </div>
+        ) : (
+          <div className="flex flex-col items-center justify-center h-32 text-center gap-2">
+            <p className="text-sm text-gray-400">「計算開始」を実行すると<br />全コンポーネントの結果一覧がここに表示されます</p>
+          </div>
+        )}
       </div>
     </div>
   )
