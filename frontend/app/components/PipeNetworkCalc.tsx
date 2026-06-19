@@ -53,9 +53,244 @@ type PressureUnit = 'm' | 'Pa' | 'kPa' | 'MPa' | 'bar'
 type ReducerLossMode = 'auto' | 'manual'
 type ElbowLossMode = 'auto' | 'manual'
 type ValveCharacteristic = 'linear' | 'quickOpening' | 'equalPercentage'
+type LineType = 'fluid' | 'power'
+type FluidSystem = {
+  id: string
+  name: string
+  fluid: string
+  propertyMode: 'constant'
+  density: number
+  viscosity: number // Pa·s
+  specificHeat: number
+  color: string
+}
 
 const PRESSURE_UNITS: PressureUnit[] = ['m', 'Pa', 'kPa', 'MPa', 'bar']
 const G_ACCEL = 9.80665
+const DEFAULT_FLUID_SYSTEM_ID = 'water-loop'
+const FLUID_SYSTEM_COLORS = ['#0ea5e9', '#f97316', '#10b981', '#a855f7', '#e11d48', '#64748b']
+
+function createDefaultFluidSystems(): FluidSystem[] {
+  return [{
+    id: DEFAULT_FLUID_SYSTEM_ID,
+    name: 'Water',
+    fluid: 'Water',
+    propertyMode: 'constant',
+    density: 1000,
+    viscosity: 0.001,
+    specificHeat: 4184,
+    color: FLUID_SYSTEM_COLORS[0],
+  }]
+}
+
+function fluidSystemForNode(data: NetworkNodeData, systems: FluidSystem[]): FluidSystem {
+  return systems.find(system => system.id === data.fluidSystemId) ?? systems[0] ?? createDefaultFluidSystems()[0]
+}
+
+function fluidColorForEdge(edge: Edge, nodes: Node[], systems: FluidSystem[]): string {
+  const sourceData = nodes.find(n => n.id === edge.source)?.data as unknown as NetworkNodeData | undefined
+  const targetData = nodes.find(n => n.id === edge.target)?.data as unknown as NetworkNodeData | undefined
+  const sourceSystem = sourceData ? fluidSystemForNode(sourceData, systems) : null
+  const targetSystem = targetData ? fluidSystemForNode(targetData, systems) : null
+  if (sourceSystem && targetSystem && sourceSystem.id !== targetSystem.id) return '#64748b'
+  return (sourceSystem ?? targetSystem ?? systems[0] ?? createDefaultFluidSystems()[0]).color
+}
+
+type PowerSpeedResolution = {
+  speeds: Map<string, number>
+  torques: Map<string, number>
+  modes: Map<string, 'fixed' | 'torque' | 'fallback'>
+  errors: string[]
+}
+
+function motorTorqueAtSpeed(data: NetworkNodeData, speedRpm: number): number {
+  const ns = Math.max(motorSynchronousSpeed(data), 1e-9)
+  const nr = Math.max(motorRatedSpeed(data), 1e-9)
+  const ratedPowerKw = Math.max(data.motorRatedPower ?? 5.5, 0)
+  const ratedSlip = Math.max((ns - nr) / ns, 1e-6)
+  const omegaRated = 2 * Math.PI * nr / 60
+  const ratedTorqueNm = omegaRated > 0 ? ratedPowerKw * 1000 / omegaRated : 0
+  const maxTorqueNm = ratedTorqueNm * 2.5
+  const ratio = ratedTorqueNm > 0 && maxTorqueNm > 0 ? ratedTorqueNm / maxTorqueNm : 0.4
+  const a = Math.max(2 / Math.max(ratio, 1e-6), 2.000001)
+  const breakdownSlip = Math.min(ratedSlip * ((a + Math.sqrt(a * a - 4)) / 2), 0.95)
+  const slip = Math.max((ns - Math.min(Math.max(speedRpm, 0), ns)) / ns, 1e-6)
+  return Math.max(maxTorqueNm * 2 / ((slip / breakdownSlip) + (breakdownSlip / slip)), 0)
+}
+
+function pumpRatedTorque(data: NetworkNodeData, rho = 1000): number {
+  const ratedSpeed = Math.max(data.ratedSpeed ?? 1450, 1e-9)
+  const ratedFlowM3s = Math.max(data.ratedFlow ?? 30, 0) / 3600
+  const ratedHead = Math.max(data.ratedHead ?? 20, 0)
+  const efficiency = Math.max(data.efficiency ?? 70, 1e-9) / 100
+  const shaftPowerW = rho * G_ACCEL * ratedHead * ratedFlowM3s / efficiency
+  const omega = 2 * Math.PI * ratedSpeed / 60
+  return omega > 0 ? Math.max(shaftPowerW / omega, 0) : 0
+}
+
+function pumpTorqueAtSpeed(data: NetworkNodeData, speedRpm: number, rho = 1000): number {
+  const ratedSpeed = Math.max(data.ratedSpeed ?? 1450, 1e-9)
+  const ratio = Math.max(speedRpm, 0) / ratedSpeed
+  return pumpRatedTorque(data, rho) * ratio * ratio
+}
+
+function turbineRatedTorque(data: NetworkNodeData, rho = 1000): number {
+  const ratedSpeed = Math.max(data.ratedSpeed ?? 1450, 1e-9)
+  const ratedFlowM3s = Math.max(data.ratedFlow ?? 30, 0) / 3600
+  const ratedHead = Math.max(data.ratedHead ?? 20, 0)
+  const efficiency = Math.max(data.efficiency ?? 85, 0) / 100
+  const shaftPowerW = rho * G_ACCEL * ratedHead * ratedFlowM3s * efficiency
+  const omega = 2 * Math.PI * ratedSpeed / 60
+  return omega > 0 ? Math.max(shaftPowerW / omega, 0) : 0
+}
+
+function turbineTorqueAtSpeed(data: NetworkNodeData, speedRpm: number, rho = 1000): number {
+  const ratedSpeed = Math.max(data.ratedSpeed ?? 1450, 1e-9)
+  const ratio = Math.max(speedRpm, 0) / ratedSpeed
+  return turbineRatedTorque(data, rho) * ratio * ratio
+}
+
+function motorPowerAtSpeed(data: NetworkNodeData, speedRpm: number): number {
+  const omega = 2 * Math.PI * Math.max(speedRpm, 0) / 60
+  return Math.max(motorTorqueAtSpeed(data, speedRpm) * omega / 1000, 0)
+}
+
+function resolvePowerSpeeds(nodes: Node[], edges: Edge[], fluidSystems: FluidSystem[]): PowerSpeedResolution {
+  const parent = new Map<string, string>()
+  const nodeById = new Map(nodes.map(n => [n.id, n]))
+  const add = (id: string) => {
+    if (!parent.has(id)) parent.set(id, id)
+  }
+  const find = (id: string): string => {
+    add(id)
+    const p = parent.get(id)!
+    if (p === id) return id
+    const root = find(p)
+    parent.set(id, root)
+    return root
+  }
+  const union = (a: string, b: string) => {
+    const ra = find(a)
+    const rb = find(b)
+    if (ra !== rb) parent.set(rb, ra)
+  }
+
+  nodes.forEach(n => add(n.id))
+  edges
+    .filter(e => ((e.data as FlowEdgeData | undefined)?.lineType ?? 'fluid') === 'power')
+    .forEach(e => union(e.source, e.target))
+
+  const fixedByRoot = new Map<string, { speed: number; label: string }>()
+  const errors: string[] = []
+  for (const node of nodes) {
+    const data = node.data as unknown as NetworkNodeData
+    if (data.nodeType !== 'speedBoundary') continue
+    const speed = Math.max(data.fixedSpeed ?? 1450, 0)
+    const root = find(node.id)
+    const existing = fixedByRoot.get(root)
+    if (existing && Math.abs(existing.speed - speed) > 1e-6) {
+      errors.push(`動力ラインに異なる固定回転数が接続されています: ${existing.label}=${existing.speed} rpm, ${data.label}=${speed} rpm`)
+    } else {
+      fixedByRoot.set(root, { speed, label: data.label })
+    }
+  }
+
+  const membersByRoot = new Map<string, Node[]>()
+  for (const node of nodes) {
+    const root = find(node.id)
+    membersByRoot.set(root, [...(membersByRoot.get(root) ?? []), node])
+  }
+
+  const speeds = new Map<string, number>()
+  const torques = new Map<string, number>()
+  const modes = new Map<string, 'fixed' | 'torque' | 'fallback'>()
+  const setGroup = (members: Node[], speed: number, mode: 'fixed' | 'torque' | 'fallback') => {
+    for (const member of members) {
+      if (!nodeById.has(member.id)) continue
+      const data = member.data as unknown as NetworkNodeData
+      const system = fluidSystemForNode(data, fluidSystems)
+      speeds.set(member.id, speed)
+      modes.set(member.id, mode)
+      if (data.nodeType === 'motor') torques.set(member.id, motorTorqueAtSpeed(data, speed))
+      if (data.nodeType === 'turbine') torques.set(member.id, turbineTorqueAtSpeed(data, speed, system.density))
+      if (data.nodeType === 'pump') torques.set(member.id, pumpTorqueAtSpeed(data, speed, system.density))
+    }
+  }
+
+  for (const [root, members] of membersByRoot) {
+    const fixed = fixedByRoot.get(root)
+    if (fixed) {
+      setGroup(members, fixed.speed, 'fixed')
+      continue
+    }
+
+    const motors = members.filter(n => ((n.data as unknown as NetworkNodeData).nodeType === 'motor'))
+    const turbines = members.filter(n => ((n.data as unknown as NetworkNodeData).nodeType === 'turbine'))
+    const pumps = members.filter(n => ((n.data as unknown as NetworkNodeData).nodeType === 'pump'))
+    if ((motors.length > 0 || turbines.length > 0) && pumps.length > 0) {
+      const motorDatas = motors.map(n => n.data as unknown as NetworkNodeData)
+      const turbineDatas = turbines.map(n => {
+        const data = n.data as unknown as NetworkNodeData
+        return { data, rho: fluidSystemForNode(data, fluidSystems).density }
+      })
+      const pumpDatas = pumps.map(n => {
+        const data = n.data as unknown as NetworkNodeData
+        return { data, rho: fluidSystemForNode(data, fluidSystems).density }
+      })
+      const producerSpeedLimits = [
+        ...motorDatas.map(motorSynchronousSpeed),
+        ...turbineDatas.map(item => item.data.ratedSpeed ?? 1450),
+      ].filter(v => v > 0)
+      const maxSpeed = Math.max(Math.min(...producerSpeedLimits) * 0.999, 1)
+      const balance = (speed: number) => (
+        motorDatas.reduce((sum, data) => sum + motorTorqueAtSpeed(data, speed), 0)
+        + turbineDatas.reduce((sum, item) => sum + turbineTorqueAtSpeed(item.data, speed, item.rho), 0)
+        - pumpDatas.reduce((sum, item) => sum + pumpTorqueAtSpeed(item.data, speed, item.rho), 0)
+      )
+      let lo = maxSpeed * 1e-6
+      let hi = maxSpeed
+      let flo = balance(lo)
+      const fhi = balance(hi)
+      if (flo <= 0 && fhi <= 0) {
+        errors.push(`動力ラインの始動トルクが不足しています: ${members.map(n => (n.data as unknown as NetworkNodeData).label).join(', ')}`)
+        setGroup(members, Math.max(...pumpDatas.map(item => item.data.ratedSpeed ?? 1450)), 'fallback')
+        continue
+      }
+      if (flo >= 0 && fhi >= 0) {
+        setGroup(members, hi, 'torque')
+        continue
+      }
+      for (let i = 0; i < 80; i += 1) {
+        const mid = (lo + hi) / 2
+        const fm = balance(mid)
+        if (Math.abs(fm) < 1e-6) {
+          lo = mid
+          hi = mid
+          break
+        }
+        if (Math.sign(fm) === Math.sign(flo)) {
+          lo = mid
+          flo = fm
+        } else {
+          hi = mid
+        }
+      }
+      setGroup(members, (lo + hi) / 2, 'torque')
+      continue
+    }
+
+    const fallbackSpeed = motors.length > 0
+      ? Math.max(Math.min(...motors.map(n => motorSynchronousSpeed(n.data as unknown as NetworkNodeData))) * 0.999, 0)
+      : turbines.length > 0
+        ? Math.max(...turbines.map(n => (n.data as unknown as NetworkNodeData).ratedSpeed ?? 1450), 0)
+      : Math.max(...members.map(n => {
+        const data = n.data as unknown as NetworkNodeData
+        return data.nodeType === 'pump' ? data.ratedSpeed ?? 1450 : 0
+      }), 0)
+    if (fallbackSpeed > 0) setGroup(members, fallbackSpeed, 'fallback')
+  }
+  return { speeds, torques, modes, errors }
+}
 
 function kpaToUnit(kpa: number, unit: PressureUnit, rho: number): number {
   switch (unit) {
@@ -100,9 +335,26 @@ function valveEffectiveZeta(data: NetworkNodeData, openingPercent = data.valveOp
   return zetaFullOpen > 0 ? zetaFullOpen / (relativeCapacity ** 2) : 0
 }
 
+function motorSynchronousSpeed(data: NetworkNodeData): number {
+  const frequency = Math.max(data.motorFrequency ?? 50, 0)
+  const poles = Math.max(Math.round(data.motorPoles ?? 4), 1)
+  return 120 * frequency / poles
+}
+
+function motorRatedSpeed(data: NetworkNodeData): number {
+  const slip = Math.min(Math.max(data.motorSlip ?? 3, 0), 100) / 100
+  return motorSynchronousSpeed(data) * (1 - slip)
+}
+
+function motorInputPower(data: NetworkNodeData): number {
+  const efficiency = Math.max(data.motorEfficiency ?? 90, 1e-9) / 100
+  return Math.max(data.motorRatedPower ?? 5.5, 0) / efficiency
+}
+
 type NetworkNodeData = {
-  nodeType: 'boundary' | 'source' | 'pipe' | 'pump' | 'heatExchanger' | 'reducer' | 'elbow' | 'valve' | 'tee' | 'sink'
+  nodeType: 'boundary' | 'source' | 'pipe' | 'pump' | 'turbine' | 'heatExchanger' | 'reducer' | 'elbow' | 'valve' | 'motor' | 'speedBoundary' | 'tee' | 'sink'
   label: string
+  fluidSystemId?: string
   // boundary/source/sink: unified boundary condition
   // flow: Q is fixed input → P is computed result
   // pressure: P is fixed input → Q is computed result
@@ -138,7 +390,9 @@ type NetworkNodeData = {
   shutoffHead?: number    // m
   efficiency?: number     // %
   ratedSpeed?: number     // rpm: PQ特性(簡易曲線/テーブル)の基準回転数
-  speed?: number          // rpm: 現在の回転数（相似則でPQ特性をスケーリング）
+  speed?: number          // rpm: power network resolved speed
+  shaftTorque?: number    // Nm: power network resolved torque
+  speedSolveMode?: 'fixed' | 'torque' | 'fallback'
   pumpCurveMode?: PumpCurveMode
   pumpCurvePoints?: PumpCurvePoint[]
   // heat exchanger
@@ -160,6 +414,15 @@ type NetworkNodeData = {
   valveOpening?: number         // %
   valveZetaFullOpen?: number
   valveRangeability?: number
+  // induction motor
+  motorRatedPower?: number       // kW, shaft output
+  motorEfficiency?: number       // %
+  motorVoltage?: number          // V
+  motorFrequency?: number        // Hz
+  motorPoles?: number
+  motorSlip?: number             // %
+  // speed boundary
+  fixedSpeed?: number             // rpm
   // tee (flow split is physics-based; no manual parameter)
   teeMode?: 'split' | 'merge'
   // result
@@ -202,11 +465,11 @@ function pressureBadgeClass(position: Position): string {
   return `${base} left-1/2 bottom-0 -translate-x-1/2 translate-y-[calc(100%+10px)]`
 }
 
-function portHandleStyle(color: string, role: 'in' | 'out'): CSSProperties {
+function portHandleStyle(color: string, role: 'in' | 'out', lineType: LineType = 'fluid'): CSSProperties {
   const base: CSSProperties = {
-    width: 14,
-    height: 14,
-    borderRadius: '9999px',
+    width: lineType === 'power' ? 13 : 14,
+    height: lineType === 'power' ? 13 : 14,
+    borderRadius: lineType === 'power' ? 2 : '9999px',
     border: `3px solid ${color}`,
     zIndex: 12,
   }
@@ -292,6 +555,36 @@ function pumpHeadAt(data: NetworkNodeData, q: number): number {
   return Math.max(hAtRated * r * r, 0)
 }
 
+function pumpShaftTorqueAtFlow(data: NetworkNodeData, qM3h: number, rho = 1000): number {
+  const speed = Math.max(data.speed ?? data.ratedSpeed ?? 1450, 0)
+  const omega = 2 * Math.PI * speed / 60
+  if (omega <= 1e-12) return 0
+  const qM3s = Math.max(qM3h, 0) / 3600
+  const head = pumpHeadAt(data, qM3h)
+  const efficiency = Math.max(data.efficiency ?? 70, 1e-9) / 100
+  const shaftPowerW = rho * G_ACCEL * head * qM3s / efficiency
+  return Math.max(shaftPowerW / omega, 0)
+}
+
+function turbineHeadAtFlow(data: NetworkNodeData, qM3h: number): number {
+  const ratedFlow = Math.max(data.ratedFlow ?? 30, 1e-9)
+  const ratedHead = Math.max(data.ratedHead ?? 20, 0)
+  return ratedHead * (Math.max(qM3h, 0) / ratedFlow) ** 2
+}
+
+function turbineOutputPowerAtFlow(data: NetworkNodeData, qM3h: number, rho = 1000): number {
+  const qM3s = Math.max(qM3h, 0) / 3600
+  const head = turbineHeadAtFlow(data, qM3h)
+  const efficiency = Math.max(data.efficiency ?? 85, 0) / 100
+  return rho * G_ACCEL * head * qM3s * efficiency / 1000
+}
+
+function turbineShaftTorqueAtFlow(data: NetworkNodeData, qM3h: number, rho = 1000): number {
+  const speed = Math.max(data.speed ?? data.ratedSpeed ?? 1450, 0)
+  const omega = 2 * Math.PI * speed / 60
+  return omega > 1e-12 ? turbineOutputPowerAtFlow(data, qM3h, rho) * 1000 / omega : 0
+}
+
 // ── SVG icons ──────────────────────────────────────────────────────
 
 function SvgSource({ className = '' }) {
@@ -329,6 +622,19 @@ function SvgPump({ className = '' }) {
       <path d="M5 12H2" />
       <path d="M22 12h-3" />
       <path d="M10 8l5 4-5 4V8z" />
+    </svg>
+  )
+}
+
+function SvgTurbine({ className = '' }) {
+  return (
+    <svg viewBox="0 0 24 24" className={className} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="7" />
+      <path d="M2 12h3" />
+      <path d="M19 12h3" />
+      <path d="M14 8l-5 4 5 4V8z" />
+      <path d="M12 5v3" />
+      <path d="M12 16v3" />
     </svg>
   )
 }
@@ -380,6 +686,31 @@ function SvgValve({ className = '' }) {
   )
 }
 
+function SvgMotor({ className = '' }) {
+  return (
+    <svg viewBox="0 0 24 24" className={className} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="4" y="7" width="14" height="10" rx="2" />
+      <path d="M18 10h3v4h-3" />
+      <path d="M7 17v3" />
+      <path d="M15 17v3" />
+      <path d="M7 14V10l3 4 3-4v4" />
+    </svg>
+  )
+}
+
+function SvgSpeedBoundary({ className = '' }) {
+  return (
+    <svg viewBox="0 0 24 24" className={className} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="8" />
+      <path d="M12 12l4-4" />
+      <path d="M12 4v3" />
+      <path d="M20 12h-3" />
+      <path d="M4 12h3" />
+      <path d="M18 18l3 3" />
+    </svg>
+  )
+}
+
 function SvgRotate({ className = '' }) {
   return (
     <svg viewBox="0 0 24 24" className={className} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -425,7 +756,7 @@ function BoundaryNode({ data, selected }: NodeProps) {
   const displayedTemperature = d.calcTemperature ?? d.result?.T_K ?? d.temperature
   return (
     <div className={`relative px-3 py-2 rounded-xl border-2 bg-teal-50 min-w-[130px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-teal-500'}`}>
-      <Handle type="target" position={inPosition} style={portHandleStyle('#14b8a6', 'in')} />
+      <Handle type="target" position={inPosition} id="fluid-in" style={portHandleStyle('#14b8a6', 'in')} />
       {d.showPressureResults && pressureLabel && (d.portInConnected ?? d.portLeftConnected) && (
         <div className={pressureBadgeClass(inPosition)}>
           {pressureLabel}
@@ -450,7 +781,7 @@ function BoundaryNode({ data, selected }: NodeProps) {
           {pressureLabel}
         </div>
       )}
-      <Handle type="source" position={outPosition} style={portHandleStyle('#14b8a6', 'out')} />
+      <Handle type="source" position={outPosition} id="fluid-out" style={portHandleStyle('#14b8a6', 'out')} />
     </div>
   )
 }
@@ -466,7 +797,7 @@ function PipeNode({ data, selected }: NodeProps) {
   const shapeLabel = d.pipeShape === 'annulus' ? '中空円' : d.pipeShape === 'rectangular' ? '矩形' : '円管'
   return (
     <div className={`relative px-3 py-2 rounded border-2 bg-sky-50 min-w-[140px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-sky-400'}`}>
-      <Handle type="target" position={inPosition} style={portHandleStyle('#38bdf8', 'in')} />
+      <Handle type="target" position={inPosition} id="fluid-in" style={portHandleStyle('#38bdf8', 'in')} />
       {d.showPressureResults && d.result?.P_from_kpa !== undefined && (d.portInConnected ?? d.portLeftConnected) && (
         <div className={pressureBadgeClass(inPosition)}>
           {formatPressure(d.result.P_from_kpa, unit, rho)} {unit}
@@ -488,7 +819,7 @@ function PipeNode({ data, selected }: NodeProps) {
           {formatPressure(d.result.P_to_kpa, unit, rho)} {unit}
         </div>
       )}
-      <Handle type="source" position={outPosition} style={portHandleStyle('#38bdf8', 'out')} />
+      <Handle type="source" position={outPosition} id="fluid-out" style={portHandleStyle('#38bdf8', 'out')} />
     </div>
   )
 }
@@ -501,7 +832,9 @@ function PumpNode({ data, selected }: NodeProps) {
   const rho = d.rho ?? 1000
   return (
     <div className={`relative px-3 py-2 rounded border-2 bg-violet-50 min-w-[150px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-violet-500'}`}>
-      <Handle type="target" position={inPosition} style={portHandleStyle('#8b5cf6', 'in')} />
+      <Handle type="target" position={inPosition} id="fluid-in" style={portHandleStyle('#8b5cf6', 'in')} />
+      <Handle type="target" position={Position.Top} id="power-in" style={portHandleStyle('#eab308', 'in', 'power')} />
+      <Handle type="source" position={Position.Bottom} id="power-out" style={portHandleStyle('#eab308', 'out', 'power')} />
       {d.showPressureResults && d.result?.P_from_kpa !== undefined && (d.portInConnected ?? d.portLeftConnected) && (
         <div className={pressureBadgeClass(inPosition)}>
           {formatPressure(d.result.P_from_kpa, unit, rho)} {unit}
@@ -516,6 +849,7 @@ function PumpNode({ data, selected }: NodeProps) {
           ? `テーブルPQ · ${d.pumpCurvePoints?.length ?? 0}点`
           : `H0=${d.shutoffHead ?? 30} m · Qr=${d.ratedFlow ?? 30} m³/h`}
       </div>
+      <div className="text-xs text-violet-500 pl-5">N={(d.speed ?? d.ratedSpeed ?? 1450).toFixed(0)} rpm</div>
       {d.result?.boost_kpa !== undefined && (
         <div className="text-xs font-bold text-emerald-600 mt-0.5 pl-5">+ΔP: {formatPressure(d.result.boost_kpa, unit, rho)} {unit}</div>
       )}
@@ -527,7 +861,44 @@ function PumpNode({ data, selected }: NodeProps) {
           {formatPressure(d.result.P_to_kpa, unit, rho)} {unit}
         </div>
       )}
-      <Handle type="source" position={outPosition} style={portHandleStyle('#8b5cf6', 'out')} />
+      <Handle type="source" position={outPosition} id="fluid-out" style={portHandleStyle('#8b5cf6', 'out')} />
+    </div>
+  )
+}
+
+function TurbineNode({ data, selected }: NodeProps) {
+  const d = data as unknown as NetworkNodeData
+  const inPosition = orientPosition(Position.Left, d)
+  const outPosition = orientPosition(Position.Right, d)
+  const unit = d.pressureUnit ?? 'kPa'
+  const rho = d.rho ?? 1000
+  return (
+    <div className={`relative px-3 py-2 rounded border-2 bg-emerald-50 min-w-[150px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-emerald-500'}`}>
+      <Handle type="target" position={inPosition} id="fluid-in" style={portHandleStyle('#10b981', 'in')} />
+      <Handle type="source" position={Position.Bottom} id="power-out" style={portHandleStyle('#eab308', 'out', 'power')} />
+      {d.showPressureResults && d.result?.P_from_kpa !== undefined && (d.portInConnected ?? d.portLeftConnected) && (
+        <div className={pressureBadgeClass(inPosition)}>
+          {formatPressure(d.result.P_from_kpa, unit, rho)} {unit}
+        </div>
+      )}
+      <div className="flex items-center gap-1.5 mb-0.5">
+        <SvgTurbine className="w-4 h-4 text-emerald-600 shrink-0" />
+        <span className="text-xs font-bold text-emerald-700">{d.label}</span>
+      </div>
+      <div className="text-xs text-emerald-600 pl-5">H={d.ratedHead ?? 20} m · Qr={d.ratedFlow ?? 30} m³/h</div>
+      <div className="text-xs text-emerald-600 pl-5">N={(d.speed ?? d.ratedSpeed ?? 1450).toFixed(0)} rpm</div>
+      {d.result?.output_power_kw !== undefined && (
+        <div className="text-xs font-bold text-emerald-700 mt-0.5 pl-5">Pout: {d.result.output_power_kw.toFixed(3)} kW</div>
+      )}
+      {d.result?.T_in_K !== undefined && (
+        <div className="text-xs text-emerald-600 pl-5">T: {d.result.T_in_K.toFixed(2)} K</div>
+      )}
+      {d.showPressureResults && d.result?.P_to_kpa !== undefined && (d.portOutConnected ?? d.portRightConnected) && (
+        <div className={pressureBadgeClass(outPosition)}>
+          {formatPressure(d.result.P_to_kpa, unit, rho)} {unit}
+        </div>
+      )}
+      <Handle type="source" position={outPosition} id="fluid-out" style={portHandleStyle('#10b981', 'out')} />
     </div>
   )
 }
@@ -540,7 +911,7 @@ function HeatExchangerNode({ data, selected }: NodeProps) {
   const rho = d.rho ?? 1000
   return (
     <div className={`relative px-3 py-2 rounded border-2 bg-orange-50 min-w-[160px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-orange-500'}`}>
-      <Handle type="target" position={inPosition} style={portHandleStyle('#f97316', 'in')} />
+      <Handle type="target" position={inPosition} id="fluid-in" style={portHandleStyle('#f97316', 'in')} />
       {d.showPressureResults && d.result?.P_from_kpa !== undefined && (d.portInConnected ?? d.portLeftConnected) && (
         <div className={pressureBadgeClass(inPosition)}>
           {formatPressure(d.result.P_from_kpa, unit, rho)} {unit}
@@ -563,7 +934,7 @@ function HeatExchangerNode({ data, selected }: NodeProps) {
           {formatPressure(d.result.P_to_kpa, unit, rho)} {unit}
         </div>
       )}
-      <Handle type="source" position={outPosition} style={portHandleStyle('#f97316', 'out')} />
+      <Handle type="source" position={outPosition} id="fluid-out" style={portHandleStyle('#f97316', 'out')} />
     </div>
   )
 }
@@ -581,7 +952,7 @@ function ReducerNode({ data, selected }: NodeProps) {
       : '拡縮'
   return (
     <div className={`relative px-3 py-2 rounded border-2 bg-lime-50 min-w-[150px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-lime-500'}`}>
-      <Handle type="target" position={inPosition} style={portHandleStyle('#84cc16', 'in')} />
+      <Handle type="target" position={inPosition} id="fluid-in" style={portHandleStyle('#84cc16', 'in')} />
       {d.showPressureResults && d.result?.P_from_kpa !== undefined && (d.portInConnected ?? d.portLeftConnected) && (
         <div className={pressureBadgeClass(inPosition)}>
           {formatPressure(d.result.P_from_kpa, unit, rho)} {unit}
@@ -603,7 +974,7 @@ function ReducerNode({ data, selected }: NodeProps) {
           {formatPressure(d.result.P_to_kpa, unit, rho)} {unit}
         </div>
       )}
-      <Handle type="source" position={outPosition} style={portHandleStyle('#84cc16', 'out')} />
+      <Handle type="source" position={outPosition} id="fluid-out" style={portHandleStyle('#84cc16', 'out')} />
     </div>
   )
 }
@@ -616,7 +987,7 @@ function ElbowNode({ data, selected }: NodeProps) {
   const rho = d.rho ?? 1000
   return (
     <div className={`relative px-3 py-2 rounded border-2 bg-cyan-50 min-w-[145px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-cyan-500'}`}>
-      <Handle type="target" position={inPosition} style={portHandleStyle('#06b6d4', 'in')} />
+      <Handle type="target" position={inPosition} id="fluid-in" style={portHandleStyle('#06b6d4', 'in')} />
       {d.showPressureResults && d.result?.P_from_kpa !== undefined && (d.portInConnected ?? d.portLeftConnected) && (
         <div className={pressureBadgeClass(inPosition)}>
           {formatPressure(d.result.P_from_kpa, unit, rho)} {unit}
@@ -638,7 +1009,7 @@ function ElbowNode({ data, selected }: NodeProps) {
           {formatPressure(d.result.P_to_kpa, unit, rho)} {unit}
         </div>
       )}
-      <Handle type="source" position={outPosition} style={portHandleStyle('#06b6d4', 'out')} />
+      <Handle type="source" position={outPosition} id="fluid-out" style={portHandleStyle('#06b6d4', 'out')} />
     </div>
   )
 }
@@ -656,7 +1027,7 @@ function ValveNode({ data, selected }: NodeProps) {
       : 'リニア'
   return (
     <div className={`relative px-3 py-2 rounded border-2 bg-rose-50 min-w-[150px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-rose-500'}`}>
-      <Handle type="target" position={inPosition} style={portHandleStyle('#f43f5e', 'in')} />
+      <Handle type="target" position={inPosition} id="fluid-in" style={portHandleStyle('#f43f5e', 'in')} />
       {d.showPressureResults && d.result?.P_from_kpa !== undefined && (d.portInConnected ?? d.portLeftConnected) && (
         <div className={pressureBadgeClass(inPosition)}>
           {formatPressure(d.result.P_from_kpa, unit, rho)} {unit}
@@ -678,7 +1049,37 @@ function ValveNode({ data, selected }: NodeProps) {
           {formatPressure(d.result.P_to_kpa, unit, rho)} {unit}
         </div>
       )}
-      <Handle type="source" position={outPosition} style={portHandleStyle('#f43f5e', 'out')} />
+      <Handle type="source" position={outPosition} id="fluid-out" style={portHandleStyle('#f43f5e', 'out')} />
+    </div>
+  )
+}
+
+function MotorNode({ data, selected }: NodeProps) {
+  const d = data as unknown as NetworkNodeData
+  return (
+    <div className={`relative px-3 py-2 rounded border-2 bg-yellow-50 min-w-[155px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-yellow-500'}`}>
+      <Handle type="target" position={Position.Left} id="power-in" style={portHandleStyle('#eab308', 'in', 'power')} />
+      <div className="flex items-center gap-1.5 mb-0.5">
+        <SvgMotor className="w-4 h-4 text-yellow-700 shrink-0" />
+        <span className="text-xs font-bold text-yellow-800">{d.label}</span>
+      </div>
+      <div className="text-xs text-yellow-700 pl-5">Pout={d.motorRatedPower ?? 5.5} kW · η={d.motorEfficiency ?? 90}%</div>
+      <div className="text-xs text-yellow-600 pl-5">N={(d.speed ?? motorRatedSpeed(d)).toFixed(0)} rpm · {d.motorFrequency ?? 50} Hz</div>
+      <Handle type="source" position={Position.Right} id="power-out" style={portHandleStyle('#eab308', 'out', 'power')} />
+    </div>
+  )
+}
+
+function SpeedBoundaryNode({ data, selected }: NodeProps) {
+  const d = data as unknown as NetworkNodeData
+  return (
+    <div className={`relative px-3 py-2 rounded-xl border-2 bg-yellow-50 min-w-[135px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-yellow-400'}`}>
+      <div className="flex items-center gap-1.5 mb-0.5">
+        <SvgSpeedBoundary className="w-4 h-4 text-yellow-700 shrink-0" />
+        <span className="text-xs font-bold text-yellow-800">{d.label}</span>
+      </div>
+      <div className="text-xs text-yellow-700 pl-5">N={d.fixedSpeed ?? 1450} rpm</div>
+      <Handle type="source" position={Position.Right} id="power-out" style={portHandleStyle('#eab308', 'out', 'power')} />
     </div>
   )
 }
@@ -695,11 +1096,11 @@ function TeeNode({ data, selected }: NodeProps) {
   return (
     <div className={`px-3 py-3 rounded border-2 bg-amber-50 min-w-[110px] text-center ${selected ? 'border-blue-500 shadow-lg' : 'border-amber-400'}`}>
       {mode === 'split' ? (
-        <Handle type="target" position={inPosition} id="in" style={portHandleStyle('#f59e0b', 'in')} />
+        <Handle type="target" position={inPosition} id="fluid-in" style={portHandleStyle('#f59e0b', 'in')} />
       ) : (
         <>
-          <Handle type="target" position={inPosition} id="in-1" style={portHandleStyle('#f59e0b', 'in')} />
-          <Handle type="target" position={branchPosition} id="in-2" style={portHandleStyle('#f59e0b', 'in')} />
+          <Handle type="target" position={inPosition} id="fluid-in-1" style={portHandleStyle('#f59e0b', 'in')} />
+          <Handle type="target" position={branchPosition} id="fluid-in-2" style={portHandleStyle('#f59e0b', 'in')} />
         </>
       )}
       <div className="flex items-center justify-center gap-1.5 mb-0.5">
@@ -723,11 +1124,11 @@ function TeeNode({ data, selected }: NodeProps) {
       )}
       {mode === 'split' ? (
         <>
-          <Handle type="source" position={outPosition} id="out-1" style={portHandleStyle('#f59e0b', 'out')} />
-          <Handle type="source" position={branchPosition} id="out-2" style={portHandleStyle('#f59e0b', 'out')} />
+          <Handle type="source" position={outPosition} id="fluid-out-1" style={portHandleStyle('#f59e0b', 'out')} />
+          <Handle type="source" position={branchPosition} id="fluid-out-2" style={portHandleStyle('#f59e0b', 'out')} />
         </>
       ) : (
-        <Handle type="source" position={outPosition} id="out" style={portHandleStyle('#f59e0b', 'out')} />
+        <Handle type="source" position={outPosition} id="fluid-out" style={portHandleStyle('#f59e0b', 'out')} />
       )}
     </div>
   )
@@ -741,7 +1142,7 @@ function SinkNode({ data, selected }: NodeProps) {
   const inPosition = orientPosition(Position.Left, d)
   return (
     <div className={`px-3 py-2 rounded-xl border-2 bg-rose-50 min-w-[110px] ${selected ? 'border-blue-500 shadow-lg' : 'border-rose-400'}`}>
-      <Handle type="target" position={inPosition} style={portHandleStyle('#fb7185', 'in')} />
+      <Handle type="target" position={inPosition} id="fluid-in" style={portHandleStyle('#fb7185', 'in')} />
       <div className="flex items-center gap-1.5 mb-0.5">
         <SvgSink className="w-4 h-4 text-rose-500 shrink-0" />
         <span className="text-xs font-bold text-rose-700">{d.label}</span>
@@ -777,17 +1178,30 @@ const nodeTypes: Record<string, any> = {
   source: SourceNode,
   pipe: PipeNode,
   pump: PumpNode,
+  turbine: TurbineNode,
   heatExchanger: HeatExchangerNode,
   reducer: ReducerNode,
   elbow: ElbowNode,
   valve: ValveNode,
+  motor: MotorNode,
+  speedBoundary: SpeedBoundaryNode,
   tee: TeeNode,
   teeMerge: TeeNode,
   sink: SinkNode,
 }
 
-type FlowEdgeData = Record<string, unknown> & { flowLabel?: string; labelVisible?: boolean }
+type FlowEdgeData = Record<string, unknown> & { flowLabel?: string; labelVisible?: boolean; lineType?: LineType; fluidColor?: string }
 type FlowEdgeType = Edge<FlowEdgeData, 'flow'>
+
+function handleLineType(handleId?: string | null): LineType {
+  return handleId?.startsWith('power') ? 'power' : 'fluid'
+}
+
+function connectionLineType(sourceHandle?: string | null, targetHandle?: string | null): LineType | null {
+  const sourceType = handleLineType(sourceHandle)
+  const targetType = handleLineType(targetHandle)
+  return sourceType === targetType ? sourceType : null
+}
 
 function FlowEdge({
   id,
@@ -809,6 +1223,9 @@ function FlowEdge({
     targetY,
     targetPosition,
   })
+  const lineType = data?.lineType ?? 'fluid'
+  const stroke = selected ? '#f97316' : lineType === 'power' ? '#facc15' : data?.fluidColor ?? '#94a3b8'
+  const strokeWidth = selected ? 6 : lineType === 'power' ? 3 : 2.5
 
   return (
     <>
@@ -816,10 +1233,11 @@ function FlowEdge({
         id={id}
         path={edgePath}
         style={{
-          stroke: selected ? '#f97316' : '#94a3b8',
-          strokeWidth: selected ? 6 : 2.5,
-          filter: selected ? 'drop-shadow(0 0 8px rgba(194, 65, 12, 0.95)) drop-shadow(0 0 3px rgba(249, 115, 22, 0.9))' : undefined,
           ...style,
+          stroke,
+          strokeWidth,
+          strokeDasharray: lineType === 'power' ? '8 5' : undefined,
+          filter: selected ? 'drop-shadow(0 0 8px rgba(194, 65, 12, 0.95)) drop-shadow(0 0 3px rgba(249, 115, 22, 0.9))' : undefined,
         }}
       />
       {data?.flowLabel && data.labelVisible !== false && (
@@ -849,20 +1267,23 @@ const PALETTE = [
   { type: 'boundary', label: '境界',  sub: 'P / Q',  color: 'text-teal-300',    Icon: SvgSource },
   { type: 'pipe',   label: 'パイプ',  sub: '直管',  color: 'text-sky-300',    Icon: SvgPipe },
   { type: 'pump',   label: 'ポンプ',  sub: 'PQ',    color: 'text-violet-300', Icon: SvgPump },
+  { type: 'turbine', label: 'タービン', sub: '動力回収', color: 'text-emerald-300', Icon: SvgTurbine },
   { type: 'heatExchanger', label: '熱交換器', sub: 'UA', color: 'text-orange-300', Icon: SvgHeatExchanger },
   { type: 'reducer', label: '拡縮管', sub: 'ζ', color: 'text-lime-300', Icon: SvgReducer },
   { type: 'elbow', label: 'エルボ', sub: 'θ/ζ', color: 'text-cyan-300', Icon: SvgElbow },
   { type: 'valve', label: 'バルブ', sub: '開度/PQ', color: 'text-rose-300', Icon: SvgValve },
+  { type: 'motor', label: '誘導M', sub: '動力', color: 'text-yellow-300', Icon: SvgMotor },
+  { type: 'speedBoundary', label: '回転境界', sub: 'rpm', color: 'text-yellow-300', Icon: SvgSpeedBoundary },
   { type: 'tee',    label: 'T字管',   sub: '分岐',  color: 'text-amber-300',  Icon: SvgTee },
   { type: 'teeMerge', label: 'T字管', sub: '合流', color: 'text-amber-300', Icon: SvgTee },
 ]
 
 function defaultData(type: string, n: number): NetworkNodeData {
   switch (type) {
-    case 'boundary': return { nodeType: 'boundary', label: `境界${n}`, boundaryType: 'pressure', pressure: 101.325, flowRate: 10, temperature: 293.15 }
-    case 'source': return { nodeType: 'source', label: `ソース${n}`, boundaryType: 'flow', flowRate: 10, pressure: 100, temperature: 293.15 }
+    case 'boundary': return { nodeType: 'boundary', label: `境界${n}`, fluidSystemId: DEFAULT_FLUID_SYSTEM_ID, boundaryType: 'pressure', pressure: 101.325, flowRate: 10, temperature: 293.15 }
+    case 'source': return { nodeType: 'source', label: `ソース${n}`, fluidSystemId: DEFAULT_FLUID_SYSTEM_ID, boundaryType: 'flow', flowRate: 10, pressure: 100, temperature: 293.15 }
     case 'pipe':   return {
-      nodeType: 'pipe', label: `パイプ${n}`,
+      nodeType: 'pipe', label: `パイプ${n}`, fluidSystemId: DEFAULT_FLUID_SYSTEM_ID,
       pipeShape: 'circular',
       diameter: 100, outerDiameter: 100, innerDiameter: 50,
       width: 100, ductHeight: 50,
@@ -870,11 +1291,11 @@ function defaultData(type: string, n: number): NetworkNodeData {
       frictionMethod: 'colebrook',
     }
     case 'pump': return {
-      nodeType: 'pump', label: `ポンプ${n}`,
+      nodeType: 'pump', label: `ポンプ${n}`, fluidSystemId: DEFAULT_FLUID_SYSTEM_ID,
       ratedFlow: 30, ratedHead: 20,
       shutoffHead: 30,
       efficiency: 70,
-      ratedSpeed: 1450, speed: 1450,
+      ratedSpeed: 1450,
       pumpCurveMode: 'quadratic',
       pumpCurvePoints: [
         { q: 0, h: 30 },
@@ -882,8 +1303,15 @@ function defaultData(type: string, n: number): NetworkNodeData {
         { q: 51.96, h: 0 },
       ],
     }
+    case 'turbine': return {
+      nodeType: 'turbine', label: `タービン${n}`, fluidSystemId: DEFAULT_FLUID_SYSTEM_ID,
+      ratedFlow: 30,
+      ratedHead: 20,
+      efficiency: 85,
+      ratedSpeed: 1450,
+    }
     case 'heatExchanger': return {
-      nodeType: 'heatExchanger', label: `熱交換器${n}`,
+      nodeType: 'heatExchanger', label: `熱交換器${n}`, fluidSystemId: DEFAULT_FLUID_SYSTEM_ID,
       exchangeTemperature: 303.15,
       heatTransferCoeff: 500,
       heatTransferArea: 10,
@@ -891,14 +1319,14 @@ function defaultData(type: string, n: number): NetworkNodeData {
       nominalPressureDrop: 10,
     }
     case 'reducer': return {
-      nodeType: 'reducer', label: `拡縮管${n}`,
+      nodeType: 'reducer', label: `拡縮管${n}`, fluidSystemId: DEFAULT_FLUID_SYSTEM_ID,
       diameterIn: 100,
       diameterOut: 50,
       lossMode: 'auto',
       lossCoefficient: 0.5,
     }
     case 'elbow': return {
-      nodeType: 'elbow', label: `エルボ${n}`,
+      nodeType: 'elbow', label: `エルボ${n}`, fluidSystemId: DEFAULT_FLUID_SYSTEM_ID,
       diameter: 100,
       angle: 90,
       elbowLossMode: 'auto',
@@ -906,17 +1334,30 @@ function defaultData(type: string, n: number): NetworkNodeData {
       zeta90: 0.75,
     }
     case 'valve': return {
-      nodeType: 'valve', label: `バルブ${n}`,
+      nodeType: 'valve', label: `バルブ${n}`, fluidSystemId: DEFAULT_FLUID_SYSTEM_ID,
       diameter: 100,
       valveCharacteristic: 'linear',
       valveOpening: 100,
       valveZetaFullOpen: 1.0,
       valveRangeability: 50,
     }
-    case 'tee':  return { nodeType: 'tee',  label: `分岐T字管${n}`, teeMode: 'split' }
-    case 'teeMerge': return { nodeType: 'tee', label: `合流T字管${n}`, teeMode: 'merge' }
-    case 'sink': return { nodeType: 'sink', label: `シンク${n}`, boundaryType: 'pressure', pressure: 101.325, temperature: 293.15 }
-    default:     return { nodeType: 'boundary', label: `${type}${n}`, boundaryType: 'pressure', pressure: 101.325, flowRate: 10, temperature: 293.15 }
+    case 'motor': return {
+      nodeType: 'motor', label: `誘導モーター${n}`,
+      motorRatedPower: 5.5,
+      motorEfficiency: 90,
+      motorVoltage: 200,
+      motorFrequency: 50,
+      motorPoles: 4,
+      motorSlip: 3,
+    }
+    case 'speedBoundary': return {
+      nodeType: 'speedBoundary', label: `回転境界${n}`,
+      fixedSpeed: 1450,
+    }
+    case 'tee':  return { nodeType: 'tee',  label: `分岐T字管${n}`, fluidSystemId: DEFAULT_FLUID_SYSTEM_ID, teeMode: 'split' }
+    case 'teeMerge': return { nodeType: 'tee', label: `合流T字管${n}`, fluidSystemId: DEFAULT_FLUID_SYSTEM_ID, teeMode: 'merge' }
+    case 'sink': return { nodeType: 'sink', label: `シンク${n}`, fluidSystemId: DEFAULT_FLUID_SYSTEM_ID, boundaryType: 'pressure', pressure: 101.325, temperature: 293.15 }
+    default:     return { nodeType: 'boundary', label: `${type}${n}`, fluidSystemId: DEFAULT_FLUID_SYSTEM_ID, boundaryType: 'pressure', pressure: 101.325, flowRate: 10, temperature: 293.15 }
   }
 }
 
@@ -934,10 +1375,10 @@ function createDefaultDiagram(): { nodes: Node[]; edges: Edge[] } {
   ]
   const edgeStyle = { stroke: '#94a3b8', strokeWidth: 2 }
   const edges: Edge[] = [
-    { id: 'e-boundary-1-pipe-3', source: 'boundary-1', target: 'pipe-3', type: 'flow', style: edgeStyle },
-    { id: 'e-pipe-3-pump-4',     source: 'pipe-3',     target: 'pump-4', type: 'flow', style: edgeStyle },
-    { id: 'e-pump-4-pipe-2',     source: 'pump-4',     target: 'pipe-2', type: 'flow', style: edgeStyle },
-    { id: 'e-pipe-2-boundary-1', source: 'pipe-2',     target: 'boundary-1', type: 'flow', style: edgeStyle },
+    { id: 'e-boundary-1-pipe-3', source: 'boundary-1', sourceHandle: 'fluid-out', target: 'pipe-3', targetHandle: 'fluid-in', type: 'flow', style: edgeStyle, data: { lineType: 'fluid' } },
+    { id: 'e-pipe-3-pump-4',     source: 'pipe-3',     sourceHandle: 'fluid-out', target: 'pump-4', targetHandle: 'fluid-in', type: 'flow', style: edgeStyle, data: { lineType: 'fluid' } },
+    { id: 'e-pump-4-pipe-2',     source: 'pump-4',     sourceHandle: 'fluid-out', target: 'pipe-2', targetHandle: 'fluid-in', type: 'flow', style: edgeStyle, data: { lineType: 'fluid' } },
+    { id: 'e-pipe-2-boundary-1', source: 'pipe-2',     sourceHandle: 'fluid-out', target: 'boundary-1', targetHandle: 'fluid-in', type: 'flow', style: edgeStyle, data: { lineType: 'fluid' } },
   ]
   return { nodes, edges }
 }
@@ -964,7 +1405,7 @@ function NumField({ label, unit, value, onChange }: {
 // ── Unified result table: 項目 / 記号 / 値 / 単位 ──────────────────
 
 type ResultRow = { item: string; symbol: string; value: string; unit: string; highlight?: boolean }
-type ResultTheme = 'sky' | 'violet' | 'orange' | 'amber' | 'blue' | 'rose'
+type ResultTheme = 'sky' | 'violet' | 'orange' | 'amber' | 'blue' | 'rose' | 'green'
 
 const RESULT_THEME_CLASSES: Record<ResultTheme, { bg: string; border: string; title: string }> = {
   sky:    { bg: 'bg-sky-50',    border: 'border-sky-100',    title: 'text-sky-600' },
@@ -973,6 +1414,7 @@ const RESULT_THEME_CLASSES: Record<ResultTheme, { bg: string; border: string; ti
   amber:  { bg: 'bg-amber-50',  border: 'border-amber-100',  title: 'text-amber-600' },
   blue:   { bg: 'bg-blue-50',   border: 'border-blue-100',   title: 'text-blue-600' },
   rose:   { bg: 'bg-rose-50',   border: 'border-rose-100',   title: 'text-rose-600' },
+  green:  { bg: 'bg-emerald-50', border: 'border-emerald-100', title: 'text-emerald-700' },
 }
 
 function resultSymbols(rows: ResultRow[]): string[] {
@@ -1056,8 +1498,10 @@ function pumpResultRows(result: PipeSegmentResult, unit: PressureUnit, rho: numb
     { item: '流量',   symbol: 'Q',   value: result.Q_m3h.toFixed(3),                       unit: 'm³/h' },
     { item: '揚程',   symbol: 'H',   value: (result.head_m ?? 0).toFixed(3),               unit: 'm' },
     { item: '昇圧',   symbol: 'ΔP',  value: formatPressure(result.boost_kpa ?? 0, unit, rho), unit, highlight: true },
+    ...(result.speed_rpm !== undefined ? [{ item: '動作回転数', symbol: 'N', value: result.speed_rpm.toFixed(1), unit: 'rpm', highlight: true }] : []),
     { item: '理論動力', symbol: 'P_h', value: (result.hydraulic_power_kw ?? 0).toFixed(4), unit: 'kW' },
     { item: '消費動力', symbol: 'P_s', value: (result.shaft_power_kw ?? 0).toFixed(4),     unit: 'kW', highlight: true },
+    ...(result.shaft_torque_nm !== undefined ? [{ item: '軸トルク', symbol: 'T_s', value: result.shaft_torque_nm.toFixed(3), unit: 'N·m', highlight: true }] : []),
     ...(result.P_from_kpa !== undefined ? [{ item: '入口圧', symbol: 'P_in',  value: formatPressure(result.P_from_kpa, unit, rho), unit }] : []),
     ...(result.P_to_kpa   !== undefined ? [{ item: '出口圧', symbol: 'P_out', value: formatPressure(result.P_to_kpa,   unit, rho), unit }] : []),
     ...(result.T_in_K     !== undefined ? [{ item: '入口温度', symbol: 'T_in', value: result.T_in_K.toFixed(3), unit: 'K' }] : []),
@@ -1144,6 +1588,51 @@ function valveResultRows(result: PipeSegmentResult, unit: PressureUnit, rho: num
   ]
 }
 
+function turbineResultRows(result: PipeSegmentResult, unit: PressureUnit, rho: number): ResultRow[] {
+  return [
+    { item: '流量', symbol: 'Q', value: result.Q_m3h.toFixed(3), unit: 'm³/h' },
+    { item: '有効落差', symbol: 'H', value: (result.head_m ?? 0).toFixed(3), unit: 'm' },
+    { item: '圧力損失', symbol: 'ΔP', value: formatPressure(result.dP_kpa, unit, rho), unit, highlight: true },
+    ...(result.speed_rpm !== undefined ? [{ item: '動作回転数', symbol: 'N', value: result.speed_rpm.toFixed(1), unit: 'rpm', highlight: true }] : []),
+    { item: '流体動力', symbol: 'P_h', value: (result.extracted_power_kw ?? 0).toFixed(4), unit: 'kW' },
+    { item: '軸出力', symbol: 'P_out', value: (result.output_power_kw ?? 0).toFixed(4), unit: 'kW', highlight: true },
+    ...(result.shaft_torque_nm !== undefined ? [{ item: '軸トルク', symbol: 'T_s', value: result.shaft_torque_nm.toFixed(3), unit: 'N·m', highlight: true }] : []),
+    ...(result.P_in_kpa !== undefined ? [{ item: '入口圧', symbol: 'P_in', value: formatPressure(result.P_in_kpa, unit, rho), unit }] : []),
+    ...(result.P_out_kpa !== undefined ? [{ item: '出口圧', symbol: 'P_out', value: formatPressure(result.P_out_kpa, unit, rho), unit }] : []),
+    ...(result.T_in_K !== undefined ? [{ item: '入口温度', symbol: 'T_in', value: result.T_in_K.toFixed(3), unit: 'K' }] : []),
+    ...(result.T_out_K !== undefined ? [{ item: '出口温度', symbol: 'T_out', value: result.T_out_K.toFixed(3), unit: 'K' }] : []),
+  ]
+}
+
+function speedSolveModeLabel(mode: NetworkNodeData['speedSolveMode']): string {
+  if (mode === 'fixed') return '固定境界'
+  if (mode === 'torque') return 'トルク釣合'
+  return '未接続'
+}
+
+function motorResultRows(d: NetworkNodeData): ResultRow[] {
+  return [
+    { item: '定格軸出力', symbol: 'P_out', value: (d.motorRatedPower ?? 5.5).toFixed(3), unit: 'kW', highlight: true },
+    ...(d.speed !== undefined ? [{ item: '動作回転数', symbol: 'N', value: d.speed.toFixed(1), unit: 'rpm', highlight: true }] : []),
+    ...(d.shaftTorque !== undefined ? [{ item: '発生トルク', symbol: 'T_m', value: d.shaftTorque.toFixed(3), unit: 'N·m', highlight: true }] : []),
+    ...(d.speedSolveMode !== undefined ? [{ item: '回転数決定', symbol: 'mode', value: speedSolveModeLabel(d.speedSolveMode), unit: '-' }] : []),
+    { item: '入力電力', symbol: 'P_in', value: motorInputPower(d).toFixed(3), unit: 'kW' },
+    { item: '効率', symbol: 'η', value: (d.motorEfficiency ?? 90).toFixed(2), unit: '%' },
+    { item: '電圧', symbol: 'V', value: (d.motorVoltage ?? 200).toFixed(1), unit: 'V' },
+    { item: '周波数', symbol: 'f', value: (d.motorFrequency ?? 50).toFixed(1), unit: 'Hz' },
+    { item: '極数', symbol: 'p', value: Math.round(d.motorPoles ?? 4).toString(), unit: '-' },
+    { item: 'すべり', symbol: 's', value: (d.motorSlip ?? 3).toFixed(2), unit: '%' },
+    { item: '同期速度', symbol: 'N_s', value: motorSynchronousSpeed(d).toFixed(1), unit: 'rpm' },
+    { item: '定格回転数', symbol: 'N_r', value: motorRatedSpeed(d).toFixed(1), unit: 'rpm' },
+  ]
+}
+
+function speedBoundaryResultRows(d: NetworkNodeData): ResultRow[] {
+  return [
+    { item: '固定回転数', symbol: 'N_set', value: (d.fixedSpeed ?? 1450).toFixed(1), unit: 'rpm', highlight: true },
+  ]
+}
+
 function boundaryResultRows(d: NetworkNodeData, unit: PressureUnit, rho: number): ResultRow[] | null {
   const isFlow = (d.boundaryType ?? 'flow') === 'flow'
   const temp = d.calcTemperature ?? d.result?.T_K ?? d.temperature
@@ -1190,10 +1679,13 @@ function teeResultRows(d: NetworkNodeData, unit: PressureUnit, rho: number): Res
 function componentTypeLabel(nodeType: string): string {
   if (nodeType === 'pipe') return 'パイプ'
   if (nodeType === 'pump') return 'ポンプ'
+  if (nodeType === 'turbine') return 'タービン'
   if (nodeType === 'heatExchanger') return '熱交換器'
   if (nodeType === 'reducer') return '拡縮管'
   if (nodeType === 'elbow') return 'エルボ'
   if (nodeType === 'valve') return 'バルブ'
+  if (nodeType === 'motor') return '誘導モーター'
+  if (nodeType === 'speedBoundary') return '回転境界'
   if (nodeType === 'tee')  return 'T字管'
   return '境界'
 }
@@ -1202,18 +1694,22 @@ function componentResultRows(d: NetworkNodeData, unit: PressureUnit, rho: number
   const rows =
     d.nodeType === 'pipe' ? (d.result ? pipeResultRows(d.result, unit, rho) : null)
     : d.nodeType === 'pump' ? (d.result ? pumpResultRows(d.result, unit, rho) : null)
+    : d.nodeType === 'turbine' ? (d.result ? turbineResultRows(d.result, unit, rho) : null)
     : d.nodeType === 'heatExchanger' ? (d.result ? heatExchangerResultRows(d.result, unit, rho) : null)
     : d.nodeType === 'reducer' ? (d.result ? reducerResultRows(d.result, unit, rho) : null)
     : d.nodeType === 'elbow' ? (d.result ? elbowResultRows(d.result, unit, rho) : null)
     : d.nodeType === 'valve' ? (d.result ? valveResultRows(d.result, unit, rho) : null)
+    : d.nodeType === 'motor' ? motorResultRows(d)
+    : d.nodeType === 'speedBoundary' ? speedBoundaryResultRows(d)
     : d.nodeType === 'tee' ? teeResultRows(d, unit, rho)
     : boundaryResultRows(d, unit, rho)
   return filterVisibleRows(rows, d)
 }
 
-function NodeParamPanel({ node, onChange }: {
+function NodeParamPanel({ node, onChange, fluidSystems }: {
   node: Node
   onChange: (u: Partial<NetworkNodeData>) => void
+  fluidSystems: FluidSystem[]
 }) {
   const d = node.data as unknown as NetworkNodeData
   const pumpPoints = pumpCurvePointsFor(d)
@@ -1232,23 +1728,30 @@ function NodeParamPanel({ node, onChange }: {
   }
 
   const isBoundaryNode = d.nodeType === 'boundary' || d.nodeType === 'source' || d.nodeType === 'sink'
+  const isFluidNode = d.nodeType !== 'motor' && d.nodeType !== 'speedBoundary'
 
   const Icon = isBoundaryNode ? SvgSource
     : d.nodeType === 'pipe' ? SvgPipe
     : d.nodeType === 'pump' ? SvgPump
+    : d.nodeType === 'turbine' ? SvgTurbine
     : d.nodeType === 'heatExchanger' ? SvgHeatExchanger
     : d.nodeType === 'reducer' ? SvgReducer
     : d.nodeType === 'elbow' ? SvgElbow
     : d.nodeType === 'valve' ? SvgValve
+    : d.nodeType === 'motor' ? SvgMotor
+    : d.nodeType === 'speedBoundary' ? SvgSpeedBoundary
     : SvgTee
 
   const iconColor = isBoundaryNode ? 'text-teal-600'
     : d.nodeType === 'pipe' ? 'text-sky-600'
     : d.nodeType === 'pump' ? 'text-violet-600'
+    : d.nodeType === 'turbine' ? 'text-emerald-600'
     : d.nodeType === 'heatExchanger' ? 'text-orange-600'
     : d.nodeType === 'reducer' ? 'text-lime-700'
     : d.nodeType === 'elbow' ? 'text-cyan-700'
     : d.nodeType === 'valve' ? 'text-rose-700'
+    : d.nodeType === 'motor' ? 'text-yellow-700'
+    : d.nodeType === 'speedBoundary' ? 'text-yellow-700'
     : 'text-amber-600'
 
   return (
@@ -1258,6 +1761,21 @@ function NodeParamPanel({ node, onChange }: {
         <Icon className={`w-5 h-5 ${iconColor} shrink-0`} />
         <span className="text-base font-semibold text-gray-800 min-w-0 flex-1 truncate">{d.label}</span>
       </div>
+
+      {isFluidNode && (
+        <div className="flex flex-col gap-1.5">
+          <label className="text-xs font-medium text-gray-600">流体系統</label>
+          <select
+            value={d.fluidSystemId ?? fluidSystems[0]?.id ?? DEFAULT_FLUID_SYSTEM_ID}
+            onChange={e => onChange({ fluidSystemId: e.target.value })}
+            className="border border-gray-300 rounded-md px-2 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+          >
+            {fluidSystems.map(system => (
+              <option key={system.id} value={system.id}>{system.name}</option>
+            ))}
+          </select>
+        </div>
+      )}
 
       {/* ── Boundary ── */}
       {isBoundaryNode && (<>
@@ -1365,9 +1883,24 @@ function NodeParamPanel({ node, onChange }: {
         <div className="rounded-lg border border-violet-100 bg-violet-50/60 p-3 flex flex-col gap-3">
           <div className="text-xs font-semibold text-violet-600">回転数（相似則）</div>
           <NumField label="基準回転数 Nr" unit="rpm" value={d.ratedSpeed ?? 1450} onChange={v => onChange({ ratedSpeed: v })} />
-          <NumField label="現在回転数 N"  unit="rpm" value={d.speed ?? d.ratedSpeed ?? 1450} onChange={v => onChange({ speed: v })} />
+          <div className="rounded-md border border-violet-100 bg-white px-3 py-2">
+            <div className="flex justify-between items-baseline gap-2">
+              <span className="text-xs text-gray-500">動作回転数 N</span>
+              <span className="text-sm font-semibold text-violet-700 tabular-nums">{(d.speed ?? d.ratedSpeed ?? 1450).toFixed(1)} rpm</span>
+            </div>
+            {d.shaftTorque !== undefined && (
+              <div className="mt-1 flex justify-between items-baseline gap-2">
+                <span className="text-xs text-gray-500">負荷トルク T</span>
+                <span className="text-sm font-semibold text-violet-700 tabular-nums">{d.shaftTorque.toFixed(3)} N·m</span>
+              </div>
+            )}
+            <div className="mt-1 flex justify-between items-baseline gap-2">
+              <span className="text-xs text-gray-400">決定方法</span>
+              <span className="text-xs font-medium text-violet-600">{speedSolveModeLabel(d.speedSolveMode)}</span>
+            </div>
+          </div>
           <p className="text-xs text-gray-400 leading-relaxed">
-            PQ特性（簡易曲線・テーブルいずれも）は基準回転数Nrで定義されたものとして扱い、Q∝N、H∝N²でNに応じてスケーリングします。
+            PQ特性は基準回転数Nrで定義し、現在回転数Nは固定回転境界またはモーターとのトルク釣合で決定します。未接続時はNrで計算します。
           </p>
         </div>
 
@@ -1438,6 +1971,36 @@ function NodeParamPanel({ node, onChange }: {
         )}
 
         <NumField label="効率 η" unit="%" value={d.efficiency ?? 70} onChange={v => onChange({ efficiency: v })} />
+      </>)}
+
+      {/* ── Turbine ── */}
+      {d.nodeType === 'turbine' && (<>
+        <div className="rounded-lg border border-emerald-100 bg-emerald-50/60 p-3 flex flex-col gap-3">
+          <div className="text-xs font-semibold text-emerald-700">動力回収</div>
+          <NumField label="基準回転数 Nr" unit="rpm" value={d.ratedSpeed ?? 1450} onChange={v => onChange({ ratedSpeed: v })} />
+          <div className="rounded-md border border-emerald-100 bg-white px-3 py-2">
+            <div className="flex justify-between items-baseline gap-2">
+              <span className="text-xs text-gray-500">動作回転数 N</span>
+              <span className="text-sm font-semibold text-emerald-700 tabular-nums">{(d.speed ?? d.ratedSpeed ?? 1450).toFixed(1)} rpm</span>
+            </div>
+            {d.shaftTorque !== undefined && (
+              <div className="mt-1 flex justify-between items-baseline gap-2">
+                <span className="text-xs text-gray-500">供給トルク T</span>
+                <span className="text-sm font-semibold text-emerald-700 tabular-nums">{d.shaftTorque.toFixed(3)} N·m</span>
+              </div>
+            )}
+            <div className="mt-1 flex justify-between items-baseline gap-2">
+              <span className="text-xs text-gray-400">決定方法</span>
+              <span className="text-xs font-medium text-emerald-700">{speedSolveModeLabel(d.speedSolveMode)}</span>
+            </div>
+          </div>
+          <p className="text-xs text-gray-400 leading-relaxed">
+            タービンは流体側で有効落差分の圧力を消費し、動力ラインへ軸トルクを供給します。初期モデルでは定格点からT∝N²のトルク特性を作ります。
+          </p>
+        </div>
+        <NumField label="定格流量 Qr" unit="m³/h" value={d.ratedFlow ?? 30} onChange={v => onChange({ ratedFlow: v })} />
+        <NumField label="有効落差 H" unit="m" value={d.ratedHead ?? 20} onChange={v => onChange({ ratedHead: v })} />
+        <NumField label="効率 η" unit="%" value={d.efficiency ?? 85} onChange={v => onChange({ efficiency: v })} />
       </>)}
 
       {/* ── Heat Exchanger ── */}
@@ -1582,6 +2145,49 @@ function NodeParamPanel({ node, onChange }: {
         </div>
       </>)}
 
+      {/* ── Induction Motor ── */}
+      {d.nodeType === 'motor' && (<>
+        <NumField label="定格軸出力 Pout" unit="kW" value={d.motorRatedPower ?? 5.5} onChange={v => onChange({ motorRatedPower: v })} />
+        <NumField label="効率 η" unit="%" value={d.motorEfficiency ?? 90} onChange={v => onChange({ motorEfficiency: v })} />
+        <NumField label="電圧 V" unit="V" value={d.motorVoltage ?? 200} onChange={v => onChange({ motorVoltage: v })} />
+        <NumField label="周波数 f" unit="Hz" value={d.motorFrequency ?? 50} onChange={v => onChange({ motorFrequency: v })} />
+        <NumField label="極数 p" unit="-" value={d.motorPoles ?? 4} onChange={v => onChange({ motorPoles: Math.max(Math.round(v), 1) })} />
+        <NumField label="すべり s" unit="%" value={d.motorSlip ?? 3} onChange={v => onChange({ motorSlip: v })} />
+        <div className="rounded-lg border border-yellow-100 bg-yellow-50 p-3 text-sm text-yellow-800">
+          <div className="flex justify-between gap-3">
+            <span className="text-xs text-yellow-600">動作回転数</span>
+            <span className="font-semibold tabular-nums">{(d.speed ?? motorRatedSpeed(d)).toFixed(0)} rpm</span>
+          </div>
+          {d.shaftTorque !== undefined && (
+            <div className="mt-1 flex justify-between gap-3">
+              <span className="text-xs text-yellow-600">発生トルク</span>
+              <span className="font-semibold tabular-nums">{d.shaftTorque.toFixed(3)} N·m</span>
+            </div>
+          )}
+          <div className="mt-1 flex justify-between gap-3">
+            <span className="text-xs text-yellow-600">回転数決定</span>
+            <span className="font-semibold">{speedSolveModeLabel(d.speedSolveMode)}</span>
+          </div>
+          <div className="flex justify-between gap-3">
+            <span className="text-xs text-yellow-600">同期速度</span>
+            <span className="font-semibold tabular-nums">{motorSynchronousSpeed(d).toFixed(0)} rpm</span>
+          </div>
+          <div className="mt-1 flex justify-between gap-3">
+            <span className="text-xs text-yellow-600">定格回転数</span>
+            <span className="font-semibold tabular-nums">{motorRatedSpeed(d).toFixed(0)} rpm</span>
+          </div>
+          <div className="mt-1 flex justify-between gap-3">
+            <span className="text-xs text-yellow-600">入力電力</span>
+            <span className="font-semibold tabular-nums">{motorInputPower(d).toFixed(3)} kW</span>
+          </div>
+        </div>
+      </>)}
+
+      {/* ── Fixed Speed Boundary ── */}
+      {d.nodeType === 'speedBoundary' && (
+        <NumField label="固定回転数 N" unit="rpm" value={d.fixedSpeed ?? 1450} onChange={v => onChange({ fixedSpeed: v })} />
+      )}
+
       {/* ── Tee ── */}
       {d.nodeType === 'tee' && (
         <div className="flex flex-col gap-1.5">
@@ -1682,6 +2288,19 @@ function ResultsPanel({ node, pressureUnit, rho, onToggleResultSymbol }: {
     )
   }
 
+  if (d.nodeType === 'turbine') {
+    if (!d.result) return empty
+    return (
+      <ResultTable
+        theme="green"
+        title="計算結果 — タービン"
+        rows={turbineResultRows(d.result, pressureUnit, rho)}
+        selectedSymbols={d.resultVisibleSymbols}
+        onToggleSymbol={(symbol, checked, allSymbols) => onToggleResultSymbol(node.id, symbol, checked, allSymbols)}
+      />
+    )
+  }
+
   if (d.nodeType === 'heatExchanger') {
     if (!d.result) return empty
     return (
@@ -1728,6 +2347,30 @@ function ResultsPanel({ node, pressureUnit, rho, onToggleResultSymbol }: {
         theme="rose"
         title="計算結果 — バルブ"
         rows={valveResultRows(d.result, pressureUnit, rho)}
+        selectedSymbols={d.resultVisibleSymbols}
+        onToggleSymbol={(symbol, checked, allSymbols) => onToggleResultSymbol(node.id, symbol, checked, allSymbols)}
+      />
+    )
+  }
+
+  if (d.nodeType === 'motor') {
+    return (
+      <ResultTable
+        theme="amber"
+        title="設定値 — 誘導モーター"
+        rows={motorResultRows(d)}
+        selectedSymbols={d.resultVisibleSymbols}
+        onToggleSymbol={(symbol, checked, allSymbols) => onToggleResultSymbol(node.id, symbol, checked, allSymbols)}
+      />
+    )
+  }
+
+  if (d.nodeType === 'speedBoundary') {
+    return (
+      <ResultTable
+        theme="amber"
+        title="設定値 — 回転境界"
+        rows={speedBoundaryResultRows(d)}
         selectedSymbols={d.resultVisibleSymbols}
         onToggleSymbol={(symbol, checked, allSymbols) => onToggleResultSymbol(node.id, symbol, checked, allSymbols)}
       />
@@ -1785,10 +2428,12 @@ function AnalysisPanel({ node, density, viscosity, pressureUnit, rho }: {
   const d = node?.data as unknown as NetworkNodeData | undefined
   const isPipe = d?.nodeType === 'pipe'
   const isPump = d?.nodeType === 'pump'
+  const isTurbine = d?.nodeType === 'turbine'
   const isHeatExchanger = d?.nodeType === 'heatExchanger'
   const isReducer = d?.nodeType === 'reducer'
   const isElbow = d?.nodeType === 'elbow'
   const isValve = d?.nodeType === 'valve'
+  const isMotor = d?.nodeType === 'motor'
 
   const [chartData, setChartData] = useState<PressureDropResult | null>(null)
   const [fetching,  setFetching]  = useState(false)
@@ -1858,6 +2503,67 @@ function AnalysisPanel({ node, density, viscosity, pressureUnit, rho }: {
   ])
 
   const traces = useMemo(() => {
+    if (isMotor && d) {
+      const ns = Math.max(motorSynchronousSpeed(d), 1)
+      const nr = motorRatedSpeed(d)
+      const speeds = Array.from({ length: 120 }, (_, i) => ns * i / 119)
+      const out: object[] = [{
+        x: speeds,
+        y: speeds.map(n => motorPowerAtSpeed(d, n)),
+        type: 'scatter',
+        mode: 'lines',
+        name: '軸出力特性',
+        line: { color: '#ca8a04', width: 2.8 },
+        hovertemplate: 'N: %{x:.0f} rpm<br>Pout: %{y:.3f} kW<extra></extra>',
+      }, {
+        x: speeds,
+        y: speeds.map(n => motorTorqueAtSpeed(d, n)),
+        yaxis: 'y2',
+        type: 'scatter',
+        mode: 'lines',
+        name: '発生トルク',
+        line: { color: '#f97316', width: 2.4, dash: 'dot' },
+        hovertemplate: 'N: %{x:.0f} rpm<br>T: %{y:.3f} N·m<extra></extra>',
+      }, {
+        x: [nr],
+        y: [d.motorRatedPower ?? 5.5],
+        type: 'scatter',
+        mode: 'markers',
+        name: '定格点',
+        marker: { color: '#059669', size: 12, symbol: 'circle', line: { color: '#fff', width: 2 } },
+        hovertemplate: 'Nr: %{x:.0f} rpm<br>Pout: %{y:.3f} kW<extra>定格点</extra>',
+      }, {
+        x: [ns],
+        y: [0],
+        type: 'scatter',
+        mode: 'markers',
+        name: '同期速度',
+        marker: { color: '#64748b', size: 10, symbol: 'diamond', line: { color: '#fff', width: 2 } },
+        hovertemplate: 'Ns: %{x:.0f} rpm<extra>同期速度</extra>',
+      }]
+      if (d.speed !== undefined) {
+        out.push({
+          x: [d.speed],
+          y: [motorPowerAtSpeed(d, d.speed)],
+          type: 'scatter',
+          mode: 'markers',
+          name: '動作点',
+          marker: { color: '#dc2626', size: 13, symbol: 'circle', line: { color: '#fff', width: 2 } },
+          hovertemplate: 'N: %{x:.0f} rpm<br>Pout: %{y:.3f} kW<extra>動作点</extra>',
+        }, {
+          x: [d.speed],
+          y: [d.shaftTorque ?? motorTorqueAtSpeed(d, d.speed)],
+          yaxis: 'y2',
+          type: 'scatter',
+          mode: 'markers',
+          name: '動作トルク',
+          marker: { color: '#ea580c', size: 12, symbol: 'square', line: { color: '#fff', width: 2 } },
+          hovertemplate: 'N: %{x:.0f} rpm<br>T: %{y:.3f} N·m<extra>動作トルク</extra>',
+        })
+      }
+      return out
+    }
+
     if (isValve && d) {
       const diameter = Math.max(d.diameter ?? 100, 1e-9) / 1000
       const area = Math.PI * diameter ** 2 / 4
@@ -2013,8 +2719,18 @@ function AnalysisPanel({ node, density, viscosity, pressureUnit, rho }: {
         name: 'PQ特性',
         line: { color: '#7c3aed', width: 2.8 },
         hovertemplate: 'Q: %{x:.2f} m³/h<br>H: %{y:.3f} m<extra></extra>',
+      }, {
+        x: flowRates,
+        y: flowRates.map(q => pumpShaftTorqueAtFlow(d, q, rho)),
+        yaxis: 'y2',
+        type: 'scatter',
+        mode: 'lines',
+        name: '軸トルク特性',
+        line: { color: '#f97316', width: 2.4, dash: 'dot' },
+        hovertemplate: 'Q: %{x:.2f} m³/h<br>T: %{y:.3f} N·m<extra></extra>',
       }]
       if (d.result) {
+        const resultTorque = d.result.shaft_torque_nm ?? pumpShaftTorqueAtFlow(d, d.result.Q_m3h, rho)
         out.push({
           x: [d.result.Q_m3h],
           y: [d.result.head_m ?? pumpHeadAt(d, d.result.Q_m3h)],
@@ -2023,6 +2739,62 @@ function AnalysisPanel({ node, density, viscosity, pressureUnit, rho }: {
           name: '動作点',
           marker: { color: '#059669', size: 12, symbol: 'circle', line: { color: '#fff', width: 2 } },
           hovertemplate: 'Q: %{x:.2f} m³/h<br>H: %{y:.3f} m<extra>動作点</extra>',
+        }, {
+          x: [d.result.Q_m3h],
+          y: [resultTorque],
+          yaxis: 'y2',
+          type: 'scatter',
+          mode: 'markers',
+          name: '動作トルク',
+          marker: { color: '#ea580c', size: 12, symbol: 'square', line: { color: '#fff', width: 2 } },
+          hovertemplate: 'Q: %{x:.2f} m³/h<br>T: %{y:.3f} N·m<extra>動作トルク</extra>',
+        })
+      }
+      return out
+    }
+
+    if (isTurbine && d) {
+      const qRated = Math.max(d.ratedFlow ?? 30, 1e-9)
+      const resultQ = Math.abs(d.result?.Q_m3h ?? 0)
+      const qMax = Math.max(qRated * 2, resultQ * 1.2, 1)
+      const flowRates = Array.from({ length: 100 }, (_, i) => qMax * i / 99)
+      const out: object[] = [{
+        x: flowRates,
+        y: flowRates.map(q => turbineHeadAtFlow(d, q)),
+        type: 'scatter',
+        mode: 'lines',
+        name: '有効落差特性',
+        line: { color: '#059669', width: 2.8 },
+        hovertemplate: 'Q: %{x:.2f} m³/h<br>H: %{y:.3f} m<extra></extra>',
+      }, {
+        x: flowRates,
+        y: flowRates.map(q => turbineShaftTorqueAtFlow(d, q, rho)),
+        yaxis: 'y2',
+        type: 'scatter',
+        mode: 'lines',
+        name: '軸トルク特性',
+        line: { color: '#f97316', width: 2.4, dash: 'dot' },
+        hovertemplate: 'Q: %{x:.2f} m³/h<br>T: %{y:.3f} N·m<extra></extra>',
+      }]
+      if (d.result) {
+        const resultTorque = d.result.shaft_torque_nm ?? turbineShaftTorqueAtFlow(d, d.result.Q_m3h, rho)
+        out.push({
+          x: [d.result.Q_m3h],
+          y: [d.result.head_m ?? turbineHeadAtFlow(d, d.result.Q_m3h)],
+          type: 'scatter',
+          mode: 'markers',
+          name: '動作点',
+          marker: { color: '#059669', size: 12, symbol: 'circle', line: { color: '#fff', width: 2 } },
+          hovertemplate: 'Q: %{x:.2f} m³/h<br>H: %{y:.3f} m<extra>動作点</extra>',
+        }, {
+          x: [d.result.Q_m3h],
+          y: [resultTorque],
+          yaxis: 'y2',
+          type: 'scatter',
+          mode: 'markers',
+          name: '動作トルク',
+          marker: { color: '#ea580c', size: 12, symbol: 'square', line: { color: '#fff', width: 2 } },
+          hovertemplate: 'Q: %{x:.2f} m³/h<br>T: %{y:.3f} N·m<extra>動作トルク</extra>',
         })
       }
       return out
@@ -2056,12 +2828,12 @@ function AnalysisPanel({ node, density, viscosity, pressureUnit, rho }: {
       })
     }
     return out
-  }, [chartData, d, isElbow, isHeatExchanger, isPump, isReducer, isValve, pressureUnit, rho])
+  }, [chartData, d, isElbow, isHeatExchanger, isMotor, isPump, isReducer, isTurbine, isValve, pressureUnit, rho])
 
-  if (!node || (!isPipe && !isPump && !isHeatExchanger && !isReducer && !isElbow && !isValve)) {
+  if (!node || (!isPipe && !isPump && !isTurbine && !isHeatExchanger && !isReducer && !isElbow && !isValve && !isMotor)) {
     return (
       <div className="flex items-center justify-center h-48">
-        <p className="text-sm text-gray-300">パイプ、ポンプ、熱交換器、拡縮管、エルボ、バルブを選択すると特性曲線を表示します</p>
+        <p className="text-sm text-gray-300">パイプ、ポンプ、タービン、熱交換器、拡縮管、エルボ、バルブ、モーターを選択すると特性曲線を表示します</p>
       </div>
     )
   }
@@ -2074,14 +2846,15 @@ function AnalysisPanel({ node, density, viscosity, pressureUnit, rho }: {
       {fetchErr && (
         <div className="text-sm text-red-500 py-2">{fetchErr}</div>
       )}
-      {(chartData || isPump || isHeatExchanger || isReducer || isElbow || isValve) && !fetching && (
+      {(chartData || isPump || isTurbine || isHeatExchanger || isReducer || isElbow || isValve || isMotor) && !fetching && (
         <Plot
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           data={traces as any}
           layout={{
-            title: { text: isPump ? '流量–揚程特性（PQ）' : isHeatExchanger ? '流量–圧損特性（熱交換器）' : isReducer ? '流量–圧損特性（拡縮管）' : isElbow ? '流量–圧損特性（エルボ）' : isValve ? '流量–圧損特性（バルブ）' : '流量–圧損特性（Darcy-Weisbach）', font: { size: 13 } },
-            xaxis: { title: { text: '流量 Q [m³/h]' }, showgrid: true, gridcolor: '#f1f5f9', zeroline: false },
-            yaxis: { title: { text: isPump ? '揚程 H [m]' : `ΔP [${pressureUnit}]` }, showgrid: true, gridcolor: '#f1f5f9', zeroline: false },
+            title: { text: isMotor ? '回転数–出力/トルク特性（誘導モーター）' : isPump ? '流量–揚程/トルク特性（ポンプ）' : isTurbine ? '流量–落差/トルク特性（タービン）' : isHeatExchanger ? '流量–圧損特性（熱交換器）' : isReducer ? '流量–圧損特性（拡縮管）' : isElbow ? '流量–圧損特性（エルボ）' : isValve ? '流量–圧損特性（バルブ）' : '流量–圧損特性（Darcy-Weisbach）', font: { size: 13 } },
+            xaxis: { title: { text: isMotor ? '回転数 N [rpm]' : '流量 Q [m³/h]' }, showgrid: true, gridcolor: '#f1f5f9', zeroline: false },
+            yaxis: { title: { text: isMotor ? '軸出力 Pout [kW]' : isPump ? '揚程 H [m]' : isTurbine ? '有効落差 H [m]' : `ΔP [${pressureUnit}]` }, showgrid: true, gridcolor: '#f1f5f9', zeroline: false },
+            ...(isMotor || isPump || isTurbine ? { yaxis2: { title: { text: 'トルク T [N·m]' }, overlaying: 'y' as const, side: 'right' as const, showgrid: false, zeroline: false } } : {}),
             annotations: pumpQMax !== null ? [{
               x: pumpQMax,
               y: 0,
@@ -2108,7 +2881,7 @@ function AnalysisPanel({ node, density, viscosity, pressureUnit, rho }: {
               font: { size: 13, color: '#9a3412' },
             }] : [],
             legend: { orientation: 'h' as const, y: -0.22, x: 0 },
-            margin: { l: 60, r: 24, t: 44, b: 70 },
+            margin: { l: 60, r: isMotor || isPump || isTurbine ? 62 : 24, t: 44, b: 70 },
             plot_bgcolor: '#f8fafc',
             paper_bgcolor: '#ffffff',
             autosize: true,
@@ -2160,7 +2933,7 @@ function buildSystemComponents(runHistory: CalcRun[], pressureUnit: PressureUnit
   const order: string[] = []
   for (const run of runHistory) {
     for (const n of run.nodes) {
-      const rows = componentResultRows(n.data, pressureUnit, rho)
+      const rows = componentResultRows(n.data, pressureUnit, n.data.rho ?? rho)
       if (!rows || rows.length === 0) continue
       if (!byId.has(n.id)) order.push(n.id)
       byId.set(n.id, { id: n.id, label: n.data.label, typeLabel: componentTypeLabel(n.data.nodeType), rows })
@@ -2199,7 +2972,7 @@ function SystemResultsTable({ components, runHistory, pressureUnit, rho, baselin
 }) {
   const cellValue = (run: CalcRun, componentId: string, symbol: string): string => {
     const nodeData = run.nodes.find(n => n.id === componentId)?.data
-    const rows = nodeData ? componentResultRows(nodeData, pressureUnit, rho) : null
+    const rows = nodeData ? componentResultRows(nodeData, pressureUnit, nodeData.rho ?? rho) : null
     const row = rows?.find(r => r.symbol === symbol)
     return row ? row.value : '—'
   }
@@ -2308,32 +3081,94 @@ function PipeNetworkCalcInner() {
 
   const [density,   setDensity]   = useState('1000')
   const [viscosity, setViscosity] = useState('1.0')
-  const rho = parseFloat(density) || 1000
+  const [fluidSystems, setFluidSystems] = useState<FluidSystem[]>(() => createDefaultFluidSystems())
+  const [selectedFluidSystemId, setSelectedFluidSystemId] = useState(DEFAULT_FLUID_SYSTEM_ID)
+  const selectedFluidSystem = fluidSystems.find(system => system.id === selectedFluidSystemId) ?? fluidSystems[0]
+  const rho = selectedFluidSystem?.density ?? (parseFloat(density) || 1000)
+  const selectedRho = selectedData ? fluidSystemForNode(selectedData, fluidSystems).density : rho
+  const powerSpeedResolution = useMemo(() => resolvePowerSpeeds(nodes, edges, fluidSystems), [nodes, edges, fluidSystems])
+
+  const updateFluidSystem = useCallback((id: string, updates: Partial<FluidSystem>) => {
+    setFluidSystems(prev => prev.map(system => system.id === id ? { ...system, ...updates } : system))
+  }, [])
+
+  const addFluidSystem = useCallback(() => {
+    setFluidSystems(prev => {
+      const index = prev.length + 1
+      const id = `fluid-${Date.now().toString(36)}`
+      const next: FluidSystem = {
+        id,
+        name: `流体系統${index}`,
+        fluid: 'Air',
+        propertyMode: 'constant',
+        density: 1.2,
+        viscosity: 0.000018,
+        specificHeat: 1005,
+        color: FLUID_SYSTEM_COLORS[prev.length % FLUID_SYSTEM_COLORS.length],
+      }
+      setSelectedFluidSystemId(id)
+      return [...prev, next]
+    })
+  }, [])
+
+  const removeFluidSystem = useCallback((id: string) => {
+    setFluidSystems(prev => {
+      if (prev.length <= 1) return prev
+      const fallback = prev.find(system => system.id !== id) ?? prev[0]
+      setSelectedFluidSystemId(current => current === id ? fallback.id : current)
+      setNodes(nodesPrev => nodesPrev.map(n => {
+        const d = n.data as unknown as NetworkNodeData
+        if ((d.fluidSystemId ?? prev[0].id) !== id) return n
+        return { ...n, data: { ...d, fluidSystemId: fallback.id } as NetworkNodeData }
+      }))
+      return prev.filter(system => system.id !== id)
+    })
+  }, [setNodes])
 
   const displayNodes = useMemo(() => {
-    const inConnected = new Set(edges.map(e => e.target))
-    const outConnected = new Set(edges.map(e => e.source))
-    return nodes.map(n => ({
-      ...n,
-      data: {
-        ...n.data,
+    const fluidEdges = edges.filter(e => ((e.data as FlowEdgeData | undefined)?.lineType ?? 'fluid') === 'fluid')
+    const inConnected = new Set(fluidEdges.map(e => e.target))
+    const outConnected = new Set(fluidEdges.map(e => e.source))
+    return nodes.map(n => {
+      const data = n.data as unknown as NetworkNodeData
+      const system = fluidSystemForNode(data, fluidSystems)
+      const resolvedSpeed = powerSpeedResolution.speeds.get(n.id)
+      const resolvedTorque = powerSpeedResolution.torques.get(n.id)
+      const solveMode = powerSpeedResolution.modes.get(n.id)
+      const displayData = ['pump', 'motor', 'turbine'].includes(data.nodeType)
+        ? {
+          ...data,
+          speed: resolvedSpeed ?? (data.nodeType === 'motor' ? motorRatedSpeed(data) : data.ratedSpeed ?? 1450),
+          ...(resolvedTorque !== undefined ? { shaftTorque: resolvedTorque } : {}),
+          ...(solveMode !== undefined ? { speedSolveMode: solveMode } : {}),
+        }
+        : data
+      return {
+        ...n,
+        data: {
+        ...displayData,
         portLeftConnected: inConnected.has(n.id),
         portRightConnected: outConnected.has(n.id),
         portInConnected: inConnected.has(n.id),
         portOutConnected: outConnected.has(n.id),
         showPressureResults,
         pressureUnit,
-        rho,
+        rho: system.density,
       },
-    }))
-  }, [nodes, edges, showPressureResults, pressureUnit, rho])
+      }
+    })
+  }, [nodes, edges, showPressureResults, pressureUnit, fluidSystems, powerSpeedResolution])
   const displayEdges = useMemo(() => edges.map(e => ({
     ...e,
     data: {
       ...((e.data as Record<string, unknown> | undefined) ?? {}),
       labelVisible: showLineResults,
+      fluidColor: ((e.data as FlowEdgeData | undefined)?.lineType ?? 'fluid') === 'fluid'
+        ? fluidColorForEdge(e, nodes, fluidSystems)
+        : undefined,
     },
-  })), [edges, showLineResults])
+  })), [edges, nodes, fluidSystems, showLineResults])
+  const selectedDisplayNode: Node | null = displayNodes.find(n => n.id === selectedId) ?? selectedNode
 
   const [loading,   setLoading]   = useState(false)
   const [error,     setError]     = useState<string | null>(null)
@@ -2408,8 +3243,13 @@ function PipeNetworkCalcInner() {
     setCoolError(null)
     try {
       const props = await fetchProperties(coolFluid, parseFloat(coolT), parseFloat(coolP) * 1000)
-      if (props.D != null) setDensity(props.D.toFixed(3))
-      if (props.V != null) setViscosity((props.V * 1000).toFixed(4))
+      if (selectedFluidSystem) {
+        updateFluidSystem(selectedFluidSystem.id, {
+          fluid: coolFluid,
+          ...(props.D != null ? { density: props.D } : {}),
+          ...(props.V != null ? { viscosity: props.V } : {}),
+        })
+      }
     } catch {
       setCoolError('物性値の取得に失敗しました')
     } finally {
@@ -2430,11 +3270,12 @@ function PipeNetworkCalcInner() {
     const pos = screenToFlowPosition({ x: e.clientX, y: e.clientY })
     nodeCounter.current += 1
     const id = `${type}-${nodeCounter.current}`
+    const data = defaultData(type, nodeCounter.current)
     setNodes(prev => [...prev, {
       id, type, position: pos,
-      data: defaultData(type, nodeCounter.current) as NetworkNodeData,
+      data: { ...data, ...(!['motor', 'speedBoundary'].includes(data.nodeType) ? { fluidSystemId: selectedFluidSystemId } : {}) } as NetworkNodeData,
     }])
-  }, [screenToFlowPosition, setNodes])
+  }, [screenToFlowPosition, selectedFluidSystemId, setNodes])
 
   const onDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault()
@@ -2443,10 +3284,16 @@ function PipeNetworkCalcInner() {
 
   // ── Connect ──────────────────────────────────────────────────
   const onConnect = useCallback((conn: Connection) => {
+    const lineType = connectionLineType(conn.sourceHandle, conn.targetHandle)
+    if (!lineType) {
+      setError('異なる種類のポートは接続できません。丸ポート同士、または四角ポート同士を接続してください。')
+      return
+    }
+    setError(null)
     setEdges(prev => addEdge({
       ...conn,
       type: 'flow',
-      style: { stroke: '#94a3b8', strokeWidth: 2 },
+      data: { lineType },
     }, prev))
   }, [setEdges])
 
@@ -2486,18 +3333,47 @@ function PipeNetworkCalcInner() {
     setError(null)
     setLoading(true)
     try {
+      if (powerSpeedResolution.errors.length > 0) {
+        throw new Error(powerSpeedResolution.errors.join('\n'))
+      }
       const res = await calcPipeNetwork({
         nodes: nodes.map(n => {
           const d = n.data as unknown as NetworkNodeData
-          return { id: n.id, node_type: d.nodeType, params: n.data as Record<string, unknown> }
+          const resolvedSpeed = powerSpeedResolution.speeds.get(n.id)
+          const resolvedTorque = powerSpeedResolution.torques.get(n.id)
+          const solveMode = powerSpeedResolution.modes.get(n.id)
+          return {
+            id: n.id,
+            node_type: d.nodeType,
+            params: {
+              ...(n.data as Record<string, unknown>),
+              ...(!['motor', 'speedBoundary'].includes(d.nodeType) ? { fluidSystemId: d.fluidSystemId ?? fluidSystems[0]?.id ?? DEFAULT_FLUID_SYSTEM_ID } : {}),
+              ...(['pump', 'motor', 'turbine'].includes(d.nodeType) ? {
+                speed: resolvedSpeed ?? (d.nodeType === 'motor' ? motorRatedSpeed(d) : d.ratedSpeed ?? 1450),
+                ...(resolvedTorque !== undefined ? { shaftTorque: resolvedTorque } : {}),
+                ...(solveMode !== undefined ? { speedSolveMode: solveMode } : {}),
+              } : {}),
+            },
+          }
         }),
         edges: edges.map(e => ({
           id: e.id, source: e.source, target: e.target,
           source_handle: e.sourceHandle ?? null,
           target_handle: e.targetHandle ?? null,
+          line_type: ((e.data as FlowEdgeData | undefined)?.lineType ?? 'fluid'),
         })),
         density:   parseFloat(density),
         viscosity: parseFloat(viscosity) / 1000,
+        fluidSystems: fluidSystems.map(system => ({
+          id: system.id,
+          name: system.name,
+          fluid: system.fluid,
+          propertyMode: system.propertyMode,
+          density: system.density,
+          viscosity: system.viscosity,
+          specificHeat: system.specificHeat,
+          color: system.color,
+        })),
       })
 
       const mergeResult = (d: NetworkNodeData, id: string): NetworkNodeData => {
@@ -2505,8 +3381,18 @@ function PipeNetworkCalcInner() {
         const srcPressure = res.source_pressures[id]
         const srcFlow     = res.source_flows[id]
         const srcTemp     = res.source_temperatures?.[id] ?? res.boundary_temperatures?.[id]
+        const system = fluidSystemForNode(d, fluidSystems)
+        const resolvedSpeed = powerSpeedResolution.speeds.get(id)
+        const resolvedTorque = powerSpeedResolution.torques.get(id)
+        const solveMode = powerSpeedResolution.modes.get(id)
         return {
           ...d,
+          rho: system.density,
+          ...(['pump', 'motor', 'turbine'].includes(d.nodeType) ? {
+            speed: resolvedSpeed ?? (d.nodeType === 'motor' ? motorRatedSpeed(d) : d.ratedSpeed ?? 1450),
+            ...(resolvedTorque !== undefined ? { shaftTorque: resolvedTorque } : {}),
+            ...(solveMode !== undefined ? { speedSolveMode: solveMode } : {}),
+          } : {}),
           ...(nodeResult  !== undefined ? { result: nodeResult }        : {}),
           ...(srcPressure !== undefined ? { calcPressure: srcPressure } : {}),
           ...(srcFlow     !== undefined ? { calcFlow: srcFlow }         : {}),
@@ -2532,11 +3418,12 @@ function PipeNetworkCalcInner() {
         return data?.label ?? id
       }
       const makeFlowLabel = (edge: Edge): string | undefined => {
+        if (((edge.data as FlowEdgeData | undefined)?.lineType ?? 'fluid') !== 'fluid') return undefined
         const sourceData = nodeById.get(edge.source)?.data as unknown as NetworkNodeData | undefined
         const targetData = nodeById.get(edge.target)?.data as unknown as NetworkNodeData | undefined
         const elementId =
-          sourceData?.nodeType === 'pipe' || sourceData?.nodeType === 'pump' || sourceData?.nodeType === 'heatExchanger' || sourceData?.nodeType === 'reducer' || sourceData?.nodeType === 'elbow' || sourceData?.nodeType === 'valve' ? edge.source
-          : targetData?.nodeType === 'pipe' || targetData?.nodeType === 'pump' || targetData?.nodeType === 'heatExchanger' || targetData?.nodeType === 'reducer' || targetData?.nodeType === 'elbow' || targetData?.nodeType === 'valve' ? edge.target
+          sourceData?.nodeType === 'pipe' || sourceData?.nodeType === 'pump' || sourceData?.nodeType === 'turbine' || sourceData?.nodeType === 'heatExchanger' || sourceData?.nodeType === 'reducer' || sourceData?.nodeType === 'elbow' || sourceData?.nodeType === 'valve' ? edge.source
+          : targetData?.nodeType === 'pipe' || targetData?.nodeType === 'pump' || targetData?.nodeType === 'turbine' || targetData?.nodeType === 'heatExchanger' || targetData?.nodeType === 'reducer' || targetData?.nodeType === 'elbow' || targetData?.nodeType === 'valve' ? edge.target
           : null
         if (!elementId) return undefined
 
@@ -2575,6 +3462,54 @@ function PipeNetworkCalcInner() {
           <span className="text-sm font-semibold text-gray-700 shrink-0">流体設定</span>
           <div className="w-px h-5 bg-gray-200 shrink-0" />
 
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-xs font-medium text-gray-500 shrink-0">系統</span>
+            <select
+              value={selectedFluidSystem?.id ?? ''}
+              onChange={e => setSelectedFluidSystemId(e.target.value)}
+              className="border border-gray-300 rounded-md px-2 py-1.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+            >
+              {fluidSystems.map(system => (
+                <option key={system.id} value={system.id}>{system.name}</option>
+              ))}
+            </select>
+            <button
+              type="button"
+              onClick={addFluidSystem}
+              className="rounded-md border border-blue-200 bg-blue-50 px-2.5 py-1.5 text-sm font-medium text-blue-700 hover:bg-blue-100"
+            >
+              追加
+            </button>
+            <button
+              type="button"
+              onClick={() => selectedFluidSystem && removeFluidSystem(selectedFluidSystem.id)}
+              disabled={fluidSystems.length <= 1}
+              className="rounded-md border border-gray-200 bg-white px-2.5 py-1.5 text-sm font-medium text-gray-600 hover:bg-gray-50 disabled:opacity-40"
+            >
+              削除
+            </button>
+          </div>
+
+          {selectedFluidSystem && (
+            <>
+              <input
+                type="text"
+                value={selectedFluidSystem.name}
+                onChange={e => updateFluidSystem(selectedFluidSystem.id, { name: e.target.value })}
+                className="w-28 border border-gray-300 rounded-md px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+              <input
+                type="color"
+                value={selectedFluidSystem.color}
+                onChange={e => updateFluidSystem(selectedFluidSystem.id, { color: e.target.value })}
+                className="h-8 w-9 rounded border border-gray-300 bg-white p-1"
+                title="系統色"
+              />
+            </>
+          )}
+
+          <div className="w-px h-5 bg-gray-200 shrink-0" />
+
           {/* CoolProp lookup */}
           <div className="flex items-center gap-2 flex-wrap">
             <span className="text-xs font-medium text-gray-500 shrink-0">CoolProp</span>
@@ -2600,8 +3535,35 @@ function PipeNetworkCalcInner() {
           <div className="w-px h-5 bg-gray-200 shrink-0" />
 
           {/* Manual props (filled from CoolProp or manually) */}
-          <InlineField label="密度 ρ"  unit="kg/m³" value={density}   onChange={setDensity}   width="w-24" />
-          <InlineField label="粘度 μ"  unit="mPa·s" value={viscosity} onChange={setViscosity} width="w-20" />
+          <InlineField
+            label="密度 ρ"
+            unit="kg/m³"
+            value={selectedFluidSystem ? selectedFluidSystem.density.toString() : density}
+            onChange={value => {
+              setDensity(value)
+              if (selectedFluidSystem) updateFluidSystem(selectedFluidSystem.id, { density: Number(value) || 0 })
+            }}
+            width="w-24"
+          />
+          <InlineField
+            label="粘度 μ"
+            unit="mPa·s"
+            value={selectedFluidSystem ? (selectedFluidSystem.viscosity * 1000).toString() : viscosity}
+            onChange={value => {
+              setViscosity(value)
+              if (selectedFluidSystem) updateFluidSystem(selectedFluidSystem.id, { viscosity: (Number(value) || 0) / 1000 })
+            }}
+            width="w-20"
+          />
+          {selectedFluidSystem && (
+            <InlineField
+              label="比熱 Cp"
+              unit="J/kg/K"
+              value={selectedFluidSystem.specificHeat.toString()}
+              onChange={value => updateFluidSystem(selectedFluidSystem.id, { specificHeat: Number(value) || 0 })}
+              width="w-24"
+            />
+          )}
 
           <div className="w-px h-5 bg-gray-200 shrink-0" />
 
@@ -2752,10 +3714,11 @@ function PipeNetworkCalcInner() {
             <h3 className="text-sm font-semibold text-gray-600 mb-4 pb-3 border-b border-gray-100">
               パラメータ設定
             </h3>
-            {selectedNode ? (
+            {selectedDisplayNode ? (
               <NodeParamPanel
-                node={selectedNode}
-                onChange={u => updateNode(selectedNode.id, u)}
+                node={selectedDisplayNode}
+                onChange={u => updateNode(selectedDisplayNode.id, u)}
+                fluidSystems={fluidSystems}
               />
             ) : (
               <div className="flex flex-col items-center justify-center h-48 text-center gap-2">
@@ -2774,9 +3737,9 @@ function PipeNetworkCalcInner() {
               結果表示
             </h3>
             <ResultsPanel
-              node={selectedNode}
+              node={selectedDisplayNode}
               pressureUnit={pressureUnit}
-              rho={rho}
+              rho={selectedRho}
               onToggleResultSymbol={updateResultSymbolSelection}
             />
           </div>
@@ -2788,11 +3751,11 @@ function PipeNetworkCalcInner() {
             コンポーネント特性
           </h3>
           <AnalysisPanel
-            node={selectedNode}
-            density={density}
-            viscosity={viscosity}
+            node={selectedDisplayNode}
+            density={selectedRho.toString()}
+            viscosity={(selectedData ? fluidSystemForNode(selectedData, fluidSystems).viscosity * 1000 : Number(viscosity)).toString()}
             pressureUnit={pressureUnit}
-            rho={rho}
+            rho={selectedRho}
           />
         </div>
 

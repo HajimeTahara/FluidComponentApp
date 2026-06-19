@@ -2,7 +2,7 @@ from collections import defaultdict
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Any
 import CoolProp.CoolProp as CP
 import numpy as np
@@ -10,6 +10,7 @@ import pandas as pd
 from scipy.integrate import solve_ivp
 from scipy.optimize import brentq, least_squares
 import io
+import math
 
 app = FastAPI(title="Fluid Properties API", version="0.1.0")
 
@@ -581,6 +582,17 @@ class PipeNetworkEdge(BaseModel):
     target: str
     source_handle: str | None = None
     target_handle: str | None = None
+    line_type: str = "fluid"
+
+class PipeNetworkFluidSystem(BaseModel):
+    id: str
+    name: str = ""
+    fluid: str = "Water"
+    propertyMode: str = "constant"
+    density: float = 1000.0
+    viscosity: float = 0.001
+    specificHeat: float = 4184.0
+    color: str | None = None
 
 class PipeNetworkRequest(BaseModel):
     nodes: list[PipeNetworkNode]
@@ -588,6 +600,7 @@ class PipeNetworkRequest(BaseModel):
     density: float = 1000.0
     viscosity: float = 0.001
     friction_method: str = "colebrook"
+    fluidSystems: list[PipeNetworkFluidSystem] = Field(default_factory=list)
 
 
 def _calc_pipe_segment(params: dict, Q_m3s: float, rho: float, mu: float, method: str) -> dict:
@@ -670,19 +683,10 @@ def _path_total_backpressure(
         if not node:
             break
 
-        if node.node_type in ("pipe", "heatExchanger", "reducer", "elbow", "valve"):
-            if node.node_type == "heatExchanger":
-                seg = {"dP_kpa": _heat_exchanger_pressure_drop_kpa(node.params, Q_m3s)}
-            elif node.node_type == "reducer":
-                seg = {"dP_kpa": _reducer_pressure_drop_kpa(node.params, Q_m3s, rho)}
-            elif node.node_type == "elbow":
-                seg = {"dP_kpa": _elbow_pressure_drop_kpa(node.params, Q_m3s, rho)}
-            elif node.node_type == "valve":
-                seg = {"dP_kpa": _valve_pressure_drop_kpa(node.params, Q_m3s, rho)}
-            else:
-                seg = _calc_pipe_segment(node.params, Q_m3s, rho, mu, method)
+        if node.node_type in TWO_PORT_NODE_TYPES and node.node_type != "pump":
+            dP_kpa = _component_pressure_delta_kpa(node.node_type, node.params, Q_m3s, rho, mu, method)
             # dP_kpa は常に正。Q の符号で「正方向に圧力が落ちる」か「上がる」かを決める
-            total += seg["dP_kpa"] if Q_m3s >= 0 else -seg["dP_kpa"]
+            total += dP_kpa if Q_m3s >= 0 else -dP_kpa
         elif node.node_type == "sink" or node.node_type == "boundary":
             # boundaryType='pressure' または旧 sinkType='pressure' の場合に背圧を加算
             btype = node.params.get("boundaryType", node.params.get("sinkType", "pressure"))
@@ -735,9 +739,42 @@ def _boundary_type(node_params: dict) -> str:
 
 
 BOUNDARY_NODE_TYPES = {"source", "sink", "boundary"}
-TWO_PORT_NODE_TYPES = {"pipe", "pump", "heatExchanger", "reducer", "elbow", "valve"}
+TWO_PORT_NODE_TYPES = {"pipe", "pump", "turbine", "heatExchanger", "reducer", "elbow", "valve"}
 DEFAULT_TEMPERATURE_K = 293.15
 DEFAULT_SPECIFIC_HEAT_J_KG_K = 4184.0
+DEFAULT_FLUID_SYSTEM_ID = "default"
+
+
+def _fluid_system_map(req: PipeNetworkRequest) -> dict[str, dict[str, Any]]:
+    systems: dict[str, dict[str, Any]] = {}
+    for fs in req.fluidSystems:
+        systems[fs.id] = {
+            "id": fs.id,
+            "name": fs.name or fs.id,
+            "fluid": fs.fluid,
+            "propertyMode": fs.propertyMode,
+            "density": float(fs.density),
+            "viscosity": float(fs.viscosity),
+            "specificHeat": float(fs.specificHeat),
+            "color": fs.color,
+        }
+    if not systems:
+        systems[DEFAULT_FLUID_SYSTEM_ID] = {
+            "id": DEFAULT_FLUID_SYSTEM_ID,
+            "name": "Default",
+            "fluid": "Water",
+            "propertyMode": "constant",
+            "density": float(req.density),
+            "viscosity": float(req.viscosity),
+            "specificHeat": DEFAULT_SPECIFIC_HEAT_J_KG_K,
+            "color": None,
+        }
+    return systems
+
+
+def _node_fluid_system_id(node: PipeNetworkNode, default_id: str = DEFAULT_FLUID_SYSTEM_ID) -> str:
+    value = node.params.get("fluidSystemId", default_id)
+    return str(value) if value else default_id
 
 
 def _node_temperature_k(node: PipeNetworkNode | None) -> float:
@@ -752,12 +789,18 @@ def _round_temperature(value: float | None) -> float | None:
     return round(float(value), 3)
 
 
-def _heat_exchange_state(params: dict, q_m3s: float, rho: float, t_in_k: float) -> dict[str, float]:
+def _heat_exchange_state(
+    params: dict,
+    q_m3s: float,
+    rho: float,
+    t_in_k: float,
+    default_cp: float = DEFAULT_SPECIFIC_HEAT_J_KG_K,
+) -> dict[str, float]:
     q_abs = abs(q_m3s)
     exchange_temp = float(params.get("exchangeTemperature", DEFAULT_TEMPERATURE_K))
     u_value = max(float(params.get("heatTransferCoeff", 500.0)), 0.0)
     area = max(float(params.get("heatTransferArea", 10.0)), 0.0)
-    cp = max(float(params.get("specificHeat", DEFAULT_SPECIFIC_HEAT_J_KG_K)), 1e-9)
+    cp = max(float(params.get("specificHeat", default_cp)), 1e-9)
     ua_w_k = u_value * area
     mdot = rho * q_abs
 
@@ -1062,6 +1105,10 @@ def _calc_pump_segment(params: dict, q_m3s: float, rho: float) -> dict:
     hydraulic_power_kw = boost_kpa * q_m3s
     efficiency = max(float(params.get("efficiency", 70.0)), 1e-9) / 100.0
     shaft_power_kw = hydraulic_power_kw / efficiency
+    rated_speed = max(float(params.get("ratedSpeed", 1450.0)), 1e-9)
+    speed_rpm = max(float(params.get("speed", rated_speed)), 0.0)
+    omega = 2.0 * math.pi * speed_rpm / 60.0
+    shaft_torque_nm = shaft_power_kw * 1000.0 / omega if omega > 1e-12 else 0.0
     return {
         "Q_m3h": round(q_m3h, 4),
         "v": 0.0,
@@ -1072,7 +1119,52 @@ def _calc_pump_segment(params: dict, q_m3s: float, rho: float) -> dict:
         "head_m": round(head_m, 4),
         "hydraulic_power_kw": round(hydraulic_power_kw, 6),
         "shaft_power_kw": round(shaft_power_kw, 6),
+        "speed_rpm": round(speed_rpm, 6),
+        "shaft_torque_nm": round(shaft_torque_nm, 6),
         "regime": "pump",
+    }
+
+
+def _turbine_head_m(params: dict, q_m3s: float) -> float:
+    q_rated_m3s = max(float(params.get("ratedFlow", 30.0)) / 3600.0, 1e-12)
+    h_rated = max(float(params.get("ratedHead", 20.0)), 0.0)
+    return h_rated * (abs(q_m3s) / q_rated_m3s) ** 2
+
+
+def _turbine_pressure_drop_kpa(params: dict, q_m3s: float, rho: float) -> float:
+    return rho * 9.80665 * _turbine_head_m(params, q_m3s) / 1000.0
+
+
+def _turbine_flow_for_pressure_drop(params: dict, dp_kpa: float, rho: float) -> float:
+    h_rated = max(float(params.get("ratedHead", 20.0)), 1e-12)
+    q_rated_m3s = max(float(params.get("ratedFlow", 30.0)) / 3600.0, 0.0)
+    target_head = max(dp_kpa, 0.0) * 1000.0 / max(rho * 9.80665, 1e-12)
+    return q_rated_m3s * (target_head / h_rated) ** 0.5
+
+
+def _calc_turbine_segment(params: dict, q_m3s: float, rho: float) -> dict:
+    q_abs = abs(q_m3s)
+    head_m = _turbine_head_m(params, q_m3s)
+    dP_kpa = _turbine_pressure_drop_kpa(params, q_m3s, rho)
+    extracted_power_kw = dP_kpa * q_abs
+    efficiency = max(float(params.get("efficiency", 85.0)), 0.0) / 100.0
+    output_power_kw = extracted_power_kw * efficiency
+    rated_speed = max(float(params.get("ratedSpeed", 1450.0)), 1e-9)
+    speed_rpm = max(float(params.get("speed", rated_speed)), 0.0)
+    omega = 2.0 * math.pi * speed_rpm / 60.0
+    shaft_torque_nm = output_power_kw * 1000.0 / omega if omega > 1e-12 else 0.0
+    return {
+        "Q_m3h": round(q_m3s * 3600.0, 4),
+        "v": 0.0,
+        "Re": 0.0,
+        "f": 0.0,
+        "dP_kpa": round(dP_kpa, 6),
+        "head_m": round(head_m, 6),
+        "extracted_power_kw": round(extracted_power_kw, 6),
+        "output_power_kw": round(output_power_kw, 6),
+        "speed_rpm": round(speed_rpm, 6),
+        "shaft_torque_nm": round(shaft_torque_nm, 6),
+        "regime": "turbine",
     }
 
 
@@ -1160,6 +1252,54 @@ def _calc_valve_segment(params: dict, q_m3s: float, rho: float) -> dict:
     }
 
 
+def _component_pressure_delta_kpa(kind: str, params: dict, q_m3s: float, rho: float, mu: float, method: str) -> float:
+    if kind == "pump":
+        return -_pump_boost_kpa(params, abs(q_m3s) * 3600.0, rho)
+    if kind == "turbine":
+        return _turbine_pressure_drop_kpa(params, q_m3s, rho)
+    if kind == "heatExchanger":
+        return _heat_exchanger_pressure_drop_kpa(params, q_m3s)
+    if kind == "reducer":
+        return _reducer_pressure_drop_kpa(params, q_m3s, rho)
+    if kind == "elbow":
+        return _elbow_pressure_drop_kpa(params, q_m3s, rho)
+    if kind == "valve":
+        return _valve_pressure_drop_kpa(params, q_m3s, rho)
+    return _calc_pipe_segment(params, q_m3s, rho, mu, method)["dP_kpa"]
+
+
+def _component_flow_for_pressure_delta(kind: str, params: dict, dp_kpa: float, rho: float, mu: float, method: str) -> float:
+    if kind == "pump":
+        return _pump_flow_for_required_boost(params, dp_kpa, rho)
+    if kind == "turbine":
+        return _turbine_flow_for_pressure_drop(params, abs(dp_kpa), rho)
+    if kind == "heatExchanger":
+        return _heat_exchanger_flow_for_pressure_drop(params, abs(dp_kpa))
+    if kind == "reducer":
+        return _reducer_flow_for_pressure_drop(params, abs(dp_kpa), rho)
+    if kind == "elbow":
+        return _elbow_flow_for_pressure_drop(params, abs(dp_kpa), rho)
+    if kind == "valve":
+        return _valve_flow_for_pressure_drop(params, abs(dp_kpa), rho)
+    return _pipe_flow_for_pressure_drop(params, abs(dp_kpa), rho, mu, method)
+
+
+def _component_result(kind: str, params: dict, q_m3s: float, rho: float, mu: float, method: str) -> dict:
+    if kind == "pump":
+        return _calc_pump_segment(params, q_m3s, rho)
+    if kind == "turbine":
+        return _calc_turbine_segment(params, q_m3s, rho)
+    if kind == "heatExchanger":
+        return _calc_heat_exchanger_segment(params, q_m3s, rho, mu, method)
+    if kind == "reducer":
+        return _calc_reducer_segment(params, q_m3s, rho)
+    if kind == "elbow":
+        return _calc_elbow_segment(params, q_m3s, rho)
+    if kind == "valve":
+        return _calc_valve_segment(params, q_m3s, rho)
+    return _calc_pipe_segment(params, q_m3s, rho, mu, method)
+
+
 def _apply_boundary_temperatures(
     req: PipeNetworkRequest,
     nodes_dict: dict[str, PipeNetworkNode],
@@ -1167,6 +1307,7 @@ def _apply_boundary_temperatures(
     links: list[dict[str, Any]],
     link_flows: dict[str, float],
     results: dict[str, Any],
+    fluid: dict[str, Any] | None = None,
 ) -> tuple[dict[str, float], dict[str, float]]:
     """Attach isothermal temperatures to network results based on upstream flow direction."""
     point_temps: dict[str, float] = {}
@@ -1207,7 +1348,13 @@ def _apply_boundary_temperatures(
                 continue
             seg = results.get(link["id"], {})
             if link["kind"] == "heatExchanger":
-                heat = _heat_exchange_state(link["params"], q, req.density, t_up)
+                heat = _heat_exchange_state(
+                    link["params"],
+                    q,
+                    float((fluid or {}).get("density", req.density)),
+                    t_up,
+                    float((fluid or {}).get("specificHeat", DEFAULT_SPECIFIC_HEAT_J_KG_K)),
+                )
                 seg.update(heat)
                 t_down = heat["T_out_K"]
             else:
@@ -1250,9 +1397,11 @@ def _solve_boundary_network(
     nodes_dict: dict[str, PipeNetworkNode],
     outgoing: dict[str, list[tuple[str, str | None]]],
     incoming: dict[str, list[tuple[str, str | None]]],
+    fluid: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """圧力固定・流量固定の境界条件を節点圧から解く。"""
-    rho, mu = req.density, req.viscosity
+    rho = float((fluid or {}).get("density", req.density))
+    mu = float((fluid or {}).get("viscosity", req.viscosity))
 
     parent: dict[str, str] = {}
 
@@ -1283,7 +1432,7 @@ def _solve_boundary_network(
         elif n.node_type in BOUNDARY_NODE_TYPES or n.node_type == "tee":
             add_point(n.id)
 
-    for e in req.edges:
+    for e in (edge for edge in req.edges if edge.line_type == "fluid"):
         union(node_point(e.source, outgoing_side=True), node_point(e.target, outgoing_side=False))
 
     fixed_p: dict[str, float] = {}
@@ -1317,6 +1466,8 @@ def _solve_boundary_network(
 
     links: list[dict[str, Any]] = []
     for elem in (n for n in req.nodes if n.node_type in TWO_PORT_NODE_TYPES):
+        if not outgoing.get(elem.id) and not incoming.get(elem.id):
+            continue
         a = find(f"{elem.id}:in")
         b = find(f"{elem.id}:out")
         if a == b:
@@ -1337,19 +1488,10 @@ def _solve_boundary_network(
     def signed_link_flow(link: dict[str, Any], p: dict[str, float]) -> float:
         if link["kind"] == "pump":
             required_boost = p[link["b"]] - p[link["a"]]
-            return _pump_flow_for_required_boost(link["params"], required_boost, rho)
+            return _component_flow_for_pressure_delta(link["kind"], link["params"], required_boost, rho, mu, req.friction_method)
 
         dp = p[link["a"]] - p[link["b"]]
-        if link["kind"] == "heatExchanger":
-            q_abs = _heat_exchanger_flow_for_pressure_drop(link["params"], abs(dp))
-        elif link["kind"] == "reducer":
-            q_abs = _reducer_flow_for_pressure_drop(link["params"], abs(dp), rho)
-        elif link["kind"] == "elbow":
-            q_abs = _elbow_flow_for_pressure_drop(link["params"], abs(dp), rho)
-        elif link["kind"] == "valve":
-            q_abs = _valve_flow_for_pressure_drop(link["params"], abs(dp), rho)
-        else:
-            q_abs = _pipe_flow_for_pressure_drop(link["params"], abs(dp), rho, mu, req.friction_method)
+        q_abs = _component_flow_for_pressure_delta(link["kind"], link["params"], abs(dp), rho, mu, req.friction_method)
         return q_abs if dp >= 0 else -q_abs
 
     def residual(x: np.ndarray) -> np.ndarray:
@@ -1395,22 +1537,10 @@ def _solve_boundary_network(
             p_next = fixed_p[end_id]
             for from_id, to_id, link in reversed(found_path):
                 if link["kind"] == "pump":
-                    boost_est = _pump_boost_kpa(link["params"], abs(q) * 3600.0, rho)
+                    boost_est = -_component_pressure_delta_kpa(link["kind"], link["params"], q, rho, mu, req.friction_method)
                     p_from = p_next - boost_est
-                elif link["kind"] == "heatExchanger":
-                    dp_est = _heat_exchanger_pressure_drop_kpa(link["params"], q)
-                    p_from = p_next + (dp_est if q > 0 else -dp_est)
-                elif link["kind"] == "reducer":
-                    dp_est = _reducer_pressure_drop_kpa(link["params"], q, rho)
-                    p_from = p_next + (dp_est if q > 0 else -dp_est)
-                elif link["kind"] == "elbow":
-                    dp_est = _elbow_pressure_drop_kpa(link["params"], q, rho)
-                    p_from = p_next + (dp_est if q > 0 else -dp_est)
-                elif link["kind"] == "valve":
-                    dp_est = _valve_pressure_drop_kpa(link["params"], q, rho)
-                    p_from = p_next + (dp_est if q > 0 else -dp_est)
                 else:
-                    dp_est = _calc_pipe_segment(link["params"], abs(q), rho, mu, req.friction_method)["dP_kpa"]
+                    dp_est = _component_pressure_delta_kpa(link["kind"], link["params"], q, rho, mu, req.friction_method)
                     p_from = p_next + (dp_est if q > 0 else -dp_est)
                 initial_p.setdefault(from_id, p_from)
                 p_next = p_from
@@ -1430,16 +1560,7 @@ def _solve_boundary_network(
                 return mean_p - dp_est if adjacent["a"] == nid else mean_p + dp_est
             if abs(q) < 1e-12:
                 return mean_p
-            if adjacent["kind"] == "heatExchanger":
-                dp_est = _heat_exchanger_pressure_drop_kpa(adjacent["params"], q)
-            elif adjacent["kind"] == "reducer":
-                dp_est = _reducer_pressure_drop_kpa(adjacent["params"], q, rho)
-            elif adjacent["kind"] == "elbow":
-                dp_est = _elbow_pressure_drop_kpa(adjacent["params"], q, rho)
-            elif adjacent["kind"] == "valve":
-                dp_est = _valve_pressure_drop_kpa(adjacent["params"], q, rho)
-            else:
-                dp_est = _calc_pipe_segment(adjacent["params"], abs(q), rho, mu, req.friction_method)["dP_kpa"]
+            dp_est = _component_pressure_delta_kpa(adjacent["kind"], adjacent["params"], q, rho, mu, req.friction_method)
             return mean_p + (dp_est if q > 0 else -dp_est)
 
         x0 = np.array([initial_pressure(nid) for nid in unknown_ids], dtype=float)
@@ -1459,18 +1580,7 @@ def _solve_boundary_network(
         p_b = pressures[link["b"]]
         q = signed_link_flow(link, pressures)
         link_flows[link["id"]] = q
-        if link["kind"] == "pump":
-            seg = _calc_pump_segment(link["params"], q, rho)
-        elif link["kind"] == "heatExchanger":
-            seg = _calc_heat_exchanger_segment(link["params"], q, rho, mu, req.friction_method)
-        elif link["kind"] == "reducer":
-            seg = _calc_reducer_segment(link["params"], q, rho)
-        elif link["kind"] == "elbow":
-            seg = _calc_elbow_segment(link["params"], q, rho)
-        elif link["kind"] == "valve":
-            seg = _calc_valve_segment(link["params"], q, rho)
-        else:
-            seg = _calc_pipe_segment(link["params"], q, rho, mu, req.friction_method)
+        seg = _component_result(link["kind"], link["params"], q, rho, mu, req.friction_method)
         seg.update({
             "P_from_kpa": round(p_a, 4),
             "P_to_kpa": round(p_b, 4),
@@ -1528,7 +1638,7 @@ def _solve_boundary_network(
         if n.node_type in BOUNDARY_NODE_TYPES or n.node_type == "tee"
     }
     source_temperatures, boundary_temperatures = _apply_boundary_temperatures(
-        req, nodes_dict, point_for_node, links, link_flows, results
+        req, nodes_dict, point_for_node, links, link_flows, results, fluid
     )
 
     return {
@@ -1540,6 +1650,61 @@ def _solve_boundary_network(
     }
 
 
+def _solve_multi_fluid_network(req: PipeNetworkRequest) -> dict[str, Any]:
+    systems = _fluid_system_map(req)
+    default_id = next(iter(systems))
+    node_system = {
+        n.id: _node_fluid_system_id(n, default_id)
+        for n in req.nodes
+    }
+
+    combined = {
+        "nodes": {},
+        "source_pressures": {},
+        "source_flows": {},
+        "source_temperatures": {},
+        "boundary_temperatures": {},
+        "fluid_systems": systems,
+    }
+
+    for fs_id, fluid in systems.items():
+        sub_node_ids = {nid for nid, nid_fs in node_system.items() if nid_fs == fs_id}
+        sub_nodes = []
+        for n in req.nodes:
+            if n.id not in sub_node_ids:
+                continue
+            params = dict(n.params)
+            params.setdefault("specificHeat", float(fluid["specificHeat"]))
+            sub_nodes.append(PipeNetworkNode(id=n.id, node_type=n.node_type, params=params))
+        sub_edges = [
+            e for e in req.edges
+            if e.line_type == "fluid" and e.source in sub_node_ids and e.target in sub_node_ids
+        ]
+
+        has_boundary = any(n.node_type in BOUNDARY_NODE_TYPES for n in sub_nodes)
+        has_two_port = any(n.node_type in TWO_PORT_NODE_TYPES for n in sub_nodes)
+        if not sub_nodes or not sub_edges or not has_boundary or not has_two_port:
+            continue
+
+        sub_req = PipeNetworkRequest(
+            nodes=sub_nodes,
+            edges=sub_edges,
+            density=float(fluid["density"]),
+            viscosity=float(fluid["viscosity"]),
+            friction_method=req.friction_method,
+        )
+        try:
+            sub_result = calc_pipe_network(sub_req)
+        except HTTPException as exc:
+            name = fluid.get("name") or fs_id
+            raise HTTPException(status_code=exc.status_code, detail=f"{name}: {exc.detail}") from exc
+
+        for key in ("nodes", "source_pressures", "source_flows", "source_temperatures", "boundary_temperatures"):
+            combined[key].update(sub_result.get(key, {}))
+
+    return combined
+
+
 @app.post("/pipe-network")
 def calc_pipe_network(req: PipeNetworkRequest):
     """パイプネットワーク圧損計算。
@@ -1549,10 +1714,13 @@ def calc_pipe_network(req: PipeNetworkRequest):
     逆流: Q が負になることで表現。ΔP は常に正（エネルギー散逸の大きさ）。
     マージノード: 複数入力が揃ってから処理するトポロジカル BFS。
     """
+    if req.fluidSystems:
+        return _solve_multi_fluid_network(req)
+
     nodes_dict = {n.id: n for n in req.nodes}
     outgoing: dict[str, list[tuple[str, str | None]]] = defaultdict(list)
     incoming: dict[str, list[tuple[str, str | None]]] = defaultdict(list)
-    for e in req.edges:
+    for e in (edge for edge in req.edges if edge.line_type == "fluid"):
         outgoing[e.source].append((e.target, e.source_handle))
         incoming[e.target].append((e.source, e.target_handle))
 
@@ -1566,7 +1734,7 @@ def calc_pipe_network(req: PipeNetworkRequest):
 
     # マージノード検出
     global_in_deg: dict[str, int] = defaultdict(int)
-    for e in req.edges:
+    for e in (edge for edge in req.edges if edge.line_type == "fluid"):
         global_in_deg[e.target] += 1
 
     rho, mu = req.density, req.viscosity
@@ -1680,26 +1848,13 @@ def calc_pipe_network(req: PipeNetworkRequest):
             # ── 2ポート要素 ─────────────────────────────────────────────
             next_cum_dp = cum_dp
             T_out = T_in
-            if node.node_type in ("pipe", "heatExchanger", "reducer", "elbow", "valve"):
+            if node.node_type in ("pipe", "turbine", "heatExchanger", "reducer", "elbow", "valve"):
+                seg = _component_result(node.node_type, node.params, Q, rho, mu, req.friction_method)
                 if node.node_type == "heatExchanger":
-                    seg = _calc_heat_exchanger_segment(node.params, Q, rho, mu, req.friction_method)
                     heat = _heat_exchange_state(node.params, Q, rho, T_in)
                     seg.update(heat)
                     T_out = heat["T_out_K"]
-                elif node.node_type == "reducer":
-                    seg = _calc_reducer_segment(node.params, Q, rho)
-                    seg["T_in_K"] = _round_temperature(T_in)
-                    seg["T_out_K"] = _round_temperature(T_in)
-                elif node.node_type == "elbow":
-                    seg = _calc_elbow_segment(node.params, Q, rho)
-                    seg["T_in_K"] = _round_temperature(T_in)
-                    seg["T_out_K"] = _round_temperature(T_in)
-                elif node.node_type == "valve":
-                    seg = _calc_valve_segment(node.params, Q, rho)
-                    seg["T_in_K"] = _round_temperature(T_in)
-                    seg["T_out_K"] = _round_temperature(T_in)
                 else:
-                    seg = _calc_pipe_segment(node.params, Q, rho, mu, req.friction_method)
                     seg["T_in_K"] = _round_temperature(T_in)
                     seg["T_out_K"] = _round_temperature(T_in)
                 seg["_cum_dp_in"] = round(cum_dp, 6)
@@ -1764,7 +1919,7 @@ def calc_pipe_network(req: PipeNetworkRequest):
         # ── 流量シンクの入口圧力を後処理で算出 ─────────────────────────
         P_src_kpa = source_pressures.get(src.id, 0.0)
         for nid, r in results.items():
-            if r.get("regime") in ("laminar", "transitional", "turbulent", "heatExchanger", "reducer", "elbow", "valve"):
+            if r.get("regime") in ("laminar", "transitional", "turbulent", "turbine", "heatExchanger", "reducer", "elbow", "valve"):
                 cd_in = r.pop("_cum_dp_in", None)
                 cd_out = r.pop("_cum_dp_out", None)
                 if cd_in is not None and cd_out is not None:
@@ -1818,3 +1973,124 @@ def download_saturation_csv(fluid: str):
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename={fluid}_saturation.csv"},
     )
+
+
+class LaunchRequest(BaseModel):
+    initial_mass: float = 500.0        # 機体全備質量 [kg]（推進剤含む）
+    propellant_mass: float = 300.0     # 推進剤質量 [kg]
+    thrust: float = 12000.0            # 推力 [N]（燃焼中一定）
+    burn_time: float = 20.0            # 燃焼時間 [s]
+    launch_angle: float = 90.0         # 発射角度（水平からの角度）[deg]、90=垂直
+    drag_enabled: bool = False
+    drag_coefficient: float = 0.5
+    cross_section_area: float = 0.3    # 機体投影面積 [m²]
+    duration: float = 300.0            # シミュレーション最大時間 [s]
+    dt: float = 0.1
+
+
+@app.post("/launch/simulate")
+def simulate_launch(req: LaunchRequest):
+    """機体質量・推力から弾道軌道を計算する（点質量・重力一定の簡易モデル）。
+    推力方向は発射角度に固定（姿勢変化・重力旋回は未対応）。
+    """
+    if req.initial_mass <= 0 or req.propellant_mass <= 0:
+        raise HTTPException(status_code=400, detail="機体質量・推進剤質量は正の値を入力してください")
+    if req.propellant_mass >= req.initial_mass:
+        raise HTTPException(status_code=400, detail="推進剤質量は機体全備質量より小さくしてください")
+    if req.thrust <= 0 or req.burn_time <= 0:
+        raise HTTPException(status_code=400, detail="推力・燃焼時間は正の値を入力してください")
+    if req.duration <= 0 or req.dt <= 0:
+        raise HTTPException(status_code=400, detail="シミュレーション時間・刻み幅は正の値を入力してください")
+
+    g0 = 9.80665
+    angle_rad = np.radians(req.launch_angle)
+    thrust_vertical = req.thrust * np.sin(angle_rad)
+    weight0 = req.initial_mass * g0
+    if thrust_vertical <= weight0:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"推力の鉛直成分（{thrust_vertical:.0f} N）が機体重量（{weight0:.0f} N）以下のため離床できません"
+            ),
+        )
+
+    mdot = req.propellant_mass / req.burn_time
+    rho0 = 1.225       # 海面大気密度 [kg/m³]
+    H_scale = 8500.0   # 大気スケール高度 [m]
+    Cd = req.drag_coefficient
+    A = req.cross_section_area
+
+    def ode(t: float, state: list[float]) -> list[float]:
+        x, y, vx, vy, m = state
+        burning = t < req.burn_time
+        Fx = req.thrust * np.cos(angle_rad) if burning else 0.0
+        Fy = req.thrust * np.sin(angle_rad) if burning else 0.0
+
+        drag_x = drag_y = 0.0
+        if req.drag_enabled:
+            speed = float(np.hypot(vx, vy))
+            if speed > 1e-9:
+                rho = rho0 * np.exp(-max(y, 0.0) / H_scale)
+                Fd = 0.5 * rho * Cd * A * speed ** 2
+                drag_x = -Fd * vx / speed
+                drag_y = -Fd * vy / speed
+
+        ax = (Fx + drag_x) / m
+        ay = (Fy + drag_y) / m - g0
+        dm = -mdot if burning else 0.0
+        return [vx, vy, ax, ay, dm]
+
+    def hit_ground(t: float, state: list[float]) -> float:
+        return state[1]
+    hit_ground.terminal = True
+    hit_ground.direction = -1
+
+    state0 = [0.0, 0.0, 0.0, 0.0, req.initial_mass]
+    t_eval = np.arange(0.0, req.duration + req.dt, req.dt)
+
+    try:
+        sol = solve_ivp(
+            ode, (0.0, req.duration), state0,
+            t_eval=t_eval, method="RK45", events=hit_ground,
+            max_step=req.dt, rtol=1e-6, atol=1e-9,
+        )
+    except Exception as ex:
+        raise HTTPException(status_code=500, detail=f"計算エラー: {ex}")
+
+    if not sol.success:
+        raise HTTPException(status_code=500, detail=f"ODE 未収束: {sol.message}")
+
+    x, y, vx, vy, m = sol.y
+    y = np.clip(y, 0.0, None)
+    speed = np.hypot(vx, vy)
+
+    landed = len(sol.t_events[0]) > 0
+    apogee_idx = int(np.argmax(y))
+    burnout_idx = min(int(np.searchsorted(sol.t, req.burn_time)), len(sol.t) - 1)
+
+    ve = req.thrust / mdot  # 有効排気速度 [m/s]
+    delta_v = ve * np.log(req.initial_mass / (req.initial_mass - req.propellant_mass))
+
+    # 浮動小数点誤差（例: 90°での cos が厳密に0でない）由来の極小値を丸めて除去
+    return {
+        "time": np.round(sol.t, 6).tolist(),
+        "x": np.round(x, 6).tolist(),
+        "altitude": np.round(y, 6).tolist(),
+        "vx": np.round(vx, 6).tolist(),
+        "vy": np.round(vy, 6).tolist(),
+        "speed": np.round(speed, 6).tolist(),
+        "mass": np.round(m, 6).tolist(),
+        "landed": landed,
+        "stats": {
+            "apogee_altitude_m": round(float(y[apogee_idx]), 2),
+            "apogee_time_s": round(float(sol.t[apogee_idx]), 2),
+            "burnout_altitude_m": round(float(y[burnout_idx]), 2),
+            "burnout_speed_ms": round(float(speed[burnout_idx]), 2),
+            "burnout_mass_kg": round(float(m[burnout_idx]), 2),
+            "max_speed_ms": round(float(np.max(speed)), 2),
+            "flight_time_s": round(float(sol.t[-1]), 2),
+            "downrange_m": round(float(x[-1]), 2),
+            "thrust_to_weight": round(float(req.thrust / weight0), 3),
+            "delta_v_ms": round(float(delta_v), 2),
+        },
+    }

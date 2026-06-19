@@ -164,12 +164,24 @@ export type PipeNetworkEdgePayload = {
   target: string
   source_handle: string | null
   target_handle: string | null
+  line_type?: 'fluid' | 'power'
+}
+export type PipeNetworkFluidSystemPayload = {
+  id: string
+  name: string
+  fluid: string
+  propertyMode: 'constant'
+  density: number
+  viscosity: number
+  specificHeat: number
+  color?: string | null
 }
 export type PipeNetworkPayload = {
   nodes: PipeNetworkNodePayload[]
   edges: PipeNetworkEdgePayload[]
   density: number
   viscosity: number
+  fluidSystems?: PipeNetworkFluidSystemPayload[]
   friction_method?: string  // global fallback; per-pipe frictionMethod in params takes precedence
 }
 export type PipeSegmentResult = {
@@ -182,6 +194,10 @@ export type PipeSegmentResult = {
   head_m?: number
   hydraulic_power_kw?: number
   shaft_power_kw?: number
+  speed_rpm?: number
+  shaft_torque_nm?: number
+  extracted_power_kw?: number
+  output_power_kw?: number
   heat_duty_kw?: number
   UA_w_per_k?: number
   exchange_temperature_K?: number
@@ -222,6 +238,7 @@ export type PipeNetworkResult = {
   source_flows: Record<string, number>      // boundary/source flow m³/h
   source_temperatures?: Record<string, number>  // boundary/source temperature K
   boundary_temperatures?: Record<string, number> // defined boundary temperatures K
+  fluid_systems?: Record<string, PipeNetworkFluidSystemPayload>
 }
 
 export async function calcPipeNetwork(payload: PipeNetworkPayload): Promise<PipeNetworkResult> {
@@ -233,6 +250,58 @@ export async function calcPipeNetwork(payload: PipeNetworkPayload): Promise<Pipe
   if (!res.ok) {
     const err = await res.json().catch(() => ({}))
     throw new Error((err as { detail?: string }).detail ?? 'ネットワーク圧損計算に失敗しました')
+  }
+  return res.json()
+}
+
+// ── Launch Trajectory ──────────────────────────────────────────────
+export type LaunchRequest = {
+  initial_mass: number
+  propellant_mass: number
+  thrust: number
+  burn_time: number
+  launch_angle: number
+  drag_enabled: boolean
+  drag_coefficient: number
+  cross_section_area: number
+  duration: number
+  dt: number
+}
+
+export type LaunchStats = {
+  apogee_altitude_m: number
+  apogee_time_s: number
+  burnout_altitude_m: number
+  burnout_speed_ms: number
+  burnout_mass_kg: number
+  max_speed_ms: number
+  flight_time_s: number
+  downrange_m: number
+  thrust_to_weight: number
+  delta_v_ms: number
+}
+
+export type LaunchResult = {
+  time: number[]
+  x: number[]
+  altitude: number[]
+  vx: number[]
+  vy: number[]
+  speed: number[]
+  mass: number[]
+  landed: boolean
+  stats: LaunchStats
+}
+
+export async function simulateLaunch(payload: LaunchRequest): Promise<LaunchResult> {
+  const res = await fetch(`${API_BASE}/launch/simulate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error((err as { detail?: string }).detail ?? '打ち上げ計算に失敗しました')
   }
   return res.json()
 }

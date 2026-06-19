@@ -8,14 +8,16 @@ import PropertiesLookup from './PropertiesLookup'
 import PIDDiagram from './PIDDiagram'
 import PipeNetworkCalc from './PipeNetworkCalc'
 import ComponentLibrary from './ComponentLibrary'
+import LaunchAnalysis from './LaunchAnalysis'
 
-type Tab = 'fluid-library' | 'component-library' | 'pid' | 'pressure-drop'
+type Tab = 'fluid-library' | 'component-library' | 'pid' | 'pressure-drop' | 'launch'
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'fluid-library', label: '流体ライブラリ' },
   { id: 'component-library', label: '部品管理' },
   { id: 'pid', label: '非定常解析' },
   { id: 'pressure-drop', label: '定常流れ解析' },
+  { id: 'launch', label: '打ち上げ解析' },
 ]
 
 export default function Dashboard() {
@@ -153,6 +155,7 @@ export default function Dashboard() {
               {tab === 'component-library' && <ComponentLibrary />}
               {tab === 'pid' && <PIDDiagram />}
               {tab === 'pressure-drop' && <PipeNetworkCalc />}
+              {tab === 'launch' && <LaunchAnalysis />}
             </>
           )}
         </main>
