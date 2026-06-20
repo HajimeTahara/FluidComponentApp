@@ -28,23 +28,31 @@ Write-Host ""
 # ── バックエンド ──────────────────────────────────────────────────
 Write-Host "--- バックエンド ---" -ForegroundColor Yellow
 
-$venvPath = "$Root\backend\.venv"
-if (Test-Path $venvPath) {
-    Write-Host "仮想環境は既に存在します: $venvPath" -ForegroundColor Gray
-} else {
-    Write-Host "Python 仮想環境を作成中..."
-    & $pythonCmd -m venv $venvPath
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "[ERROR] 仮想環境の作成に失敗しました。" -ForegroundColor Red
-        exit 1
-    }
-    Write-Host "[OK] 仮想環境を作成しました" -ForegroundColor Green
-}
+# 実環境（システム Python）に必要なライブラリが既に揃っているか確認
+& $pythonCmd -c "import fastapi, uvicorn, CoolProp, pandas, numpy, scipy" 2>$null
+$systemHasDeps = ($LASTEXITCODE -eq 0)
 
-Write-Host "依存パッケージをインストール中 (pip install)..."
-& "$venvPath\Scripts\pip.exe" install --upgrade pip -q
-& "$venvPath\Scripts\pip.exe" install -r "$Root\backend\requirements.txt"
-Write-Host "[OK] バックエンドパッケージのインストール完了" -ForegroundColor Green
+if ($systemHasDeps) {
+    Write-Host "[OK] 実環境に必要なライブラリが揃っています。仮想環境を作成せず実環境を使用します。" -ForegroundColor Green
+} else {
+    $venvPath = "$Root\backend\.venv"
+    if (Test-Path $venvPath) {
+        Write-Host "仮想環境は既に存在します: $venvPath" -ForegroundColor Gray
+    } else {
+        Write-Host "Python 仮想環境を作成中..."
+        & $pythonCmd -m venv $venvPath
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[ERROR] 仮想環境の作成に失敗しました。" -ForegroundColor Red
+            exit 1
+        }
+        Write-Host "[OK] 仮想環境を作成しました" -ForegroundColor Green
+    }
+
+    Write-Host "依存パッケージをインストール中 (pip install)..."
+    & "$venvPath\Scripts\pip.exe" install --upgrade pip -q
+    & "$venvPath\Scripts\pip.exe" install -r "$Root\backend\requirements.txt"
+    Write-Host "[OK] バックエンドパッケージのインストール完了" -ForegroundColor Green
+}
 
 Write-Host ""
 

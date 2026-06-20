@@ -3,9 +3,11 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from tinydb import TinyDB
 from typing import Any
 import CoolProp.CoolProp as CP
 import numpy as np
+import os
 import pandas as pd
 from scipy.integrate import solve_ivp
 from scipy.optimize import brentq, least_squares
@@ -740,6 +742,7 @@ def _boundary_type(node_params: dict) -> str:
 
 BOUNDARY_NODE_TYPES = {"source", "sink", "boundary"}
 TWO_PORT_NODE_TYPES = {"pipe", "pump", "turbine", "heatExchanger", "reducer", "elbow", "valve"}
+TWO_FLUID_HEAT_EXCHANGER_NODE_TYPES = {"twoFluidHeatExchanger"}
 DEFAULT_TEMPERATURE_K = 293.15
 DEFAULT_SPECIFIC_HEAT_J_KG_K = 4184.0
 DEFAULT_FLUID_SYSTEM_ID = "default"
@@ -831,6 +834,95 @@ def _heat_exchanger_flow_for_pressure_drop(params: dict, dp_kpa: float) -> float
     if dp_kpa <= 1e-12 or nominal_dp_kpa <= 1e-12:
         return 0.0
     return rated_flow_m3h * np.sqrt(dp_kpa / nominal_dp_kpa) / 3600.0
+
+
+def _two_fluid_side_pressure_drop_kpa(params: dict, side: str, q_m3s: float) -> float:
+    rated_key = "hotRatedFlow" if side == "hot" else "coldRatedFlow"
+    dp_key = "hotNominalPressureDrop" if side == "hot" else "coldNominalPressureDrop"
+    rated_flow_m3h = max(float(params.get(rated_key, 10.0)), 1e-9)
+    nominal_dp_kpa = max(float(params.get(dp_key, 10.0)), 0.0)
+    q_m3h = abs(q_m3s) * 3600.0
+    return nominal_dp_kpa * (q_m3h / rated_flow_m3h) ** 2
+
+
+def _two_fluid_side_flow_for_pressure_drop(params: dict, side: str, dp_kpa: float) -> float:
+    rated_key = "hotRatedFlow" if side == "hot" else "coldRatedFlow"
+    dp_key = "hotNominalPressureDrop" if side == "hot" else "coldNominalPressureDrop"
+    nominal_dp_kpa = max(float(params.get(dp_key, 10.0)), 0.0)
+    rated_flow_m3h = max(float(params.get(rated_key, 10.0)), 1e-9)
+    if dp_kpa <= 1e-12 or nominal_dp_kpa <= 1e-12:
+        return 0.0
+    return rated_flow_m3h * np.sqrt(dp_kpa / nominal_dp_kpa) / 3600.0
+
+
+def _calc_two_fluid_side_segment(params: dict, side: str, q_m3s: float) -> dict:
+    return {
+        "Q_m3h": round(q_m3s * 3600.0, 4),
+        "v": 0.0,
+        "Re": 0.0,
+        "f": 0.0,
+        "dP_kpa": round(_two_fluid_side_pressure_drop_kpa(params, side, q_m3s), 6),
+        "regime": "twoFluidHeatExchanger",
+        "side": side,
+    }
+
+
+def _two_fluid_heat_exchange_result(
+    params: dict,
+    hot: dict[str, Any] | None,
+    cold: dict[str, Any] | None,
+    hot_fluid: dict[str, Any],
+    cold_fluid: dict[str, Any],
+) -> dict[str, Any]:
+    hot = hot or {}
+    cold = cold or {}
+    hot_q = float(hot.get("Q_m3h", 0.0)) / 3600.0
+    cold_q = float(cold.get("Q_m3h", 0.0)) / 3600.0
+    hot_t_in = float(hot.get("T_in_K", DEFAULT_TEMPERATURE_K))
+    cold_t_in = float(cold.get("T_in_K", DEFAULT_TEMPERATURE_K))
+    hot_cp = max(float(hot_fluid.get("specificHeat", DEFAULT_SPECIFIC_HEAT_J_KG_K)), 1e-9)
+    cold_cp = max(float(cold_fluid.get("specificHeat", DEFAULT_SPECIFIC_HEAT_J_KG_K)), 1e-9)
+    hot_c = abs(hot_q) * float(hot_fluid.get("density", 1000.0)) * hot_cp
+    cold_c = abs(cold_q) * float(cold_fluid.get("density", 1000.0)) * cold_cp
+    ua = max(float(params.get("heatTransferCoeff", 500.0)), 0.0) * max(float(params.get("heatTransferArea", 10.0)), 0.0)
+
+    heat_w = 0.0
+    effectiveness = 0.0
+    if hot_c > 1e-12 and cold_c > 1e-12 and ua > 0:
+        c_min = min(hot_c, cold_c)
+        c_max = max(hot_c, cold_c)
+        cr = c_min / c_max if c_max > 0 else 0.0
+        ntu = ua / c_min
+        if abs(1.0 - cr) < 1e-9:
+            effectiveness = ntu / (1.0 + ntu)
+        else:
+            effectiveness = (1.0 - math.exp(-ntu * (1.0 - cr))) / (1.0 - cr * math.exp(-ntu * (1.0 - cr)))
+        heat_w = effectiveness * c_min * (hot_t_in - cold_t_in)
+
+    hot_t_out = hot_t_in - heat_w / hot_c if hot_c > 1e-12 else hot_t_in
+    cold_t_out = cold_t_in + heat_w / cold_c if cold_c > 1e-12 else cold_t_in
+
+    return {
+        "Q_m3h": round(hot_q * 3600.0, 4),
+        "hot_Q_m3h": round(hot_q * 3600.0, 4),
+        "cold_Q_m3h": round(cold_q * 3600.0, 4),
+        "dP_kpa": round(max(float(hot.get("dP_kpa", 0.0)), float(cold.get("dP_kpa", 0.0))), 6),
+        "hot_dP_kpa": round(float(hot.get("dP_kpa", 0.0)), 6),
+        "cold_dP_kpa": round(float(cold.get("dP_kpa", 0.0)), 6),
+        "heat_duty_kw": round(heat_w / 1000.0, 6),
+        "UA_w_per_k": round(ua, 6),
+        "effectiveness": round(effectiveness, 6),
+        "hot_capacity_w_per_k": round(hot_c, 6),
+        "cold_capacity_w_per_k": round(cold_c, 6),
+        "hot_T_in_K": _round_temperature(hot_t_in),
+        "hot_T_out_K": _round_temperature(hot_t_out),
+        "cold_T_in_K": _round_temperature(cold_t_in),
+        "cold_T_out_K": _round_temperature(cold_t_out),
+        "regime": "twoFluidHeatExchanger",
+        "v": 0.0,
+        "Re": 0.0,
+        "f": 0.0,
+    }
 
 
 def _reducer_areas(params: dict, q_m3s: float) -> tuple[float, float, float, float]:
@@ -1253,6 +1345,8 @@ def _calc_valve_segment(params: dict, q_m3s: float, rho: float) -> dict:
 
 
 def _component_pressure_delta_kpa(kind: str, params: dict, q_m3s: float, rho: float, mu: float, method: str) -> float:
+    if kind in ("twoFluidHeatExchanger:hot", "twoFluidHeatExchanger:cold"):
+        return _two_fluid_side_pressure_drop_kpa(params, kind.split(":", 1)[1], q_m3s)
     if kind == "pump":
         return -_pump_boost_kpa(params, abs(q_m3s) * 3600.0, rho)
     if kind == "turbine":
@@ -1269,6 +1363,8 @@ def _component_pressure_delta_kpa(kind: str, params: dict, q_m3s: float, rho: fl
 
 
 def _component_flow_for_pressure_delta(kind: str, params: dict, dp_kpa: float, rho: float, mu: float, method: str) -> float:
+    if kind in ("twoFluidHeatExchanger:hot", "twoFluidHeatExchanger:cold"):
+        return _two_fluid_side_flow_for_pressure_drop(params, kind.split(":", 1)[1], abs(dp_kpa))
     if kind == "pump":
         return _pump_flow_for_required_boost(params, dp_kpa, rho)
     if kind == "turbine":
@@ -1285,6 +1381,8 @@ def _component_flow_for_pressure_delta(kind: str, params: dict, dp_kpa: float, r
 
 
 def _component_result(kind: str, params: dict, q_m3s: float, rho: float, mu: float, method: str) -> dict:
+    if kind in ("twoFluidHeatExchanger:hot", "twoFluidHeatExchanger:cold"):
+        return _calc_two_fluid_side_segment(params, kind.split(":", 1)[1], q_m3s)
     if kind == "pump":
         return _calc_pump_segment(params, q_m3s, rho)
     if kind == "turbine":
@@ -1419,21 +1517,43 @@ def _solve_boundary_network(
         if ra != rb:
             parent[rb] = ra
 
-    def node_point(nid: str, outgoing_side: bool) -> str:
+    def two_fluid_side_from_handle(handle: str | None) -> str:
+        text = handle or ""
+        return "cold" if text.startswith("cold") else "hot"
+
+    def node_point(nid: str, outgoing_side: bool, handle: str | None = None) -> str:
         node = nodes_dict[nid]
         if node.node_type in TWO_PORT_NODE_TYPES:
             return f"{nid}:out" if outgoing_side else f"{nid}:in"
+        if node.node_type in TWO_FLUID_HEAT_EXCHANGER_NODE_TYPES:
+            side = two_fluid_side_from_handle(handle)
+            if outgoing_side:
+                return f"{nid}:{side}:out"
+            return f"{nid}:{side}:in"
         return nid
 
     for n in req.nodes:
         if n.node_type in TWO_PORT_NODE_TYPES:
             add_point(f"{n.id}:in")
             add_point(f"{n.id}:out")
+        elif n.node_type in TWO_FLUID_HEAT_EXCHANGER_NODE_TYPES:
+            add_point(f"{n.id}:hot:in")
+            add_point(f"{n.id}:hot:out")
+            add_point(f"{n.id}:cold:in")
+            add_point(f"{n.id}:cold:out")
         elif n.node_type in BOUNDARY_NODE_TYPES or n.node_type == "tee":
             add_point(n.id)
 
+    connected_points: set[str] = set()
     for e in (edge for edge in req.edges if edge.line_type == "fluid"):
-        union(node_point(e.source, outgoing_side=True), node_point(e.target, outgoing_side=False))
+        source_point = node_point(e.source, outgoing_side=True, handle=e.source_handle)
+        target_point = node_point(e.target, outgoing_side=False, handle=e.target_handle)
+        connected_points.add(source_point)
+        connected_points.add(target_point)
+        union(
+            source_point,
+            target_point,
+        )
 
     fixed_p: dict[str, float] = {}
     fixed_q: dict[str, float] = defaultdict(float)
@@ -1473,6 +1593,24 @@ def _solve_boundary_network(
         if a == b:
             continue
         links.append({"id": elem.id, "kind": elem.node_type, "a": a, "b": b, "params": elem.params})
+
+    for elem in (n for n in req.nodes if n.node_type in TWO_FLUID_HEAT_EXCHANGER_NODE_TYPES):
+        for side in ("hot", "cold"):
+            if f"{elem.id}:{side}:in" not in connected_points and f"{elem.id}:{side}:out" not in connected_points:
+                continue
+            a = find(f"{elem.id}:{side}:in")
+            b = find(f"{elem.id}:{side}:out")
+            if a == b:
+                continue
+            links.append({
+                "id": f"{elem.id}:{side}",
+                "node_id": elem.id,
+                "side": side,
+                "kind": f"twoFluidHeatExchanger:{side}",
+                "a": a,
+                "b": b,
+                "params": elem.params,
+            })
 
     if not links:
         raise HTTPException(status_code=400, detail="圧力境界計算には2ポート要素が少なくとも1つ必要です")
@@ -1658,6 +1796,25 @@ def _solve_multi_fluid_network(req: PipeNetworkRequest) -> dict[str, Any]:
         for n in req.nodes
     }
 
+    def node_in_system(node: PipeNetworkNode, fs_id: str) -> bool:
+        if node.node_type == "twoFluidHeatExchanger":
+            return (
+                str(node.params.get("hotFluidSystemId", default_id)) == fs_id
+                or str(node.params.get("coldFluidSystemId", default_id)) == fs_id
+            )
+        return node_system.get(node.id) == fs_id
+
+    def edge_in_system(edge: PipeNetworkEdge, fs_id: str) -> bool:
+        source = next((n for n in req.nodes if n.id == edge.source), None)
+        target = next((n for n in req.nodes if n.id == edge.target), None)
+        node = source if source and source.node_type == "twoFluidHeatExchanger" else target if target and target.node_type == "twoFluidHeatExchanger" else None
+        if node is None:
+            return edge.source in sub_node_ids and edge.target in sub_node_ids
+        handle = edge.source_handle if node.id == edge.source else edge.target_handle
+        side = "cold" if (handle or "").startswith("cold") else "hot"
+        key = "coldFluidSystemId" if side == "cold" else "hotFluidSystemId"
+        return str(node.params.get(key, default_id)) == fs_id
+
     combined = {
         "nodes": {},
         "source_pressures": {},
@@ -1668,7 +1825,7 @@ def _solve_multi_fluid_network(req: PipeNetworkRequest) -> dict[str, Any]:
     }
 
     for fs_id, fluid in systems.items():
-        sub_node_ids = {nid for nid, nid_fs in node_system.items() if nid_fs == fs_id}
+        sub_node_ids = {n.id for n in req.nodes if node_in_system(n, fs_id)}
         sub_nodes = []
         for n in req.nodes:
             if n.id not in sub_node_ids:
@@ -1678,11 +1835,11 @@ def _solve_multi_fluid_network(req: PipeNetworkRequest) -> dict[str, Any]:
             sub_nodes.append(PipeNetworkNode(id=n.id, node_type=n.node_type, params=params))
         sub_edges = [
             e for e in req.edges
-            if e.line_type == "fluid" and e.source in sub_node_ids and e.target in sub_node_ids
+            if e.line_type == "fluid" and e.source in sub_node_ids and e.target in sub_node_ids and edge_in_system(e, fs_id)
         ]
 
         has_boundary = any(n.node_type in BOUNDARY_NODE_TYPES for n in sub_nodes)
-        has_two_port = any(n.node_type in TWO_PORT_NODE_TYPES for n in sub_nodes)
+        has_two_port = any(n.node_type in TWO_PORT_NODE_TYPES or n.node_type in TWO_FLUID_HEAT_EXCHANGER_NODE_TYPES for n in sub_nodes)
         if not sub_nodes or not sub_edges or not has_boundary or not has_two_port:
             continue
 
@@ -1701,6 +1858,14 @@ def _solve_multi_fluid_network(req: PipeNetworkRequest) -> dict[str, Any]:
 
         for key in ("nodes", "source_pressures", "source_flows", "source_temperatures", "boundary_temperatures"):
             combined[key].update(sub_result.get(key, {}))
+
+    for n in (node for node in req.nodes if node.node_type == "twoFluidHeatExchanger"):
+        hot = combined["nodes"].pop(f"{n.id}:hot", None)
+        cold = combined["nodes"].pop(f"{n.id}:cold", None)
+        hot_fs = systems.get(str(n.params.get("hotFluidSystemId", default_id)), systems[default_id])
+        cold_fs = systems.get(str(n.params.get("coldFluidSystemId", default_id)), systems[default_id])
+        if hot or cold:
+            combined["nodes"][n.id] = _two_fluid_heat_exchange_result(n.params, hot, cold, hot_fs, cold_fs)
 
     return combined
 
@@ -1975,11 +2140,20 @@ def download_saturation_csv(fluid: str):
     )
 
 
+class StageSpec(BaseModel):
+    propellant_mass: float             # 推進剤質量 [kg]
+    dry_mass: float                    # 段構造質量（推進剤を除く、分離時に投棄）[kg]
+    oxidizer: str = "LOX"              # 酸化剤
+    fuel: str = "LCH4"                 # 燃料
+    thrust: float                      # 推力 [N]（燃焼中一定）
+    burn_time: float                   # 燃焼時間 [s]
+
+
 class LaunchRequest(BaseModel):
-    initial_mass: float = 500.0        # 機体全備質量 [kg]（推進剤含む）
-    propellant_mass: float = 300.0     # 推進剤質量 [kg]
-    thrust: float = 12000.0            # 推力 [N]（燃焼中一定）
-    burn_time: float = 20.0            # 燃焼時間 [s]
+    stages: list[StageSpec] = Field(default_factory=lambda: [
+        StageSpec(propellant_mass=300.0, dry_mass=150.0, thrust=12000.0, burn_time=20.0),
+    ])
+    payload_mass: float = 50.0         # ペイロード質量 [kg]
     launch_angle: float = 90.0         # 発射角度（水平からの角度）[deg]、90=垂直
     drag_enabled: bool = False
     drag_coefficient: float = 0.5
@@ -1991,89 +2165,168 @@ class LaunchRequest(BaseModel):
 @app.post("/launch/simulate")
 def simulate_launch(req: LaunchRequest):
     """機体質量・推力から弾道軌道を計算する（点質量・重力一定の簡易モデル）。
+    各段は順番に燃焼し、燃焼終了時に段の構造質量（dry_mass）を投棄して次の段に進む。
+    全段燃焼後は無動力（慣性飛行）として計算を続ける。
     推力方向は発射角度に固定（姿勢変化・重力旋回は未対応）。
     """
-    if req.initial_mass <= 0 or req.propellant_mass <= 0:
-        raise HTTPException(status_code=400, detail="機体質量・推進剤質量は正の値を入力してください")
-    if req.propellant_mass >= req.initial_mass:
-        raise HTTPException(status_code=400, detail="推進剤質量は機体全備質量より小さくしてください")
-    if req.thrust <= 0 or req.burn_time <= 0:
-        raise HTTPException(status_code=400, detail="推力・燃焼時間は正の値を入力してください")
+    if not req.stages:
+        raise HTTPException(status_code=400, detail="少なくとも1段を設定してください")
+    for i, stage in enumerate(req.stages, start=1):
+        if stage.propellant_mass <= 0 or stage.dry_mass < 0:
+            raise HTTPException(status_code=400, detail=f"第{i}段の質量設定が不正です")
+        if stage.thrust <= 0 or stage.burn_time <= 0:
+            raise HTTPException(status_code=400, detail=f"第{i}段の推力・燃焼時間は正の値を入力してください")
+    if req.payload_mass < 0:
+        raise HTTPException(status_code=400, detail="ペイロード質量は0以上を入力してください")
     if req.duration <= 0 or req.dt <= 0:
         raise HTTPException(status_code=400, detail="シミュレーション時間・刻み幅は正の値を入力してください")
 
     g0 = 9.80665
     angle_rad = np.radians(req.launch_angle)
-    thrust_vertical = req.thrust * np.sin(angle_rad)
-    weight0 = req.initial_mass * g0
+    initial_mass = sum(s.propellant_mass + s.dry_mass for s in req.stages) + req.payload_mass
+
+    thrust_vertical = req.stages[0].thrust * np.sin(angle_rad)
+    weight0 = initial_mass * g0
     if thrust_vertical <= weight0:
         raise HTTPException(
             status_code=400,
             detail=(
-                f"推力の鉛直成分（{thrust_vertical:.0f} N）が機体重量（{weight0:.0f} N）以下のため離床できません"
+                f"第1段推力の鉛直成分（{thrust_vertical:.0f} N）が機体重量（{weight0:.0f} N）以下のため離床できません"
             ),
         )
 
-    mdot = req.propellant_mass / req.burn_time
     rho0 = 1.225       # 海面大気密度 [kg/m³]
     H_scale = 8500.0   # 大気スケール高度 [m]
     Cd = req.drag_coefficient
     A = req.cross_section_area
 
-    def ode(t: float, state: list[float]) -> list[float]:
-        x, y, vx, vy, m = state
-        burning = t < req.burn_time
-        Fx = req.thrust * np.cos(angle_rad) if burning else 0.0
-        Fy = req.thrust * np.sin(angle_rad) if burning else 0.0
+    def make_ode(thrust: float, mdot: float, burning: bool):
+        def ode(t: float, state: list[float]) -> list[float]:
+            x, y, vx, vy, m = state
+            Fx = thrust * np.cos(angle_rad) if burning else 0.0
+            Fy = thrust * np.sin(angle_rad) if burning else 0.0
 
-        drag_x = drag_y = 0.0
-        if req.drag_enabled:
-            speed = float(np.hypot(vx, vy))
-            if speed > 1e-9:
-                rho = rho0 * np.exp(-max(y, 0.0) / H_scale)
-                Fd = 0.5 * rho * Cd * A * speed ** 2
-                drag_x = -Fd * vx / speed
-                drag_y = -Fd * vy / speed
+            drag_x = drag_y = 0.0
+            if req.drag_enabled:
+                speed = float(np.hypot(vx, vy))
+                if speed > 1e-9:
+                    rho = rho0 * np.exp(-max(y, 0.0) / H_scale)
+                    Fd = 0.5 * rho * Cd * A * speed ** 2
+                    drag_x = -Fd * vx / speed
+                    drag_y = -Fd * vy / speed
 
-        ax = (Fx + drag_x) / m
-        ay = (Fy + drag_y) / m - g0
-        dm = -mdot if burning else 0.0
-        return [vx, vy, ax, ay, dm]
+            ax = (Fx + drag_x) / m
+            ay = (Fy + drag_y) / m - g0
+            dm = -mdot if burning else 0.0
+            return [vx, vy, ax, ay, dm]
+        return ode
 
     def hit_ground(t: float, state: list[float]) -> float:
         return state[1]
     hit_ground.terminal = True
     hit_ground.direction = -1
 
-    state0 = [0.0, 0.0, 0.0, 0.0, req.initial_mass]
-    t_eval = np.arange(0.0, req.duration + req.dt, req.dt)
+    t_all: list[float] = [0.0]
+    x_all: list[float] = [0.0]
+    y_all: list[float] = [0.0]
+    vx_all: list[float] = [0.0]
+    vy_all: list[float] = [0.0]
+    m_all: list[float] = [initial_mass]
 
-    try:
-        sol = solve_ivp(
-            ode, (0.0, req.duration), state0,
-            t_eval=t_eval, method="RK45", events=hit_ground,
-            max_step=req.dt, rtol=1e-6, atol=1e-9,
-        )
-    except Exception as ex:
-        raise HTTPException(status_code=500, detail=f"計算エラー: {ex}")
+    state = [0.0, 0.0, 0.0, 0.0, initial_mass]
+    t_cursor = 0.0
+    remaining = req.duration
+    landed = False
+    delta_v_total = 0.0
+    stage_burnouts: list[dict] = []
 
-    if not sol.success:
-        raise HTTPException(status_code=500, detail=f"ODE 未収束: {sol.message}")
+    for stage_idx, stage in enumerate(req.stages, start=1):
+        if landed or remaining <= 1e-9:
+            break
 
-    x, y, vx, vy, m = sol.y
-    y = np.clip(y, 0.0, None)
+        span = min(stage.burn_time, remaining)
+        mdot = stage.propellant_mass / stage.burn_time
+        mass_before_burn = state[4]
+        n_steps = max(int(np.ceil(span / req.dt)), 1)
+        t_eval = np.linspace(0.0, span, n_steps + 1)
+
+        try:
+            sol = solve_ivp(
+                make_ode(stage.thrust, mdot, True), (0.0, span), state,
+                t_eval=t_eval, method="RK45", events=hit_ground,
+                max_step=req.dt, rtol=1e-6, atol=1e-9,
+            )
+        except Exception as ex:
+            raise HTTPException(status_code=500, detail=f"計算エラー: {ex}")
+        if not sol.success:
+            raise HTTPException(status_code=500, detail=f"ODE 未収束: {sol.message}")
+
+        t_all.extend((t_cursor + sol.t[1:]).tolist())
+        x_all.extend(sol.y[0][1:].tolist())
+        y_all.extend(sol.y[1][1:].tolist())
+        vx_all.extend(sol.y[2][1:].tolist())
+        vy_all.extend(sol.y[3][1:].tolist())
+        m_all.extend(sol.y[4][1:].tolist())
+
+        mass_at_burnout = float(sol.y[4][-1])
+        ve = stage.thrust / mdot  # 有効排気速度 [m/s]
+        delta_v_total += ve * float(np.log(mass_before_burn / mass_at_burnout))
+        stage_burnouts.append({
+            "stage_index": stage_idx,
+            "time_s": round(t_cursor + float(sol.t[-1]), 2),
+            "altitude_m": round(float(sol.y[1][-1]), 2),
+            "speed_ms": round(float(np.hypot(sol.y[2][-1], sol.y[3][-1])), 2),
+            "mass_kg": round(mass_at_burnout, 2),
+        })
+
+        if len(sol.t_events[0]) > 0:
+            landed = True
+            break
+
+        t_cursor += float(sol.t[-1])
+        remaining -= float(sol.t[-1])
+        # 段分離: 燃焼を終えた段の構造質量を投棄
+        state = [
+            float(sol.y[0][-1]), float(sol.y[1][-1]),
+            float(sol.y[2][-1]), float(sol.y[3][-1]),
+            mass_at_burnout - stage.dry_mass,
+        ]
+
+    if not landed and remaining > 1e-9:
+        n_steps = max(int(np.ceil(remaining / req.dt)), 1)
+        t_eval = np.linspace(0.0, remaining, n_steps + 1)
+        try:
+            sol = solve_ivp(
+                make_ode(0.0, 0.0, False), (0.0, remaining), state,
+                t_eval=t_eval, method="RK45", events=hit_ground,
+                max_step=req.dt, rtol=1e-6, atol=1e-9,
+            )
+        except Exception as ex:
+            raise HTTPException(status_code=500, detail=f"計算エラー: {ex}")
+        if not sol.success:
+            raise HTTPException(status_code=500, detail=f"ODE 未収束: {sol.message}")
+
+        t_all.extend((t_cursor + sol.t[1:]).tolist())
+        x_all.extend(sol.y[0][1:].tolist())
+        y_all.extend(sol.y[1][1:].tolist())
+        vx_all.extend(sol.y[2][1:].tolist())
+        vy_all.extend(sol.y[3][1:].tolist())
+        m_all.extend(sol.y[4][1:].tolist())
+        if len(sol.t_events[0]) > 0:
+            landed = True
+
+    x = np.array(x_all)
+    y = np.clip(np.array(y_all), 0.0, None)
+    vx = np.array(vx_all)
+    vy = np.array(vy_all)
+    m = np.array(m_all)
+    t = np.array(t_all)
     speed = np.hypot(vx, vy)
-
-    landed = len(sol.t_events[0]) > 0
     apogee_idx = int(np.argmax(y))
-    burnout_idx = min(int(np.searchsorted(sol.t, req.burn_time)), len(sol.t) - 1)
-
-    ve = req.thrust / mdot  # 有効排気速度 [m/s]
-    delta_v = ve * np.log(req.initial_mass / (req.initial_mass - req.propellant_mass))
 
     # 浮動小数点誤差（例: 90°での cos が厳密に0でない）由来の極小値を丸めて除去
     return {
-        "time": np.round(sol.t, 6).tolist(),
+        "time": np.round(t, 6).tolist(),
         "x": np.round(x, 6).tolist(),
         "altitude": np.round(y, 6).tolist(),
         "vx": np.round(vx, 6).tolist(),
@@ -2083,14 +2336,437 @@ def simulate_launch(req: LaunchRequest):
         "landed": landed,
         "stats": {
             "apogee_altitude_m": round(float(y[apogee_idx]), 2),
-            "apogee_time_s": round(float(sol.t[apogee_idx]), 2),
-            "burnout_altitude_m": round(float(y[burnout_idx]), 2),
-            "burnout_speed_ms": round(float(speed[burnout_idx]), 2),
-            "burnout_mass_kg": round(float(m[burnout_idx]), 2),
+            "apogee_time_s": round(float(t[apogee_idx]), 2),
+            "stage_burnouts": stage_burnouts,
             "max_speed_ms": round(float(np.max(speed)), 2),
-            "flight_time_s": round(float(sol.t[-1]), 2),
+            "flight_time_s": round(float(t[-1]), 2),
             "downrange_m": round(float(x[-1]), 2),
-            "thrust_to_weight": round(float(req.thrust / weight0), 3),
-            "delta_v_ms": round(float(delta_v), 2),
+            "thrust_to_weight": round(float(req.stages[0].thrust / weight0), 3),
+            "delta_v_ms": round(float(delta_v_total), 2),
         },
     }
+
+
+# ── 機体データベース（TinyDB） ─────────────────────────────────────
+
+VEHICLE_DB_PATH = os.path.join(os.path.dirname(__file__), "data", "vehicles_db.json")
+os.makedirs(os.path.dirname(VEHICLE_DB_PATH), exist_ok=True)
+vehicle_db = TinyDB(VEHICLE_DB_PATH, encoding="utf-8")
+vehicle_table = vehicle_db.table("vehicles")
+
+
+class VehicleSpec(BaseModel):
+    name: str                          # 機体名
+    stages: list[StageSpec]            # 段構成（1段目から順）
+    payload_mass: float = 0.0          # ペイロード質量 [kg]
+    length: float = 0.0                # 全長 [m]
+    diameter: float = 0.0              # 直径 [m]
+    launch_angle: float = 90.0         # 発射角度 [deg]
+    drag_enabled: bool = False
+    drag_coefficient: float = 0.5
+    cross_section_area: float = 0.0    # 機体投影面積 [m²]
+    note: str = ""                     # 出典・補足
+
+
+# サンプルデータ（公開情報をもとにした概算値の2段構成モデル。各段のdry_massは推定値を含む）
+# H3-30: JAXA/MHI H3ロケット（SRBなし構成）
+#   1段目: 3×LE-9（LOX/LH2）推進剤225t・燃焼214s
+#   2段目: LE-5B-3（LOX/LH2）推進剤約23t・推力137kN・燃焼700s（定格値）
+#   全長63m、直径5.27m、ペイロードはSSO換算で約4,000kg
+# Falcon 9 Block 5: SpaceX
+#   1段目: 9×Merlin 1D（LOX/RP-1）推進剤411t・燃焼162s
+#   2段目: Merlin 1D Vacuum（LOX/RP-1）推進剤約92.7t・推力934kN・燃焼397s
+#   全長69.8m、直径3.7m、ペイロードはLEO使い切り条件で約22,800kg
+SAMPLE_VEHICLES = [
+    VehicleSpec(
+        name="H3-30",
+        stages=[
+            StageSpec(
+                propellant_mass=225_000.0, dry_mass=48_000.0,
+                oxidizer="LOX", fuel="LH2",
+                thrust=4_416_000.0, burn_time=214.0,
+            ),
+            StageSpec(
+                propellant_mass=23_000.0, dry_mass=3_500.0,
+                oxidizer="LOX", fuel="LH2",
+                thrust=137_000.0, burn_time=700.0,
+            ),
+        ],
+        payload_mass=4_000.0,
+        length=63.0,
+        diameter=5.27,
+        launch_angle=90.0,
+        cross_section_area=round(math.pi * (5.27 / 2) ** 2, 2),
+        note="JAXA/MHI H3-30（SRBなし、LE-9 ×3 + LE-5B-3）。2段dry_massは推定値、ペイロードはSSO換算",
+    ),
+    VehicleSpec(
+        name="Falcon 9 Block 5",
+        stages=[
+            StageSpec(
+                propellant_mass=411_000.0, dry_mass=41_384.0,
+                oxidizer="LOX", fuel="RP-1",
+                thrust=7_607_000.0, burn_time=162.0,
+            ),
+            StageSpec(
+                propellant_mass=92_670.0, dry_mass=4_000.0,
+                oxidizer="LOX", fuel="RP-1",
+                thrust=934_000.0, burn_time=397.0,
+            ),
+        ],
+        payload_mass=22_800.0,
+        length=69.8,
+        diameter=3.7,
+        launch_angle=90.0,
+        cross_section_area=round(math.pi * (3.7 / 2) ** 2, 2),
+        note="SpaceX Falcon 9 Block 5（Merlin 1D ×9 + Merlin 1D Vacuum）。1段dry_massは概算、ペイロードはLEO使い切り条件",
+    ),
+]
+
+
+def _seed_vehicle_db() -> None:
+    if len(vehicle_table) == 0:
+        for vehicle in SAMPLE_VEHICLES:
+            vehicle_table.insert(vehicle.model_dump())
+
+
+_seed_vehicle_db()
+
+
+@app.get("/vehicles")
+def list_vehicles():
+    return [{"id": doc.doc_id, **doc} for doc in vehicle_table.all()]
+
+
+@app.post("/vehicles")
+def create_vehicle(vehicle: VehicleSpec):
+    doc_id = vehicle_table.insert(vehicle.model_dump())
+    return {"id": doc_id, **vehicle.model_dump()}
+
+
+@app.put("/vehicles/{vehicle_id}")
+def update_vehicle(vehicle_id: int, vehicle: VehicleSpec):
+    if not vehicle_table.contains(doc_id=vehicle_id):
+        raise HTTPException(status_code=404, detail="機体が見つかりません")
+    vehicle_table.update(vehicle.model_dump(), doc_ids=[vehicle_id])
+    return {"id": vehicle_id, **vehicle.model_dump()}
+
+
+@app.delete("/vehicles/{vehicle_id}")
+def delete_vehicle(vehicle_id: int):
+    if not vehicle_table.contains(doc_id=vehicle_id):
+        raise HTTPException(status_code=404, detail="機体が見つかりません")
+    vehicle_table.remove(doc_ids=[vehicle_id])
+    return {"ok": True}
+
+
+# ── 部品データベース（TinyDB、機体データベースと同じファイルを使用） ──────
+
+parts_table = vehicle_db.table("parts")
+
+
+class PartSpec(BaseModel):
+    code: str                          # 部品コード
+    name: str                          # 部品名
+    category: str                      # "pipe" | "valve" | "pump"
+    maker: str = ""                    # メーカー
+    model: str = ""                    # 型式
+    note: str = ""                     # タグ・用途メモ
+    params: dict[str, str] = {}        # カテゴリ別の解析用パラメータ
+
+
+# 部品管理タブの初期テストデータ（フロントエンドの旧ハードコードデータを移行）
+SAMPLE_PARTS = [
+    PartSpec(
+        code="PIPE-100A-SGP", name="SGP 100A 標準配管", category="pipe",
+        maker="標準", model="SGP-100A", note="定常解析の配管ノード初期値用",
+        params={
+            "shape": "円管", "diameterMm": "105.3", "lengthM": "6",
+            "roughnessMm": "0.046", "material": "SGP", "pressureClass": "10K",
+        },
+    ),
+    PartSpec(
+        code="VALVE-GATE-50A", name="ゲートバルブ 50A", category="valve",
+        maker="標準", model="GV-50A", note="開度100%の初期値",
+        params={
+            "diameterMm": "50", "cv": "48", "openingPct": "100",
+            "pressureClass": "JIS 10K", "connection": "フランジ",
+        },
+    ),
+    PartSpec(
+        code="PUMP-030-020", name="遠心ポンプ 30m3/h 20m", category="pump",
+        maker="標準", model="CP-030", note="二次PQ特性の初期登録例",
+        params={
+            "ratedFlowM3h": "30", "ratedHeadM": "20", "shutoffHeadM": "30",
+            "efficiencyPct": "75", "ratedSpeedRpm": "1450",
+        },
+    ),
+]
+
+
+def _seed_parts_db() -> None:
+    if len(parts_table) == 0:
+        for part in SAMPLE_PARTS:
+            parts_table.insert(part.model_dump())
+
+
+_seed_parts_db()
+
+
+@app.get("/parts")
+def list_parts():
+    return [{"id": doc.doc_id, **doc} for doc in parts_table.all()]
+
+
+@app.post("/parts")
+def create_part(part: PartSpec):
+    doc_id = parts_table.insert(part.model_dump())
+    return {"id": doc_id, **part.model_dump()}
+
+
+@app.delete("/parts/{part_id}")
+def delete_part(part_id: int):
+    if not parts_table.contains(doc_id=part_id):
+        raise HTTPException(status_code=404, detail="部品が見つかりません")
+    parts_table.remove(doc_ids=[part_id])
+    return {"ok": True}
+
+
+# ── ロケット段デザイナー（コンポーネント単位のノードグラフ→段集計） ───────
+
+class RocketNode(BaseModel):
+    id: str
+    node_type: str  # structure | tank | pipe | pump | combustor | nozzle | fairing | fixed_mass
+    params: dict[str, float | str] = {}
+
+
+class RocketEdge(BaseModel):
+    id: str
+    source: str
+    target: str
+    source_handle: str | None = None
+    target_handle: str | None = None
+
+
+class RocketStagePayload(BaseModel):
+    nodes: list[RocketNode]
+    edges: list[RocketEdge]
+    structure: dict[str, float] = {}
+    fixed_masses: list[dict] = []
+
+
+def _rocket_num(params: dict, key: str, default: float = 0.0) -> float:
+    try:
+        return float(params.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _shell_mass(diameter_mm: float, length_mm: float, thickness_mm: float, density: float) -> float:
+    """円筒シェルの質量 = 密度 × 肉厚 × 側面表面積（簡易、底面・座屈は無視）"""
+    diameter_m = diameter_mm / 1000.0
+    length_m = length_mm / 1000.0
+    thickness_m = thickness_mm / 1000.0
+    surface_area = math.pi * diameter_m * length_m
+    return density * thickness_m * surface_area
+
+
+def _pressure_vessel_thickness(pressure_pa: float, diameter_mm: float, yield_strength_pa: float, safety_factor: float) -> float:
+    """薄肉円筒のフープ応力から必要肉厚を算出: t = P・D / (2・σ_allow)"""
+    if yield_strength_pa <= 0 or safety_factor <= 0:
+        return 0.0
+    sigma_allow = yield_strength_pa / safety_factor
+    diameter_m = diameter_mm / 1000.0
+    return (pressure_pa * diameter_m) / (2 * sigma_allow) * 1000.0  # mm
+
+
+def _calc_shell_component(params: dict) -> dict:
+    """外壁構造材・フェアリング・配管: 指定肉厚からのシェル質量"""
+    mass = _shell_mass(
+        _rocket_num(params, "diameterMm"),
+        _rocket_num(params, "lengthMm"),
+        _rocket_num(params, "thicknessMm"),
+        _rocket_num(params, "densityKgM3"),
+    )
+    return {"mass_kg": round(mass, 3)}
+
+
+def _calc_direct_mass(params: dict) -> dict:
+    """ポンプ・固定質量: 質量を直接入力"""
+    return {"mass_kg": round(_rocket_num(params, "massKg"), 3)}
+
+
+def _calc_tank(params: dict) -> dict:
+    """タンク: フープ応力からシェル質量、円筒近似体積から推進剤質量を算出"""
+    diameter_mm = _rocket_num(params, "diameterMm")
+    length_mm = _rocket_num(params, "lengthMm")
+    thickness = _pressure_vessel_thickness(
+        _rocket_num(params, "designPressurePa"),
+        diameter_mm,
+        _rocket_num(params, "yieldStrengthPa"),
+        _rocket_num(params, "safetyFactor", 1.5),
+    )
+    shell_mass = _shell_mass(diameter_mm, length_mm, thickness, _rocket_num(params, "densityKgM3"))
+
+    radius_m = diameter_mm / 1000.0 / 2.0
+    length_m = length_mm / 1000.0
+    volume_m3 = math.pi * radius_m ** 2 * length_m
+    usable_volume = volume_m3 * max(0.0, 1.0 - _rocket_num(params, "ullagePercent") / 100.0)
+    propellant_mass = usable_volume * _rocket_num(params, "propellantDensityKgM3")
+
+    return {
+        "thickness_mm": round(thickness, 3),
+        "shell_mass_kg": round(shell_mass, 3),
+        "propellant_mass_kg": round(propellant_mass, 3),
+    }
+
+
+def _combustor_mdot(params: dict) -> float:
+    chamber_pressure = _rocket_num(params, "chamberPressurePa")
+    c_star = _rocket_num(params, "cStarMS")
+    throat_area_m2 = math.pi * (_rocket_num(params, "throatDiameterMm") / 1000.0 / 2.0) ** 2
+    return (chamber_pressure * throat_area_m2 / c_star) if c_star > 0 else 0.0
+
+
+def _calc_combustor(params: dict) -> dict:
+    """燃焼器: フープ応力からシェル質量、Pc・At・c*から質量流量を算出"""
+    diameter_mm = _rocket_num(params, "diameterMm")
+    length_mm = _rocket_num(params, "lengthMm")
+    thickness = _pressure_vessel_thickness(
+        _rocket_num(params, "chamberPressurePa"),
+        diameter_mm,
+        _rocket_num(params, "yieldStrengthPa"),
+        _rocket_num(params, "safetyFactor", 1.5),
+    )
+    shell_mass = _shell_mass(diameter_mm, length_mm, thickness, _rocket_num(params, "densityKgM3"))
+    return {
+        "thickness_mm": round(thickness, 3),
+        "shell_mass_kg": round(shell_mass, 3),
+        "mdot_kg_s": round(_combustor_mdot(params), 5),
+    }
+
+
+def _nozzle_exit_mach(expansion_ratio: float, gamma: float) -> float | None:
+    """面積比 Ae/At から超音速側出口マッハ数を数値的に求める（等エントロピー流れ）"""
+    if expansion_ratio <= 1.0 or gamma <= 1.0:
+        return None
+
+    def area_ratio(mach: float) -> float:
+        term = (2.0 / (gamma + 1.0)) * (1.0 + (gamma - 1.0) / 2.0 * mach ** 2)
+        return (1.0 / mach) * term ** ((gamma + 1.0) / (2.0 * (gamma - 1.0)))
+
+    try:
+        return brentq(lambda m: area_ratio(m) - expansion_ratio, 1.0 + 1e-6, 80.0, xtol=1e-10, maxiter=200)
+    except ValueError:
+        return None
+
+
+def _calc_nozzle(params: dict, combustor_params: dict | None) -> dict:
+    """ノズル: 燃焼器とのペアリングがあれば燃焼圧・拡大比から推力・Ispを計算"""
+    shell_mass = _shell_mass(
+        _rocket_num(params, "exitDiameterMm") or _rocket_num(params, "diameterMm"),
+        _rocket_num(params, "lengthMm"),
+        _rocket_num(params, "thicknessMm"),
+        _rocket_num(params, "densityKgM3"),
+    )
+    result = {"shell_mass_kg": round(shell_mass, 3), "thrust_n": 0.0, "isp_s": 0.0}
+    if not combustor_params:
+        return result
+
+    expansion_ratio = _rocket_num(params, "expansionRatio")
+    ambient_pressure = _rocket_num(params, "ambientPressurePa", 101325.0)
+    gamma = _rocket_num(combustor_params, "gamma", 1.2)
+    chamber_pressure = _rocket_num(combustor_params, "chamberPressurePa")
+    mdot = _combustor_mdot(combustor_params)
+    throat_area_m2 = math.pi * (_rocket_num(combustor_params, "throatDiameterMm") / 1000.0 / 2.0) ** 2
+
+    mach_e = _nozzle_exit_mach(expansion_ratio, gamma)
+    if mach_e is None or chamber_pressure <= 0:
+        return result
+
+    pe_pc = (1.0 + (gamma - 1.0) / 2.0 * mach_e ** 2) ** (-gamma / (gamma - 1.0))
+    cf = math.sqrt(
+        (2 * gamma ** 2 / (gamma - 1.0))
+        * (2 / (gamma + 1.0)) ** ((gamma + 1.0) / (gamma - 1.0))
+        * (1.0 - pe_pc ** ((gamma - 1.0) / gamma))
+    ) + (pe_pc - ambient_pressure / chamber_pressure) * expansion_ratio
+    thrust = cf * chamber_pressure * throat_area_m2
+    isp = (thrust / (mdot * 9.80665)) if mdot > 0 else 0.0
+
+    return {
+        "shell_mass_kg": round(shell_mass, 3),
+        "thrust_n": round(thrust, 2),
+        "isp_s": round(isp, 2),
+        "mach_exit": round(mach_e, 4),
+        "cf": round(cf, 4),
+    }
+
+
+@app.post("/rocket/stage/build")
+def build_rocket_stage(payload: RocketStagePayload):
+    """段の部品グラフ（外壁構造材・タンク・配管・ポンプ・燃焼器・ノズル・フェアリング・固定質量）から
+    段全体の構造質量・推進剤質量・推力・燃焼時間を計算する。
+    燃焼器→ノズルは接続エッジでペアリングし、燃焼圧・拡大比からノズル性能（推力・Isp）を算出する。
+    結果は既存の StageSpec 形式（/launch/simulate へそのまま渡せる形）で返す。
+    """
+    nodes_by_id = {n.id: n for n in payload.nodes}
+    nozzle_combustor: dict[str, str] = {}
+    for edge in payload.edges:
+        source = nodes_by_id.get(edge.source)
+        target = nodes_by_id.get(edge.target)
+        if not source or not target:
+            continue
+        if source.node_type == "combustor" and target.node_type == "nozzle":
+            nozzle_combustor[target.id] = source.id
+        elif source.node_type == "nozzle" and target.node_type == "combustor":
+            nozzle_combustor[source.id] = target.id
+
+    results: dict[str, dict] = {}
+    dry_mass = 0.0
+    propellant_mass = 0.0
+    thrust_total = 0.0
+    mdot_total = 0.0
+    oxidizer = ""
+    fuel = ""
+
+    for node in payload.nodes:
+        params = node.params
+        if node.node_type in ("fairing", "pipe"):
+            r = _calc_shell_component(params)
+            dry_mass += r["mass_kg"]
+        elif node.node_type == "pump":
+            r = _calc_direct_mass(params)
+            dry_mass += r["mass_kg"]
+        elif node.node_type == "tank":
+            r = _calc_tank(params)
+            dry_mass += r["shell_mass_kg"]
+            propellant_mass += r["propellant_mass_kg"]
+        elif node.node_type == "combustor":
+            r = _calc_combustor(params)
+            dry_mass += r["shell_mass_kg"]
+            mdot_total += r["mdot_kg_s"]
+            oxidizer = oxidizer or str(params.get("oxidizer", ""))
+            fuel = fuel or str(params.get("fuel", ""))
+        elif node.node_type == "nozzle":
+            combustor_id = nozzle_combustor.get(node.id)
+            combustor_params = nodes_by_id[combustor_id].params if combustor_id else None
+            r = _calc_nozzle(params, combustor_params)
+            dry_mass += r["shell_mass_kg"]
+            thrust_total += r["thrust_n"]
+        else:
+            r = {}
+        results[node.id] = r
+
+    if payload.structure:
+        dry_mass += _calc_shell_component(payload.structure)["mass_kg"]
+    dry_mass += sum(_rocket_num(m, "massKg") for m in payload.fixed_masses)
+
+    burn_time = (propellant_mass / mdot_total) if mdot_total > 0 else 0.0
+    stage = {
+        "propellant_mass": round(propellant_mass, 3),
+        "dry_mass": round(dry_mass, 3),
+        "oxidizer": oxidizer or "LOX",
+        "fuel": fuel or "LCH4",
+        "thrust": round(thrust_total, 2),
+        "burn_time": round(burn_time, 3),
+    }
+    return {"nodes": results, "stage": stage}

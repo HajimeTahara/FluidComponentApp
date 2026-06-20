@@ -200,6 +200,17 @@ export type PipeSegmentResult = {
   output_power_kw?: number
   heat_duty_kw?: number
   UA_w_per_k?: number
+  hot_Q_m3h?: number
+  cold_Q_m3h?: number
+  hot_dP_kpa?: number
+  cold_dP_kpa?: number
+  hot_T_in_K?: number
+  hot_T_out_K?: number
+  cold_T_in_K?: number
+  cold_T_out_K?: number
+  hot_capacity_w_per_k?: number
+  cold_capacity_w_per_k?: number
+  effectiveness?: number
   exchange_temperature_K?: number
   heat_transfer_coeff_w_m2_k?: number
   heat_transfer_area_m2?: number
@@ -255,11 +266,18 @@ export async function calcPipeNetwork(payload: PipeNetworkPayload): Promise<Pipe
 }
 
 // ── Launch Trajectory ──────────────────────────────────────────────
-export type LaunchRequest = {
-  initial_mass: number
+export type StageSpec = {
   propellant_mass: number
+  dry_mass: number
+  oxidizer: string
+  fuel: string
   thrust: number
   burn_time: number
+}
+
+export type LaunchRequest = {
+  stages: StageSpec[]
+  payload_mass: number
   launch_angle: number
   drag_enabled: boolean
   drag_coefficient: number
@@ -268,12 +286,18 @@ export type LaunchRequest = {
   dt: number
 }
 
+export type StageBurnout = {
+  stage_index: number
+  time_s: number
+  altitude_m: number
+  speed_ms: number
+  mass_kg: number
+}
+
 export type LaunchStats = {
   apogee_altitude_m: number
   apogee_time_s: number
-  burnout_altitude_m: number
-  burnout_speed_ms: number
-  burnout_mass_kg: number
+  stage_burnouts: StageBurnout[]
   max_speed_ms: number
   flight_time_s: number
   downrange_m: number
@@ -304,6 +328,134 @@ export async function simulateLaunch(payload: LaunchRequest): Promise<LaunchResu
     throw new Error((err as { detail?: string }).detail ?? '打ち上げ計算に失敗しました')
   }
   return res.json()
+}
+
+// ── Rocket Stage Builder ─────────────────────────────────────────────
+export type RocketNodePayload = {
+  id: string
+  node_type: string
+  params: Record<string, number | string>
+}
+export type RocketEdgePayload = {
+  id: string
+  source: string
+  target: string
+  source_handle?: string | null
+  target_handle?: string | null
+}
+export type RocketFixedMassPayload = {
+  id: string
+  label: string
+  massKg: number
+}
+export type RocketStagePayload = {
+  nodes: RocketNodePayload[]
+  edges: RocketEdgePayload[]
+  structure?: Record<string, number>
+  fixed_masses?: RocketFixedMassPayload[]
+}
+export type RocketNodeResult = {
+  mass_kg?: number
+  shell_mass_kg?: number
+  propellant_mass_kg?: number
+  thickness_mm?: number
+  mdot_kg_s?: number
+  thrust_n?: number
+  isp_s?: number
+  mach_exit?: number
+  cf?: number
+}
+export type RocketStageBuildResult = {
+  nodes: Record<string, RocketNodeResult>
+  stage: StageSpec
+}
+
+export async function buildRocketStage(payload: RocketStagePayload): Promise<RocketStageBuildResult> {
+  const res = await fetch(`${API_BASE}/rocket/stage/build`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error((err as { detail?: string }).detail ?? '段の計算に失敗しました')
+  }
+  return res.json()
+}
+
+// ── Vehicle Database ────────────────────────────────────────────────
+export type VehicleSpec = {
+  name: string
+  stages: StageSpec[]
+  payload_mass: number
+  length: number
+  diameter: number
+  launch_angle: number
+  drag_enabled: boolean
+  drag_coefficient: number
+  cross_section_area: number
+  note: string
+}
+
+export type Vehicle = VehicleSpec & { id: number }
+
+async function vehicleResponse<T>(res: Response, fallback: string): Promise<T> {
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error((err as { detail?: string }).detail ?? fallback)
+  }
+  return res.json()
+}
+
+export async function fetchVehicles(): Promise<Vehicle[]> {
+  const res = await fetch(`${API_BASE}/vehicles`)
+  return vehicleResponse(res, '機体データベースの取得に失敗しました')
+}
+
+export async function createVehicle(payload: VehicleSpec): Promise<Vehicle> {
+  const res = await fetch(`${API_BASE}/vehicles`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  return vehicleResponse(res, '機体の登録に失敗しました')
+}
+
+export async function deleteVehicle(id: number): Promise<void> {
+  const res = await fetch(`${API_BASE}/vehicles/${id}`, { method: 'DELETE' })
+  await vehicleResponse(res, '機体の削除に失敗しました')
+}
+
+// ── Parts Database ───────────────────────────────────────────────────
+export type PartSpec = {
+  code: string
+  name: string
+  category: string
+  maker: string
+  model: string
+  note: string
+  params: Record<string, string>
+}
+
+export type Part = PartSpec & { id: number }
+
+export async function fetchParts(): Promise<Part[]> {
+  const res = await fetch(`${API_BASE}/parts`)
+  return vehicleResponse(res, '部品データベースの取得に失敗しました')
+}
+
+export async function createPart(payload: PartSpec): Promise<Part> {
+  const res = await fetch(`${API_BASE}/parts`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  return vehicleResponse(res, '部品の登録に失敗しました')
+}
+
+export async function deletePart(id: number): Promise<void> {
+  const res = await fetch(`${API_BASE}/parts/${id}`, { method: 'DELETE' })
+  await vehicleResponse(res, '部品の削除に失敗しました')
 }
 
 export async function runSimulate(payload: {

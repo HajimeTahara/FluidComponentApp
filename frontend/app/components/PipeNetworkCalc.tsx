@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactElement } from 'react'
 import dynamic from 'next/dynamic'
 import {
   ReactFlow,
@@ -14,6 +14,7 @@ import {
   useUpdateNodeInternals,
   ReactFlowProvider,
   NodeToolbar,
+  NodeResizer,
   BaseEdge,
   EdgeLabelRenderer,
   Handle,
@@ -103,6 +104,16 @@ type PowerSpeedResolution = {
   errors: string[]
 }
 
+function pumpPowerAtSpeed(data: NetworkNodeData, speedRpm: number, rho = 1000): number {
+  const omega = 2 * Math.PI * Math.max(speedRpm, 0) / 60
+  return Math.max(pumpTorqueAtSpeed(data, speedRpm, rho) * omega / 1000, 0)
+}
+
+function turbinePowerAtSpeed(data: NetworkNodeData, speedRpm: number, rho = 1000): number {
+  const omega = 2 * Math.PI * Math.max(speedRpm, 0) / 60
+  return Math.max(turbineTorqueAtSpeed(data, speedRpm, rho) * omega / 1000, 0)
+}
+
 function motorTorqueAtSpeed(data: NetworkNodeData, speedRpm: number): number {
   const ns = Math.max(motorSynchronousSpeed(data), 1e-9)
   const nr = Math.max(motorRatedSpeed(data), 1e-9)
@@ -157,70 +168,119 @@ function motorPowerAtSpeed(data: NetworkNodeData, speedRpm: number): number {
 
 function resolvePowerSpeeds(nodes: Node[], edges: Edge[], fluidSystems: FluidSystem[]): PowerSpeedResolution {
   const parent = new Map<string, string>()
+  const ratioToParent = new Map<string, number>()
   const nodeById = new Map(nodes.map(n => [n.id, n]))
   const add = (id: string) => {
-    if (!parent.has(id)) parent.set(id, id)
+    if (!parent.has(id)) {
+      parent.set(id, id)
+      ratioToParent.set(id, 1)
+    }
   }
-  const find = (id: string): string => {
+  const find = (id: string): { root: string; ratio: number } => {
     add(id)
     const p = parent.get(id)!
-    if (p === id) return id
-    const root = find(p)
-    parent.set(id, root)
-    return root
+    const ratio = ratioToParent.get(id) ?? 1
+    if (p === id) return { root: id, ratio: 1 }
+    const found = find(p)
+    parent.set(id, found.root)
+    ratioToParent.set(id, ratio * found.ratio)
+    return { root: found.root, ratio: ratio * found.ratio }
   }
-  const union = (a: string, b: string) => {
-    const ra = find(a)
-    const rb = find(b)
-    if (ra !== rb) parent.set(rb, ra)
+  const union = (a: string, b: string, bOverA = 1) => {
+    const fa = find(a)
+    const fb = find(b)
+    if (fa.root === fb.root) {
+      const current = fb.ratio / fa.ratio
+      if (Math.abs(current - bOverA) > 1e-6 * Math.max(1, Math.abs(bOverA))) {
+        return false
+      }
+      return true
+    }
+    parent.set(fb.root, fa.root)
+    ratioToParent.set(fb.root, (fa.ratio * bOverA) / fb.ratio)
+    return true
   }
 
-  nodes.forEach(n => add(n.id))
+  const vertexFor = (nodeId: string, handleId?: string | null): string => {
+    const data = nodeById.get(nodeId)?.data as unknown as NetworkNodeData | undefined
+    if (data?.nodeType === 'gear') {
+      return handleId?.endsWith('-b') ? `${nodeId}:b` : `${nodeId}:a`
+    }
+    return nodeId
+  }
+
+  nodes.forEach(n => {
+    const data = n.data as unknown as NetworkNodeData
+    if (data.nodeType === 'gear') {
+      add(`${n.id}:a`)
+      add(`${n.id}:b`)
+      if (!union(`${n.id}:a`, `${n.id}:b`, Math.max(data.gearRatio ?? 1, 1e-9))) {
+        // This should only happen when another constraint conflicts with the gear itself.
+      }
+    } else {
+      add(n.id)
+    }
+  })
+  const errors: string[] = []
   edges
     .filter(e => ((e.data as FlowEdgeData | undefined)?.lineType ?? 'fluid') === 'power')
-    .forEach(e => union(e.source, e.target))
+    .forEach(e => {
+      const ok = union(vertexFor(e.source, e.sourceHandle), vertexFor(e.target, e.targetHandle), 1)
+      if (!ok) errors.push('ギア比と動力ライン接続の回転数拘束が矛盾しています')
+    })
 
-  const fixedByRoot = new Map<string, { speed: number; label: string }>()
-  const errors: string[] = []
+  const fixedByRoot = new Map<string, { rootSpeed: number; label: string; nodeSpeed: number }>()
   for (const node of nodes) {
     const data = node.data as unknown as NetworkNodeData
     if (data.nodeType !== 'speedBoundary') continue
     const speed = Math.max(data.fixedSpeed ?? 1450, 0)
-    const root = find(node.id)
+    const found = find(node.id)
+    const rootSpeed = speed / Math.max(found.ratio, 1e-9)
+    const root = found.root
     const existing = fixedByRoot.get(root)
-    if (existing && Math.abs(existing.speed - speed) > 1e-6) {
-      errors.push(`動力ラインに異なる固定回転数が接続されています: ${existing.label}=${existing.speed} rpm, ${data.label}=${speed} rpm`)
+    if (existing && Math.abs(existing.rootSpeed - rootSpeed) > 1e-6) {
+      errors.push(`動力ラインに異なる固定回転数が接続されています: ${existing.label}=${existing.nodeSpeed} rpm, ${data.label}=${speed} rpm`)
     } else {
-      fixedByRoot.set(root, { speed, label: data.label })
+      fixedByRoot.set(root, { rootSpeed, label: data.label, nodeSpeed: speed })
     }
   }
 
   const membersByRoot = new Map<string, Node[]>()
   for (const node of nodes) {
-    const root = find(node.id)
+    const data = node.data as unknown as NetworkNodeData
+    if (data.nodeType === 'gear' || data.nodeType === 'powerSplitter') continue
+    const root = find(node.id).root
     membersByRoot.set(root, [...(membersByRoot.get(root) ?? []), node])
   }
 
   const speeds = new Map<string, number>()
   const torques = new Map<string, number>()
   const modes = new Map<string, 'fixed' | 'torque' | 'fallback'>()
-  const setGroup = (members: Node[], speed: number, mode: 'fixed' | 'torque' | 'fallback') => {
+  const setGroup = (root: string, members: Node[], rootSpeed: number, mode: 'fixed' | 'torque' | 'fallback') => {
     for (const member of members) {
       if (!nodeById.has(member.id)) continue
       const data = member.data as unknown as NetworkNodeData
       const system = fluidSystemForNode(data, fluidSystems)
+      const speed = rootSpeed * find(member.id).ratio
       speeds.set(member.id, speed)
       modes.set(member.id, mode)
       if (data.nodeType === 'motor') torques.set(member.id, motorTorqueAtSpeed(data, speed))
       if (data.nodeType === 'turbine') torques.set(member.id, turbineTorqueAtSpeed(data, speed, system.density))
       if (data.nodeType === 'pump') torques.set(member.id, pumpTorqueAtSpeed(data, speed, system.density))
     }
+    for (const gear of nodes.filter(n => ((n.data as unknown as NetworkNodeData).nodeType === 'gear'))) {
+      const a = find(`${gear.id}:a`)
+      if (a.root === root) {
+        speeds.set(gear.id, rootSpeed * a.ratio)
+        modes.set(gear.id, mode)
+      }
+    }
   }
 
   for (const [root, members] of membersByRoot) {
     const fixed = fixedByRoot.get(root)
     if (fixed) {
-      setGroup(members, fixed.speed, 'fixed')
+      setGroup(root, members, fixed.rootSpeed, 'fixed')
       continue
     }
 
@@ -228,36 +288,36 @@ function resolvePowerSpeeds(nodes: Node[], edges: Edge[], fluidSystems: FluidSys
     const turbines = members.filter(n => ((n.data as unknown as NetworkNodeData).nodeType === 'turbine'))
     const pumps = members.filter(n => ((n.data as unknown as NetworkNodeData).nodeType === 'pump'))
     if ((motors.length > 0 || turbines.length > 0) && pumps.length > 0) {
-      const motorDatas = motors.map(n => n.data as unknown as NetworkNodeData)
+      const motorDatas = motors.map(n => ({ data: n.data as unknown as NetworkNodeData, ratio: find(n.id).ratio }))
       const turbineDatas = turbines.map(n => {
         const data = n.data as unknown as NetworkNodeData
-        return { data, rho: fluidSystemForNode(data, fluidSystems).density }
+        return { data, ratio: find(n.id).ratio, rho: fluidSystemForNode(data, fluidSystems).density }
       })
       const pumpDatas = pumps.map(n => {
         const data = n.data as unknown as NetworkNodeData
-        return { data, rho: fluidSystemForNode(data, fluidSystems).density }
+        return { data, ratio: find(n.id).ratio, rho: fluidSystemForNode(data, fluidSystems).density }
       })
       const producerSpeedLimits = [
-        ...motorDatas.map(motorSynchronousSpeed),
-        ...turbineDatas.map(item => item.data.ratedSpeed ?? 1450),
+        ...motorDatas.map(item => motorSynchronousSpeed(item.data) / Math.max(item.ratio, 1e-9)),
+        ...turbineDatas.map(item => (item.data.ratedSpeed ?? 1450) / Math.max(item.ratio, 1e-9)),
       ].filter(v => v > 0)
-      const maxSpeed = Math.max(Math.min(...producerSpeedLimits) * 0.999, 1)
-      const balance = (speed: number) => (
-        motorDatas.reduce((sum, data) => sum + motorTorqueAtSpeed(data, speed), 0)
-        + turbineDatas.reduce((sum, item) => sum + turbineTorqueAtSpeed(item.data, speed, item.rho), 0)
-        - pumpDatas.reduce((sum, item) => sum + pumpTorqueAtSpeed(item.data, speed, item.rho), 0)
+      const maxRootSpeed = Math.max(Math.min(...producerSpeedLimits) * 0.999, 1)
+      const balance = (rootSpeed: number) => (
+        motorDatas.reduce((sum, item) => sum + motorPowerAtSpeed(item.data, rootSpeed * item.ratio), 0)
+        + turbineDatas.reduce((sum, item) => sum + turbinePowerAtSpeed(item.data, rootSpeed * item.ratio, item.rho), 0)
+        - pumpDatas.reduce((sum, item) => sum + pumpPowerAtSpeed(item.data, rootSpeed * item.ratio, item.rho), 0)
       )
-      let lo = maxSpeed * 1e-6
-      let hi = maxSpeed
+      let lo = maxRootSpeed * 1e-6
+      let hi = maxRootSpeed
       let flo = balance(lo)
       const fhi = balance(hi)
       if (flo <= 0 && fhi <= 0) {
         errors.push(`動力ラインの始動トルクが不足しています: ${members.map(n => (n.data as unknown as NetworkNodeData).label).join(', ')}`)
-        setGroup(members, Math.max(...pumpDatas.map(item => item.data.ratedSpeed ?? 1450)), 'fallback')
+        setGroup(root, members, Math.max(...pumpDatas.map(item => (item.data.ratedSpeed ?? 1450) / Math.max(item.ratio, 1e-9))), 'fallback')
         continue
       }
       if (flo >= 0 && fhi >= 0) {
-        setGroup(members, hi, 'torque')
+        setGroup(root, members, hi, 'torque')
         continue
       }
       for (let i = 0; i < 80; i += 1) {
@@ -275,19 +335,19 @@ function resolvePowerSpeeds(nodes: Node[], edges: Edge[], fluidSystems: FluidSys
           hi = mid
         }
       }
-      setGroup(members, (lo + hi) / 2, 'torque')
+      setGroup(root, members, (lo + hi) / 2, 'torque')
       continue
     }
 
     const fallbackSpeed = motors.length > 0
-      ? Math.max(Math.min(...motors.map(n => motorSynchronousSpeed(n.data as unknown as NetworkNodeData))) * 0.999, 0)
+      ? Math.max(Math.min(...motors.map(n => motorSynchronousSpeed(n.data as unknown as NetworkNodeData) / Math.max(find(n.id).ratio, 1e-9))) * 0.999, 0)
       : turbines.length > 0
-        ? Math.max(...turbines.map(n => (n.data as unknown as NetworkNodeData).ratedSpeed ?? 1450), 0)
+        ? Math.max(...turbines.map(n => ((n.data as unknown as NetworkNodeData).ratedSpeed ?? 1450) / Math.max(find(n.id).ratio, 1e-9)), 0)
       : Math.max(...members.map(n => {
         const data = n.data as unknown as NetworkNodeData
-        return data.nodeType === 'pump' ? data.ratedSpeed ?? 1450 : 0
+        return data.nodeType === 'pump' ? (data.ratedSpeed ?? 1450) / Math.max(find(n.id).ratio, 1e-9) : 0
       }), 0)
-    if (fallbackSpeed > 0) setGroup(members, fallbackSpeed, 'fallback')
+    if (fallbackSpeed > 0) setGroup(root, members, fallbackSpeed, 'fallback')
   }
   return { speeds, torques, modes, errors }
 }
@@ -352,7 +412,7 @@ function motorInputPower(data: NetworkNodeData): number {
 }
 
 type NetworkNodeData = {
-  nodeType: 'boundary' | 'source' | 'pipe' | 'pump' | 'turbine' | 'heatExchanger' | 'reducer' | 'elbow' | 'valve' | 'motor' | 'speedBoundary' | 'tee' | 'sink'
+  nodeType: 'boundary' | 'source' | 'pipe' | 'pump' | 'turbine' | 'heatExchanger' | 'twoFluidHeatExchanger' | 'reducer' | 'elbow' | 'valve' | 'motor' | 'speedBoundary' | 'powerSplitter' | 'gear' | 'tee' | 'sink'
   label: string
   fluidSystemId?: string
   // boundary/source/sink: unified boundary condition
@@ -400,6 +460,12 @@ type NetworkNodeData = {
   heatTransferCoeff?: number   // W/m²/K
   heatTransferArea?: number    // m²
   nominalPressureDrop?: number // kPa at ratedFlow
+  hotFluidSystemId?: string
+  coldFluidSystemId?: string
+  hotRatedFlow?: number
+  coldRatedFlow?: number
+  hotNominalPressureDrop?: number
+  coldNominalPressureDrop?: number
   // reducer / expander
   diameterIn?: number          // mm
   diameterOut?: number         // mm
@@ -423,6 +489,9 @@ type NetworkNodeData = {
   motorSlip?: number             // %
   // speed boundary
   fixedSpeed?: number             // rpm
+  // power network
+  gearRatio?: number              // N_b / N_a
+  gearEfficiency?: number         // %
   // tee (flow split is physics-based; no manual parameter)
   teeMode?: 'split' | 'merge'
   // result
@@ -446,15 +515,106 @@ function vectorToPosition({ x, y }: { x: number; y: number }): Position {
 }
 
 function orientPosition(base: Position, data: NetworkNodeData): Position {
-  let { x, y } = POSITION_VECTOR[base]
+  let { x } = POSITION_VECTOR[base]
+  const { y } = POSITION_VECTOR[base]
   if (data.flipped) x *= -1
-  const turns = ((data.rotation ?? 0) / 90) % 4
+  return vectorToPosition({ x, y })
+}
+
+function rotatePosition(base: Position, rotation: NodeRotation = 0): Position {
+  let { x, y } = POSITION_VECTOR[base]
+  const turns = ((rotation / 90) % 4 + 4) % 4
   for (let i = 0; i < turns; i += 1) {
     const nextX = -y
     y = x
     x = nextX
   }
   return vectorToPosition({ x, y })
+}
+
+function visualPortPosition(data: NetworkNodeData, handleId?: string | null): Position {
+  let base = Position.Right
+  if (handleId?.startsWith('hot-in') || handleId?.startsWith('cold-in')) base = Position.Left
+  if (handleId?.startsWith('hot-out') || handleId?.startsWith('cold-out')) base = Position.Right
+  if (handleId?.startsWith('power')) {
+    if (data.nodeType === 'gear' && handleId.endsWith('-a')) base = Position.Left
+    else if (data.nodeType === 'powerSplitter' && handleId.endsWith('-a')) base = Position.Left
+    else if (data.nodeType === 'powerSplitter' && handleId.endsWith('-c')) base = Position.Bottom
+    else base = data.nodeType === 'pump' || data.nodeType === 'turbine' ? Position.Bottom : Position.Right
+  } else {
+    if (handleId?.includes('in')) base = Position.Left
+    if (handleId?.endsWith('-2')) base = Position.Bottom
+  }
+  return rotatePosition(orientPosition(base, data), data.rotation ?? 0)
+}
+
+function basePortPosition(data: NetworkNodeData, handleId?: string | null): Position {
+  let base = Position.Right
+  if (handleId?.startsWith('hot-in') || handleId?.startsWith('cold-in')) base = Position.Left
+  if (handleId?.startsWith('hot-out') || handleId?.startsWith('cold-out')) base = Position.Right
+  if (handleId?.startsWith('power')) {
+    if (data.nodeType === 'gear' && handleId.endsWith('-a')) base = Position.Left
+    else if (data.nodeType === 'powerSplitter' && handleId.endsWith('-a')) base = Position.Left
+    else if (data.nodeType === 'powerSplitter' && handleId.endsWith('-c')) base = Position.Bottom
+    else base = data.nodeType === 'pump' || data.nodeType === 'turbine' ? Position.Bottom : Position.Right
+  } else {
+    if (handleId?.includes('in')) base = Position.Left
+    if (handleId?.endsWith('-2')) base = Position.Bottom
+  }
+  return orientPosition(base, data)
+}
+
+function rotatedPortPoint(node: Node, handleId?: string | null): { x: number; y: number } | undefined {
+  const data = node.data as unknown as NetworkNodeData
+  const measured = (node as Node & { measured?: { width?: number; height?: number } }).measured
+  const width = measured?.width ?? node.width
+  const height = measured?.height ?? node.height
+  if (!width || !height) return undefined
+
+  const centerX = width / 2
+  const centerY = height / 2
+  const position = basePortPosition(data, handleId)
+  const x = centerX + POSITION_VECTOR[position].x * centerX
+  let y = centerY + POSITION_VECTOR[position].y * centerY
+  if (handleId?.startsWith('hot-')) y = height * 0.34
+  if (handleId?.startsWith('cold-')) y = height * 0.66
+  const radians = ((data.rotation ?? 0) * Math.PI) / 180
+  const dx = x - centerX
+  const dy = y - centerY
+  const rotatedX = centerX + dx * Math.cos(radians) - dy * Math.sin(radians)
+  const rotatedY = centerY + dx * Math.sin(radians) + dy * Math.cos(radians)
+
+  return {
+    x: node.position.x + rotatedX,
+    y: node.position.y + rotatedY,
+  }
+}
+
+function nodeRotationStyle(data: NetworkNodeData): CSSProperties {
+  const rotation = data.rotation ?? 0
+  return {
+    width: '100%',
+    height: '100%',
+    boxSizing: 'border-box',
+    ...(rotation !== 0 ? { transform: `rotate(${rotation}deg)` } : {}),
+    transformOrigin: 'center',
+  }
+}
+
+function NodeResizeHandles({ selected, minWidth = 96, minHeight = 48 }: {
+  selected?: boolean
+  minWidth?: number
+  minHeight?: number
+}) {
+  return (
+    <NodeResizer
+      isVisible={!!selected}
+      minWidth={minWidth}
+      minHeight={minHeight}
+      lineClassName="!border-blue-400"
+      handleClassName="!h-2.5 !w-2.5 !border-blue-500 !bg-white"
+    />
+  )
 }
 
 function pressureBadgeClass(position: Position): string {
@@ -476,6 +636,36 @@ function portHandleStyle(color: string, role: 'in' | 'out', lineType: LineType =
   return role === 'in'
     ? { ...base, background: color }
     : { ...base, background: '#ffffff' }
+}
+
+function powerHandleStyle(visible = true): CSSProperties {
+  return {
+    width: 13,
+    height: 13,
+    borderRadius: 2,
+    border: '3px solid #eab308',
+    background: '#facc15',
+    zIndex: 12,
+    opacity: visible ? 1 : 0,
+    pointerEvents: visible ? undefined : 'none',
+  }
+}
+
+function PowerPort({ position, id = 'power', legacy = false }: { position: Position; id?: string; legacy?: boolean }) {
+  const style = powerHandleStyle()
+  const hiddenStyle = powerHandleStyle(false)
+  return (
+    <>
+      <Handle type="target" position={position} id={id} style={style} />
+      <Handle type="source" position={position} id={id} style={style} />
+      {legacy && (
+        <>
+          <Handle type="target" position={position} id="power-in" style={hiddenStyle} />
+          <Handle type="source" position={position} id="power-out" style={hiddenStyle} />
+        </>
+      )}
+    </>
+  )
 }
 
 function pumpCurvePointsFor(data: NetworkNodeData): PumpCurvePoint[] {
@@ -720,6 +910,30 @@ function SvgRotate({ className = '' }) {
   )
 }
 
+function SvgPowerSplitter({ className = '' }) {
+  return (
+    <svg viewBox="0 0 24 24" className={className} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="8" cy="12" r="2.5" />
+      <path d="M10.5 12H15" />
+      <path d="M15 12l4-4" />
+      <path d="M15 12l4 4" />
+    </svg>
+  )
+}
+
+function SvgGearBox({ className = '' }) {
+  return (
+    <svg viewBox="0 0 24 24" className={className} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="8" cy="12" r="3" />
+      <circle cx="16" cy="12" r="4" />
+      <path d="M2 12h3" />
+      <path d="M19 12h3" />
+      <path d="M8 9v6" />
+      <path d="M16 8v8" />
+    </svg>
+  )
+}
+
 function SvgFlip({ className = '' }) {
   return (
     <svg viewBox="0 0 24 24" className={className} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -755,7 +969,11 @@ function BoundaryNode({ data, selected }: NodeProps) {
     : null
   const displayedTemperature = d.calcTemperature ?? d.result?.T_K ?? d.temperature
   return (
-    <div className={`relative px-3 py-2 rounded-xl border-2 bg-teal-50 min-w-[130px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-teal-500'}`}>
+    <div
+      className={`relative px-3 py-2 rounded-xl border-2 bg-teal-50 min-w-[130px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-teal-500'}`}
+      style={nodeRotationStyle(d)}
+    >
+      <NodeResizeHandles selected={selected} minWidth={130} minHeight={58} />
       <Handle type="target" position={inPosition} id="fluid-in" style={portHandleStyle('#14b8a6', 'in')} />
       {d.showPressureResults && pressureLabel && (d.portInConnected ?? d.portLeftConnected) && (
         <div className={pressureBadgeClass(inPosition)}>
@@ -796,7 +1014,11 @@ function PipeNode({ data, selected }: NodeProps) {
   const rho = d.rho ?? 1000
   const shapeLabel = d.pipeShape === 'annulus' ? '中空円' : d.pipeShape === 'rectangular' ? '矩形' : '円管'
   return (
-    <div className={`relative px-3 py-2 rounded border-2 bg-sky-50 min-w-[140px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-sky-400'}`}>
+    <div
+      className={`relative px-3 py-2 rounded border-2 bg-sky-50 min-w-[140px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-sky-400'}`}
+      style={nodeRotationStyle(d)}
+    >
+      <NodeResizeHandles selected={selected} minWidth={140} minHeight={58} />
       <Handle type="target" position={inPosition} id="fluid-in" style={portHandleStyle('#38bdf8', 'in')} />
       {d.showPressureResults && d.result?.P_from_kpa !== undefined && (d.portInConnected ?? d.portLeftConnected) && (
         <div className={pressureBadgeClass(inPosition)}>
@@ -831,10 +1053,13 @@ function PumpNode({ data, selected }: NodeProps) {
   const unit = d.pressureUnit ?? 'kPa'
   const rho = d.rho ?? 1000
   return (
-    <div className={`relative px-3 py-2 rounded border-2 bg-violet-50 min-w-[150px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-violet-500'}`}>
+    <div
+      className={`relative px-3 py-2 rounded border-2 bg-violet-50 min-w-[150px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-violet-500'}`}
+      style={nodeRotationStyle(d)}
+    >
+      <NodeResizeHandles selected={selected} minWidth={150} minHeight={76} />
       <Handle type="target" position={inPosition} id="fluid-in" style={portHandleStyle('#8b5cf6', 'in')} />
-      <Handle type="target" position={Position.Top} id="power-in" style={portHandleStyle('#eab308', 'in', 'power')} />
-      <Handle type="source" position={Position.Bottom} id="power-out" style={portHandleStyle('#eab308', 'out', 'power')} />
+      <PowerPort position={Position.Bottom} legacy />
       {d.showPressureResults && d.result?.P_from_kpa !== undefined && (d.portInConnected ?? d.portLeftConnected) && (
         <div className={pressureBadgeClass(inPosition)}>
           {formatPressure(d.result.P_from_kpa, unit, rho)} {unit}
@@ -873,9 +1098,13 @@ function TurbineNode({ data, selected }: NodeProps) {
   const unit = d.pressureUnit ?? 'kPa'
   const rho = d.rho ?? 1000
   return (
-    <div className={`relative px-3 py-2 rounded border-2 bg-emerald-50 min-w-[150px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-emerald-500'}`}>
+    <div
+      className={`relative px-3 py-2 rounded border-2 bg-emerald-50 min-w-[150px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-emerald-500'}`}
+      style={nodeRotationStyle(d)}
+    >
+      <NodeResizeHandles selected={selected} minWidth={150} minHeight={76} />
       <Handle type="target" position={inPosition} id="fluid-in" style={portHandleStyle('#10b981', 'in')} />
-      <Handle type="source" position={Position.Bottom} id="power-out" style={portHandleStyle('#eab308', 'out', 'power')} />
+      <PowerPort position={Position.Bottom} legacy />
       {d.showPressureResults && d.result?.P_from_kpa !== undefined && (d.portInConnected ?? d.portLeftConnected) && (
         <div className={pressureBadgeClass(inPosition)}>
           {formatPressure(d.result.P_from_kpa, unit, rho)} {unit}
@@ -910,7 +1139,11 @@ function HeatExchangerNode({ data, selected }: NodeProps) {
   const unit = d.pressureUnit ?? 'kPa'
   const rho = d.rho ?? 1000
   return (
-    <div className={`relative px-3 py-2 rounded border-2 bg-orange-50 min-w-[160px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-orange-500'}`}>
+    <div
+      className={`relative px-3 py-2 rounded border-2 bg-orange-50 min-w-[160px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-orange-500'}`}
+      style={nodeRotationStyle(d)}
+    >
+      <NodeResizeHandles selected={selected} minWidth={160} minHeight={80} />
       <Handle type="target" position={inPosition} id="fluid-in" style={portHandleStyle('#f97316', 'in')} />
       {d.showPressureResults && d.result?.P_from_kpa !== undefined && (d.portInConnected ?? d.portLeftConnected) && (
         <div className={pressureBadgeClass(inPosition)}>
@@ -939,6 +1172,44 @@ function HeatExchangerNode({ data, selected }: NodeProps) {
   )
 }
 
+function TwoFluidHeatExchangerNode({ data, selected }: NodeProps) {
+  const d = data as unknown as NetworkNodeData
+  const unit = d.pressureUnit ?? 'kPa'
+  const rho = d.rho ?? 1000
+  const hotHandle = (role: 'in' | 'out'): CSSProperties => ({ ...portHandleStyle('#f97316', role), top: '34%' })
+  const coldHandle = (role: 'in' | 'out'): CSSProperties => ({ ...portHandleStyle('#0ea5e9', role), top: '66%' })
+  return (
+    <div
+      className={`relative px-3 py-3 rounded border-2 bg-orange-50 min-w-[175px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-orange-500'}`}
+      style={nodeRotationStyle(d)}
+    >
+      <NodeResizeHandles selected={selected} minWidth={175} minHeight={96} />
+      <Handle type="target" position={Position.Left} id="hot-in" style={hotHandle('in')} />
+      <Handle type="source" position={Position.Right} id="hot-out" style={hotHandle('out')} />
+      <Handle type="target" position={Position.Left} id="cold-in" style={coldHandle('in')} />
+      <Handle type="source" position={Position.Right} id="cold-out" style={coldHandle('out')} />
+      <div className="flex items-center gap-1.5 mb-1">
+        <SvgHeatExchanger className="w-4 h-4 text-orange-600 shrink-0" />
+        <span className="text-xs font-bold text-orange-700">{d.label}</span>
+      </div>
+      <div className="text-xs text-orange-500 pl-5">UA={(d.heatTransferCoeff ?? 500) * (d.heatTransferArea ?? 10)} W/K</div>
+      {d.result?.heat_duty_kw !== undefined && (
+        <div className="text-xs font-bold text-orange-600 mt-0.5 pl-5">Q熱: {d.result.heat_duty_kw.toFixed(3)} kW</div>
+      )}
+      {d.result?.hot_T_out_K !== undefined && d.result?.cold_T_out_K !== undefined && (
+        <div className="text-xs text-orange-600 pl-5">
+          H:{d.result.hot_T_out_K.toFixed(1)} K / C:{d.result.cold_T_out_K.toFixed(1)} K
+        </div>
+      )}
+      {d.result?.hot_dP_kpa !== undefined && d.result?.cold_dP_kpa !== undefined && (
+        <div className="text-xs text-orange-500 pl-5">
+          ΔP H/C: {formatPressure(d.result.hot_dP_kpa, unit, rho)} / {formatPressure(d.result.cold_dP_kpa, unit, rho)} {unit}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function ReducerNode({ data, selected }: NodeProps) {
   const d = data as unknown as NetworkNodeData
   const inPosition = orientPosition(Position.Left, d)
@@ -951,7 +1222,11 @@ function ReducerNode({ data, selected }: NodeProps) {
       ? '縮小'
       : '拡縮'
   return (
-    <div className={`relative px-3 py-2 rounded border-2 bg-lime-50 min-w-[150px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-lime-500'}`}>
+    <div
+      className={`relative px-3 py-2 rounded border-2 bg-lime-50 min-w-[150px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-lime-500'}`}
+      style={nodeRotationStyle(d)}
+    >
+      <NodeResizeHandles selected={selected} minWidth={150} minHeight={66} />
       <Handle type="target" position={inPosition} id="fluid-in" style={portHandleStyle('#84cc16', 'in')} />
       {d.showPressureResults && d.result?.P_from_kpa !== undefined && (d.portInConnected ?? d.portLeftConnected) && (
         <div className={pressureBadgeClass(inPosition)}>
@@ -986,7 +1261,11 @@ function ElbowNode({ data, selected }: NodeProps) {
   const unit = d.pressureUnit ?? 'kPa'
   const rho = d.rho ?? 1000
   return (
-    <div className={`relative px-3 py-2 rounded border-2 bg-cyan-50 min-w-[145px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-cyan-500'}`}>
+    <div
+      className={`relative px-3 py-2 rounded border-2 bg-cyan-50 min-w-[145px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-cyan-500'}`}
+      style={nodeRotationStyle(d)}
+    >
+      <NodeResizeHandles selected={selected} minWidth={145} minHeight={66} />
       <Handle type="target" position={inPosition} id="fluid-in" style={portHandleStyle('#06b6d4', 'in')} />
       {d.showPressureResults && d.result?.P_from_kpa !== undefined && (d.portInConnected ?? d.portLeftConnected) && (
         <div className={pressureBadgeClass(inPosition)}>
@@ -1026,7 +1305,11 @@ function ValveNode({ data, selected }: NodeProps) {
       ? 'EQ%'
       : 'リニア'
   return (
-    <div className={`relative px-3 py-2 rounded border-2 bg-rose-50 min-w-[150px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-rose-500'}`}>
+    <div
+      className={`relative px-3 py-2 rounded border-2 bg-rose-50 min-w-[150px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-rose-500'}`}
+      style={nodeRotationStyle(d)}
+    >
+      <NodeResizeHandles selected={selected} minWidth={150} minHeight={66} />
       <Handle type="target" position={inPosition} id="fluid-in" style={portHandleStyle('#f43f5e', 'in')} />
       {d.showPressureResults && d.result?.P_from_kpa !== undefined && (d.portInConnected ?? d.portLeftConnected) && (
         <div className={pressureBadgeClass(inPosition)}>
@@ -1057,15 +1340,18 @@ function ValveNode({ data, selected }: NodeProps) {
 function MotorNode({ data, selected }: NodeProps) {
   const d = data as unknown as NetworkNodeData
   return (
-    <div className={`relative px-3 py-2 rounded border-2 bg-yellow-50 min-w-[155px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-yellow-500'}`}>
-      <Handle type="target" position={Position.Left} id="power-in" style={portHandleStyle('#eab308', 'in', 'power')} />
+    <div
+      className={`relative px-3 py-2 rounded border-2 bg-yellow-50 min-w-[155px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-yellow-500'}`}
+      style={nodeRotationStyle(d)}
+    >
+      <NodeResizeHandles selected={selected} minWidth={155} minHeight={58} />
+      <PowerPort position={Position.Right} legacy />
       <div className="flex items-center gap-1.5 mb-0.5">
         <SvgMotor className="w-4 h-4 text-yellow-700 shrink-0" />
         <span className="text-xs font-bold text-yellow-800">{d.label}</span>
       </div>
       <div className="text-xs text-yellow-700 pl-5">Pout={d.motorRatedPower ?? 5.5} kW · η={d.motorEfficiency ?? 90}%</div>
       <div className="text-xs text-yellow-600 pl-5">N={(d.speed ?? motorRatedSpeed(d)).toFixed(0)} rpm · {d.motorFrequency ?? 50} Hz</div>
-      <Handle type="source" position={Position.Right} id="power-out" style={portHandleStyle('#eab308', 'out', 'power')} />
     </div>
   )
 }
@@ -1073,13 +1359,57 @@ function MotorNode({ data, selected }: NodeProps) {
 function SpeedBoundaryNode({ data, selected }: NodeProps) {
   const d = data as unknown as NetworkNodeData
   return (
-    <div className={`relative px-3 py-2 rounded-xl border-2 bg-yellow-50 min-w-[135px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-yellow-400'}`}>
+    <div
+      className={`relative px-3 py-2 rounded-xl border-2 bg-yellow-50 min-w-[135px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-yellow-400'}`}
+      style={nodeRotationStyle(d)}
+    >
+      <NodeResizeHandles selected={selected} minWidth={135} minHeight={50} />
       <div className="flex items-center gap-1.5 mb-0.5">
         <SvgSpeedBoundary className="w-4 h-4 text-yellow-700 shrink-0" />
         <span className="text-xs font-bold text-yellow-800">{d.label}</span>
       </div>
       <div className="text-xs text-yellow-700 pl-5">N={d.fixedSpeed ?? 1450} rpm</div>
-      <Handle type="source" position={Position.Right} id="power-out" style={portHandleStyle('#eab308', 'out', 'power')} />
+      <PowerPort position={Position.Right} legacy />
+    </div>
+  )
+}
+
+function PowerSplitterNode({ data, selected }: NodeProps) {
+  const d = data as unknown as NetworkNodeData
+  return (
+    <div
+      className={`relative px-3 py-2 rounded-xl border-2 bg-yellow-50 min-w-[130px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-yellow-400'}`}
+      style={nodeRotationStyle(d)}
+    >
+      <NodeResizeHandles selected={selected} minWidth={130} minHeight={58} />
+      <PowerPort id="power-a" position={Position.Left} />
+      <PowerPort id="power-b" position={Position.Right} />
+      <PowerPort id="power-c" position={Position.Bottom} />
+      <div className="flex items-center gap-1.5 mb-0.5">
+        <SvgPowerSplitter className="w-4 h-4 text-yellow-700 shrink-0" />
+        <span className="text-xs font-bold text-yellow-800">{d.label}</span>
+      </div>
+      <div className="text-xs text-yellow-700 pl-5">同一回転軸を分岐</div>
+    </div>
+  )
+}
+
+function GearNode({ data, selected }: NodeProps) {
+  const d = data as unknown as NetworkNodeData
+  return (
+    <div
+      className={`relative px-3 py-2 rounded border-2 bg-yellow-50 min-w-[145px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-yellow-500'}`}
+      style={nodeRotationStyle(d)}
+    >
+      <NodeResizeHandles selected={selected} minWidth={145} minHeight={58} />
+      <PowerPort id="power-a" position={Position.Left} />
+      <PowerPort id="power-b" position={Position.Right} />
+      <div className="flex items-center gap-1.5 mb-0.5">
+        <SvgGearBox className="w-4 h-4 text-yellow-700 shrink-0" />
+        <span className="text-xs font-bold text-yellow-800">{d.label}</span>
+      </div>
+      <div className="text-xs text-yellow-700 pl-5">Nb/Na={d.gearRatio ?? 1}</div>
+      <div className="text-xs text-yellow-600 pl-5">η={d.gearEfficiency ?? 98}%</div>
     </div>
   )
 }
@@ -1094,7 +1424,11 @@ function TeeNode({ data, selected }: NodeProps) {
   const branchPosition = orientPosition(Position.Bottom, d)
   const outPosition = orientPosition(Position.Right, d)
   return (
-    <div className={`px-3 py-3 rounded border-2 bg-amber-50 min-w-[110px] text-center ${selected ? 'border-blue-500 shadow-lg' : 'border-amber-400'}`}>
+    <div
+      className={`relative px-3 py-3 rounded border-2 bg-amber-50 min-w-[110px] overflow-visible text-center ${selected ? 'border-blue-500 shadow-lg' : 'border-amber-400'}`}
+      style={nodeRotationStyle(d)}
+    >
+      <NodeResizeHandles selected={selected} minWidth={110} minHeight={58} />
       {mode === 'split' ? (
         <Handle type="target" position={inPosition} id="fluid-in" style={portHandleStyle('#f59e0b', 'in')} />
       ) : (
@@ -1141,7 +1475,11 @@ function SinkNode({ data, selected }: NodeProps) {
   const rho = d.rho ?? 1000
   const inPosition = orientPosition(Position.Left, d)
   return (
-    <div className={`px-3 py-2 rounded-xl border-2 bg-rose-50 min-w-[110px] ${selected ? 'border-blue-500 shadow-lg' : 'border-rose-400'}`}>
+    <div
+      className={`relative px-3 py-2 rounded-xl border-2 bg-rose-50 min-w-[110px] overflow-visible ${selected ? 'border-blue-500 shadow-lg' : 'border-rose-400'}`}
+      style={nodeRotationStyle(d)}
+    >
+      <NodeResizeHandles selected={selected} minWidth={110} minHeight={56} />
       <Handle type="target" position={inPosition} id="fluid-in" style={portHandleStyle('#fb7185', 'in')} />
       <div className="flex items-center gap-1.5 mb-0.5">
         <SvgSink className="w-4 h-4 text-rose-500 shrink-0" />
@@ -1180,17 +1518,29 @@ const nodeTypes: Record<string, any> = {
   pump: PumpNode,
   turbine: TurbineNode,
   heatExchanger: HeatExchangerNode,
+  twoFluidHeatExchanger: TwoFluidHeatExchangerNode,
   reducer: ReducerNode,
   elbow: ElbowNode,
   valve: ValveNode,
   motor: MotorNode,
   speedBoundary: SpeedBoundaryNode,
+  powerSplitter: PowerSplitterNode,
+  gear: GearNode,
   tee: TeeNode,
   teeMerge: TeeNode,
   sink: SinkNode,
 }
 
-type FlowEdgeData = Record<string, unknown> & { flowLabel?: string; labelVisible?: boolean; lineType?: LineType; fluidColor?: string }
+type FlowEdgeData = Record<string, unknown> & {
+  flowLabel?: string
+  labelVisible?: boolean
+  lineType?: LineType
+  fluidColor?: string
+  sourceVisualPosition?: Position
+  targetVisualPosition?: Position
+  sourceVisualPoint?: { x: number; y: number }
+  targetVisualPoint?: { x: number; y: number }
+}
 type FlowEdgeType = Edge<FlowEdgeData, 'flow'>
 
 function handleLineType(handleId?: string | null): LineType {
@@ -1215,13 +1565,17 @@ function FlowEdge({
   data,
   selected,
 }: EdgeProps<FlowEdgeType>) {
+  const visualSourceX = data?.sourceVisualPoint?.x ?? sourceX
+  const visualSourceY = data?.sourceVisualPoint?.y ?? sourceY
+  const visualTargetX = data?.targetVisualPoint?.x ?? targetX
+  const visualTargetY = data?.targetVisualPoint?.y ?? targetY
   const [edgePath, labelX, labelY] = getSmoothStepPath({
-    sourceX,
-    sourceY,
-    sourcePosition,
-    targetX,
-    targetY,
-    targetPosition,
+    sourceX: visualSourceX,
+    sourceY: visualSourceY,
+    sourcePosition: data?.sourceVisualPosition ?? sourcePosition,
+    targetX: visualTargetX,
+    targetY: visualTargetY,
+    targetPosition: data?.targetVisualPosition ?? targetPosition,
   })
   const lineType = data?.lineType ?? 'fluid'
   const stroke = selected ? '#f97316' : lineType === 'power' ? '#facc15' : data?.fluidColor ?? '#94a3b8'
@@ -1263,19 +1617,39 @@ const edgeTypes = { flow: FlowEdge } satisfies EdgeTypes
 
 // ── Palette ────────────────────────────────────────────────────────
 
-const PALETTE = [
-  { type: 'boundary', label: '境界',  sub: 'P / Q',  color: 'text-teal-300',    Icon: SvgSource },
-  { type: 'pipe',   label: 'パイプ',  sub: '直管',  color: 'text-sky-300',    Icon: SvgPipe },
-  { type: 'pump',   label: 'ポンプ',  sub: 'PQ',    color: 'text-violet-300', Icon: SvgPump },
-  { type: 'turbine', label: 'タービン', sub: '動力回収', color: 'text-emerald-300', Icon: SvgTurbine },
-  { type: 'heatExchanger', label: '熱交換器', sub: 'UA', color: 'text-orange-300', Icon: SvgHeatExchanger },
-  { type: 'reducer', label: '拡縮管', sub: 'ζ', color: 'text-lime-300', Icon: SvgReducer },
-  { type: 'elbow', label: 'エルボ', sub: 'θ/ζ', color: 'text-cyan-300', Icon: SvgElbow },
-  { type: 'valve', label: 'バルブ', sub: '開度/PQ', color: 'text-rose-300', Icon: SvgValve },
-  { type: 'motor', label: '誘導M', sub: '動力', color: 'text-yellow-300', Icon: SvgMotor },
-  { type: 'speedBoundary', label: '回転境界', sub: 'rpm', color: 'text-yellow-300', Icon: SvgSpeedBoundary },
-  { type: 'tee',    label: 'T字管',   sub: '分岐',  color: 'text-amber-300',  Icon: SvgTee },
-  { type: 'teeMerge', label: 'T字管', sub: '合流', color: 'text-amber-300', Icon: SvgTee },
+type PaletteCategory = 'basic' | 'equipment' | 'fitting' | 'power'
+type PaletteItem = {
+  type: string
+  label: string
+  sub: string
+  color: string
+  category: PaletteCategory
+  Icon: ({ className }: { className?: string }) => ReactElement
+}
+
+const PALETTE_CATEGORIES: { id: PaletteCategory; label: string }[] = [
+  { id: 'basic', label: '基本' },
+  { id: 'equipment', label: '機器' },
+  { id: 'fitting', label: '接手' },
+  { id: 'power', label: '動力' },
+]
+
+const PALETTE: PaletteItem[] = [
+  { type: 'boundary', label: '境界',  sub: 'P / Q',  color: 'text-teal-300', category: 'basic', Icon: SvgSource },
+  { type: 'pipe',   label: 'パイプ',  sub: '直管',  color: 'text-sky-300', category: 'basic', Icon: SvgPipe },
+  { type: 'pump',   label: 'ポンプ',  sub: 'PQ',    color: 'text-violet-300', category: 'equipment', Icon: SvgPump },
+  { type: 'turbine', label: 'タービン', sub: '動力回収', color: 'text-emerald-300', category: 'equipment', Icon: SvgTurbine },
+  { type: 'heatExchanger', label: '熱交換器', sub: 'UA', color: 'text-orange-300', category: 'equipment', Icon: SvgHeatExchanger },
+  { type: 'twoFluidHeatExchanger', label: '二流体HX', sub: 'hot/cold', color: 'text-orange-300', category: 'equipment', Icon: SvgHeatExchanger },
+  { type: 'reducer', label: '拡縮管', sub: 'ζ', color: 'text-lime-300', category: 'fitting', Icon: SvgReducer },
+  { type: 'elbow', label: 'エルボ', sub: 'θ/ζ', color: 'text-cyan-300', category: 'fitting', Icon: SvgElbow },
+  { type: 'valve', label: 'バルブ', sub: '開度/PQ', color: 'text-rose-300', category: 'fitting', Icon: SvgValve },
+  { type: 'tee',    label: 'T字管',   sub: '分岐',  color: 'text-amber-300', category: 'fitting', Icon: SvgTee },
+  { type: 'teeMerge', label: 'T字管', sub: '合流', color: 'text-amber-300', category: 'fitting', Icon: SvgTee },
+  { type: 'motor', label: '誘導M', sub: '動力', color: 'text-yellow-300', category: 'power', Icon: SvgMotor },
+  { type: 'speedBoundary', label: '回転境界', sub: 'rpm', color: 'text-yellow-300', category: 'power', Icon: SvgSpeedBoundary },
+  { type: 'powerSplitter', label: '動力分岐', sub: 'shaft', color: 'text-yellow-300', category: 'power', Icon: SvgPowerSplitter },
+  { type: 'gear', label: 'ギア', sub: 'ratio', color: 'text-yellow-300', category: 'power', Icon: SvgGearBox },
 ]
 
 function defaultData(type: string, n: number): NetworkNodeData {
@@ -1318,6 +1692,17 @@ function defaultData(type: string, n: number): NetworkNodeData {
       ratedFlow: 10,
       nominalPressureDrop: 10,
     }
+    case 'twoFluidHeatExchanger': return {
+      nodeType: 'twoFluidHeatExchanger', label: `二流体熱交換器${n}`,
+      hotFluidSystemId: DEFAULT_FLUID_SYSTEM_ID,
+      coldFluidSystemId: DEFAULT_FLUID_SYSTEM_ID,
+      heatTransferCoeff: 500,
+      heatTransferArea: 10,
+      hotRatedFlow: 10,
+      coldRatedFlow: 10,
+      hotNominalPressureDrop: 10,
+      coldNominalPressureDrop: 10,
+    }
     case 'reducer': return {
       nodeType: 'reducer', label: `拡縮管${n}`, fluidSystemId: DEFAULT_FLUID_SYSTEM_ID,
       diameterIn: 100,
@@ -1354,6 +1739,14 @@ function defaultData(type: string, n: number): NetworkNodeData {
       nodeType: 'speedBoundary', label: `回転境界${n}`,
       fixedSpeed: 1450,
     }
+    case 'powerSplitter': return {
+      nodeType: 'powerSplitter', label: `動力分岐${n}`,
+    }
+    case 'gear': return {
+      nodeType: 'gear', label: `ギア${n}`,
+      gearRatio: 1,
+      gearEfficiency: 98,
+    }
     case 'tee':  return { nodeType: 'tee',  label: `分岐T字管${n}`, fluidSystemId: DEFAULT_FLUID_SYSTEM_ID, teeMode: 'split' }
     case 'teeMerge': return { nodeType: 'tee', label: `合流T字管${n}`, fluidSystemId: DEFAULT_FLUID_SYSTEM_ID, teeMode: 'merge' }
     case 'sink': return { nodeType: 'sink', label: `シンク${n}`, fluidSystemId: DEFAULT_FLUID_SYSTEM_ID, boundaryType: 'pressure', pressure: 101.325, temperature: 293.15 }
@@ -1385,13 +1778,31 @@ function createDefaultDiagram(): { nodes: Node[]; edges: Edge[] } {
 
 // ── Vertical parameter panel (left column of bottom section) ───────
 
-function NumField({ label, unit, value, onChange }: {
-  label: string; unit: string; value: number; onChange: (v: number) => void
+function InfoTip({ text }: { text: string }) {
+  return (
+    <span className="relative inline-flex group">
+      <button
+        type="button"
+        className="flex h-4 w-4 items-center justify-center rounded-full border border-slate-300 bg-white text-[10px] font-bold leading-none text-slate-500 hover:border-blue-400 hover:text-blue-600 focus:outline-none focus:ring-2 focus:ring-blue-400"
+        aria-label="ヒント"
+      >
+        ?
+      </button>
+      <span className="pointer-events-none absolute left-1/2 top-5 z-30 hidden w-56 -translate-x-1/2 rounded-md border border-slate-200 bg-white px-3 py-2 text-xs font-normal leading-relaxed text-slate-600 shadow-lg group-hover:block group-focus-within:block">
+        {text}
+      </span>
+    </span>
+  )
+}
+
+function NumField({ label, unit, value, onChange, hint }: {
+  label: string; unit: string; value: number; onChange: (v: number) => void; hint?: string
 }) {
   return (
     <div className="flex flex-col gap-1">
-      <label className="text-xs font-medium text-gray-600">
-        {label} <span className="text-gray-400 font-normal">[{unit}]</span>
+      <label className="flex items-center gap-1.5 text-xs font-medium text-gray-600">
+        <span>{label} <span className="text-gray-400 font-normal">[{unit}]</span></span>
+        {hint && <InfoTip text={hint} />}
       </label>
       <input
         type="number" step="any" value={value}
@@ -1525,6 +1936,22 @@ function heatExchangerResultRows(result: PipeSegmentResult, unit: PressureUnit, 
   ]
 }
 
+function twoFluidHeatExchangerResultRows(result: PipeSegmentResult, unit: PressureUnit, rho: number): ResultRow[] {
+  return [
+    { item: '熱交換量', symbol: 'Q_heat', value: (result.heat_duty_kw ?? 0).toFixed(4), unit: 'kW', highlight: true },
+    ...(result.effectiveness !== undefined ? [{ item: '有効度', symbol: 'ε', value: result.effectiveness.toFixed(4), unit: '-' }] : []),
+    { item: 'Hot流量', symbol: 'Q_h', value: (result.hot_Q_m3h ?? 0).toFixed(3), unit: 'm³/h' },
+    { item: 'Cold流量', symbol: 'Q_c', value: (result.cold_Q_m3h ?? 0).toFixed(3), unit: 'm³/h' },
+    { item: 'Hot圧損', symbol: 'ΔP_h', value: formatPressure(result.hot_dP_kpa ?? 0, unit, rho), unit },
+    { item: 'Cold圧損', symbol: 'ΔP_c', value: formatPressure(result.cold_dP_kpa ?? 0, unit, rho), unit },
+    { item: 'Hot入口温度', symbol: 'T_h,in', value: result.hot_T_in_K !== undefined ? result.hot_T_in_K.toFixed(3) : '—', unit: 'K' },
+    { item: 'Hot出口温度', symbol: 'T_h,out', value: result.hot_T_out_K !== undefined ? result.hot_T_out_K.toFixed(3) : '—', unit: 'K', highlight: true },
+    { item: 'Cold入口温度', symbol: 'T_c,in', value: result.cold_T_in_K !== undefined ? result.cold_T_in_K.toFixed(3) : '—', unit: 'K' },
+    { item: 'Cold出口温度', symbol: 'T_c,out', value: result.cold_T_out_K !== undefined ? result.cold_T_out_K.toFixed(3) : '—', unit: 'K', highlight: true },
+    ...(result.UA_w_per_k !== undefined ? [{ item: 'UA', symbol: 'UA', value: result.UA_w_per_k.toFixed(3), unit: 'W/K' }] : []),
+  ]
+}
+
 function reducerResultRows(result: PipeSegmentResult, unit: PressureUnit, rho: number): ResultRow[] {
   const kind = result.reducer_kind === 'expansion'
     ? '拡大'
@@ -1633,6 +2060,21 @@ function speedBoundaryResultRows(d: NetworkNodeData): ResultRow[] {
   ]
 }
 
+function gearResultRows(d: NetworkNodeData): ResultRow[] {
+  return [
+    { item: 'ギア比', symbol: 'i', value: (d.gearRatio ?? 1).toFixed(4), unit: '-', highlight: true },
+    { item: '効率', symbol: 'η', value: (d.gearEfficiency ?? 98).toFixed(1), unit: '%' },
+    ...(d.speed !== undefined ? [{ item: 'A側回転数', symbol: 'N_a', value: d.speed.toFixed(1), unit: 'rpm' }] : []),
+    ...(d.speed !== undefined ? [{ item: 'B側回転数', symbol: 'N_b', value: (d.speed * (d.gearRatio ?? 1)).toFixed(1), unit: 'rpm', highlight: true }] : []),
+  ]
+}
+
+function powerSplitterResultRows(): ResultRow[] {
+  return [
+    { item: '動力分岐', symbol: 'shaft', value: '同一回転数', unit: '-', highlight: true },
+  ]
+}
+
 function boundaryResultRows(d: NetworkNodeData, unit: PressureUnit, rho: number): ResultRow[] | null {
   const isFlow = (d.boundaryType ?? 'flow') === 'flow'
   const temp = d.calcTemperature ?? d.result?.T_K ?? d.temperature
@@ -1681,11 +2123,14 @@ function componentTypeLabel(nodeType: string): string {
   if (nodeType === 'pump') return 'ポンプ'
   if (nodeType === 'turbine') return 'タービン'
   if (nodeType === 'heatExchanger') return '熱交換器'
+  if (nodeType === 'twoFluidHeatExchanger') return '二流体熱交換器'
   if (nodeType === 'reducer') return '拡縮管'
   if (nodeType === 'elbow') return 'エルボ'
   if (nodeType === 'valve') return 'バルブ'
   if (nodeType === 'motor') return '誘導モーター'
   if (nodeType === 'speedBoundary') return '回転境界'
+  if (nodeType === 'powerSplitter') return '動力分岐'
+  if (nodeType === 'gear') return 'ギア'
   if (nodeType === 'tee')  return 'T字管'
   return '境界'
 }
@@ -1696,11 +2141,14 @@ function componentResultRows(d: NetworkNodeData, unit: PressureUnit, rho: number
     : d.nodeType === 'pump' ? (d.result ? pumpResultRows(d.result, unit, rho) : null)
     : d.nodeType === 'turbine' ? (d.result ? turbineResultRows(d.result, unit, rho) : null)
     : d.nodeType === 'heatExchanger' ? (d.result ? heatExchangerResultRows(d.result, unit, rho) : null)
+    : d.nodeType === 'twoFluidHeatExchanger' ? (d.result ? twoFluidHeatExchangerResultRows(d.result, unit, rho) : null)
     : d.nodeType === 'reducer' ? (d.result ? reducerResultRows(d.result, unit, rho) : null)
     : d.nodeType === 'elbow' ? (d.result ? elbowResultRows(d.result, unit, rho) : null)
     : d.nodeType === 'valve' ? (d.result ? valveResultRows(d.result, unit, rho) : null)
     : d.nodeType === 'motor' ? motorResultRows(d)
     : d.nodeType === 'speedBoundary' ? speedBoundaryResultRows(d)
+    : d.nodeType === 'gear' ? gearResultRows(d)
+    : d.nodeType === 'powerSplitter' ? powerSplitterResultRows()
     : d.nodeType === 'tee' ? teeResultRows(d, unit, rho)
     : boundaryResultRows(d, unit, rho)
   return filterVisibleRows(rows, d)
@@ -1728,18 +2176,21 @@ function NodeParamPanel({ node, onChange, fluidSystems }: {
   }
 
   const isBoundaryNode = d.nodeType === 'boundary' || d.nodeType === 'source' || d.nodeType === 'sink'
-  const isFluidNode = d.nodeType !== 'motor' && d.nodeType !== 'speedBoundary'
+  const isFluidNode = !['motor', 'speedBoundary', 'powerSplitter', 'gear', 'twoFluidHeatExchanger'].includes(d.nodeType)
 
   const Icon = isBoundaryNode ? SvgSource
     : d.nodeType === 'pipe' ? SvgPipe
     : d.nodeType === 'pump' ? SvgPump
     : d.nodeType === 'turbine' ? SvgTurbine
     : d.nodeType === 'heatExchanger' ? SvgHeatExchanger
+    : d.nodeType === 'twoFluidHeatExchanger' ? SvgHeatExchanger
     : d.nodeType === 'reducer' ? SvgReducer
     : d.nodeType === 'elbow' ? SvgElbow
     : d.nodeType === 'valve' ? SvgValve
     : d.nodeType === 'motor' ? SvgMotor
     : d.nodeType === 'speedBoundary' ? SvgSpeedBoundary
+    : d.nodeType === 'powerSplitter' ? SvgPowerSplitter
+    : d.nodeType === 'gear' ? SvgGearBox
     : SvgTee
 
   const iconColor = isBoundaryNode ? 'text-teal-600'
@@ -1747,11 +2198,14 @@ function NodeParamPanel({ node, onChange, fluidSystems }: {
     : d.nodeType === 'pump' ? 'text-violet-600'
     : d.nodeType === 'turbine' ? 'text-emerald-600'
     : d.nodeType === 'heatExchanger' ? 'text-orange-600'
+    : d.nodeType === 'twoFluidHeatExchanger' ? 'text-orange-600'
     : d.nodeType === 'reducer' ? 'text-lime-700'
     : d.nodeType === 'elbow' ? 'text-cyan-700'
     : d.nodeType === 'valve' ? 'text-rose-700'
     : d.nodeType === 'motor' ? 'text-yellow-700'
     : d.nodeType === 'speedBoundary' ? 'text-yellow-700'
+    : d.nodeType === 'powerSplitter' ? 'text-yellow-700'
+    : d.nodeType === 'gear' ? 'text-yellow-700'
     : 'text-amber-600'
 
   return (
@@ -1882,7 +2336,13 @@ function NodeParamPanel({ node, onChange, fluidSystems }: {
 
         <div className="rounded-lg border border-violet-100 bg-violet-50/60 p-3 flex flex-col gap-3">
           <div className="text-xs font-semibold text-violet-600">回転数（相似則）</div>
-          <NumField label="基準回転数 Nr" unit="rpm" value={d.ratedSpeed ?? 1450} onChange={v => onChange({ ratedSpeed: v })} />
+          <NumField
+            label="基準回転数 Nr"
+            unit="rpm"
+            value={d.ratedSpeed ?? 1450}
+            onChange={v => onChange({ ratedSpeed: v })}
+            hint="PQ特性は基準回転数Nrで定義し、現在回転数Nは固定回転境界またはモーターとのトルク釣合で決定します。未接続時はNrで計算します。"
+          />
           <div className="rounded-md border border-violet-100 bg-white px-3 py-2">
             <div className="flex justify-between items-baseline gap-2">
               <span className="text-xs text-gray-500">動作回転数 N</span>
@@ -1899,14 +2359,12 @@ function NodeParamPanel({ node, onChange, fluidSystems }: {
               <span className="text-xs font-medium text-violet-600">{speedSolveModeLabel(d.speedSolveMode)}</span>
             </div>
           </div>
-          <p className="text-xs text-gray-400 leading-relaxed">
-            PQ特性は基準回転数Nrで定義し、現在回転数Nは固定回転境界またはモーターとのトルク釣合で決定します。未接続時はNrで計算します。
-          </p>
         </div>
 
         {(d.pumpCurveMode ?? 'quadratic') === 'quadratic' ? (<>
-          <div className="rounded-lg border border-violet-100 bg-violet-50 p-3 text-xs leading-relaxed text-violet-700">
-            H(Q) = H0 - aQ²、a = (H0 - Hr) / Qr² としてPQ曲線を作ります。QmaxはH=0となる流量として自動計算します。
+          <div className="flex items-center gap-1.5 rounded-lg border border-violet-100 bg-violet-50 px-3 py-2 text-xs font-semibold text-violet-700">
+            <span>簡易PQ曲線</span>
+            <InfoTip text="H(Q) = H0 - aQ^2、a = (H0 - Hr) / Qr^2 としてPQ曲線を作ります。QmaxはH=0となる流量として自動計算します。" />
           </div>
           <NumField label="定格流量 Qr" unit="m³/h" value={d.ratedFlow ?? 30} onChange={v => onChange({ ratedFlow: v })} />
           <NumField label="定格揚程 Hr" unit="m" value={d.ratedHead ?? 20} onChange={v => onChange({ ratedHead: v })} />
@@ -2010,6 +2468,37 @@ function NodeParamPanel({ node, onChange, fluidSystems }: {
         <NumField label="熱交換面積 A" unit="m²" value={d.heatTransferArea ?? 10} onChange={v => onChange({ heatTransferArea: v })} />
         <NumField label="定格流量 Qr" unit="m³/h" value={d.ratedFlow ?? 10} onChange={v => onChange({ ratedFlow: v })} />
         <NumField label="ノミナル圧損 ΔPn" unit="kPa" value={d.nominalPressureDrop ?? 10} onChange={v => onChange({ nominalPressureDrop: v })} />
+      </>)}
+
+      {d.nodeType === 'twoFluidHeatExchanger' && (<>
+        <div className="grid grid-cols-2 gap-2">
+          <div className="flex flex-col gap-1.5">
+            <label className="text-xs font-medium text-gray-600">Hot系統</label>
+            <select
+              value={d.hotFluidSystemId ?? fluidSystems[0]?.id ?? DEFAULT_FLUID_SYSTEM_ID}
+              onChange={e => onChange({ hotFluidSystemId: e.target.value })}
+              className="border border-gray-300 rounded-md px-2 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+            >
+              {fluidSystems.map(system => <option key={system.id} value={system.id}>{system.name}</option>)}
+            </select>
+          </div>
+          <div className="flex flex-col gap-1.5">
+            <label className="text-xs font-medium text-gray-600">Cold系統</label>
+            <select
+              value={d.coldFluidSystemId ?? fluidSystems[0]?.id ?? DEFAULT_FLUID_SYSTEM_ID}
+              onChange={e => onChange({ coldFluidSystemId: e.target.value })}
+              className="border border-gray-300 rounded-md px-2 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+            >
+              {fluidSystems.map(system => <option key={system.id} value={system.id}>{system.name}</option>)}
+            </select>
+          </div>
+        </div>
+        <NumField label="総括熱伝達率 U" unit="W/m²/K" value={d.heatTransferCoeff ?? 500} onChange={v => onChange({ heatTransferCoeff: v })} />
+        <NumField label="熱交換面積 A" unit="m²" value={d.heatTransferArea ?? 10} onChange={v => onChange({ heatTransferArea: v })} />
+        <NumField label="Hot定格流量 Qh,r" unit="m³/h" value={d.hotRatedFlow ?? 10} onChange={v => onChange({ hotRatedFlow: v })} />
+        <NumField label="Cold定格流量 Qc,r" unit="m³/h" value={d.coldRatedFlow ?? 10} onChange={v => onChange({ coldRatedFlow: v })} />
+        <NumField label="Hotノミナル圧損 ΔPh,n" unit="kPa" value={d.hotNominalPressureDrop ?? 10} onChange={v => onChange({ hotNominalPressureDrop: v })} />
+        <NumField label="Coldノミナル圧損 ΔPc,n" unit="kPa" value={d.coldNominalPressureDrop ?? 10} onChange={v => onChange({ coldNominalPressureDrop: v })} />
       </>)}
 
       {/* ── Reducer / Expander ── */}
@@ -2188,6 +2677,29 @@ function NodeParamPanel({ node, onChange, fluidSystems }: {
         <NumField label="固定回転数 N" unit="rpm" value={d.fixedSpeed ?? 1450} onChange={v => onChange({ fixedSpeed: v })} />
       )}
 
+      {d.nodeType === 'gear' && (<>
+        <NumField
+          label="ギア比 Nb/Na"
+          unit="-"
+          value={d.gearRatio ?? 1}
+          onChange={v => onChange({ gearRatio: Math.max(v, 1e-9) })}
+          hint="左ポートAの回転数をNa、右ポートBの回転数をNbとして、Nb = Na × ギア比 で計算します。"
+        />
+        <NumField
+          label="効率 η"
+          unit="%"
+          value={d.gearEfficiency ?? 98}
+          onChange={v => onChange({ gearEfficiency: Math.min(Math.max(v, 0), 100) })}
+          hint="現段階では表示・設計値として保持します。回転数比は反映され、損失を含む詳細な動力収支は次段階で拡張します。"
+        />
+      </>)}
+
+      {d.nodeType === 'powerSplitter' && (
+        <div className="rounded-lg border border-yellow-100 bg-yellow-50 p-3 text-xs leading-relaxed text-yellow-700">
+          複数の動力ラインを同じ回転軸として接続する分岐点です。スプリッタ自身は回転数比を持ちません。
+        </div>
+      )}
+
       {/* ── Tee ── */}
       {d.nodeType === 'tee' && (
         <div className="flex flex-col gap-1.5">
@@ -2314,6 +2826,19 @@ function ResultsPanel({ node, pressureUnit, rho, onToggleResultSymbol }: {
     )
   }
 
+  if (d.nodeType === 'twoFluidHeatExchanger') {
+    if (!d.result) return empty
+    return (
+      <ResultTable
+        theme="orange"
+        title="計算結果 — 二流体熱交換器"
+        rows={twoFluidHeatExchangerResultRows(d.result, pressureUnit, rho)}
+        selectedSymbols={d.resultVisibleSymbols}
+        onToggleSymbol={(symbol, checked, allSymbols) => onToggleResultSymbol(node.id, symbol, checked, allSymbols)}
+      />
+    )
+  }
+
   if (d.nodeType === 'reducer') {
     if (!d.result) return empty
     return (
@@ -2371,6 +2896,18 @@ function ResultsPanel({ node, pressureUnit, rho, onToggleResultSymbol }: {
         theme="amber"
         title="設定値 — 回転境界"
         rows={speedBoundaryResultRows(d)}
+        selectedSymbols={d.resultVisibleSymbols}
+        onToggleSymbol={(symbol, checked, allSymbols) => onToggleResultSymbol(node.id, symbol, checked, allSymbols)}
+      />
+    )
+  }
+
+  if (d.nodeType === 'gear' || d.nodeType === 'powerSplitter') {
+    return (
+      <ResultTable
+        theme="amber"
+        title={d.nodeType === 'gear' ? '設定値 — ギア' : '設定値 — 動力分岐'}
+        rows={d.nodeType === 'gear' ? gearResultRows(d) : powerSplitterResultRows()}
         selectedSymbols={d.resultVisibleSymbols}
         onToggleSymbol={(symbol, checked, allSymbols) => onToggleResultSymbol(node.id, symbol, checked, allSymbols)}
       />
@@ -3087,6 +3624,11 @@ function PipeNetworkCalcInner() {
   const rho = selectedFluidSystem?.density ?? (parseFloat(density) || 1000)
   const selectedRho = selectedData ? fluidSystemForNode(selectedData, fluidSystems).density : rho
   const powerSpeedResolution = useMemo(() => resolvePowerSpeeds(nodes, edges, fluidSystems), [nodes, edges, fluidSystems])
+  const [activePaletteCategory, setActivePaletteCategory] = useState<PaletteCategory>('basic')
+  const paletteItems = useMemo(
+    () => PALETTE.filter(item => item.category === activePaletteCategory),
+    [activePaletteCategory],
+  )
 
   const updateFluidSystem = useCallback((id: string, updates: Partial<FluidSystem>) => {
     setFluidSystems(prev => prev.map(system => system.id === id ? { ...system, ...updates } : system))
@@ -3118,8 +3660,12 @@ function PipeNetworkCalcInner() {
       setSelectedFluidSystemId(current => current === id ? fallback.id : current)
       setNodes(nodesPrev => nodesPrev.map(n => {
         const d = n.data as unknown as NetworkNodeData
-        if ((d.fluidSystemId ?? prev[0].id) !== id) return n
-        return { ...n, data: { ...d, fluidSystemId: fallback.id } as NetworkNodeData }
+        const updates: Partial<NetworkNodeData> = {}
+        if ((d.fluidSystemId ?? prev[0].id) === id) updates.fluidSystemId = fallback.id
+        if ((d.hotFluidSystemId ?? prev[0].id) === id) updates.hotFluidSystemId = fallback.id
+        if ((d.coldFluidSystemId ?? prev[0].id) === id) updates.coldFluidSystemId = fallback.id
+        if (Object.keys(updates).length === 0) return n
+        return { ...n, data: { ...d, ...updates } as NetworkNodeData }
       }))
       return prev.filter(system => system.id !== id)
     })
@@ -3135,10 +3681,10 @@ function PipeNetworkCalcInner() {
       const resolvedSpeed = powerSpeedResolution.speeds.get(n.id)
       const resolvedTorque = powerSpeedResolution.torques.get(n.id)
       const solveMode = powerSpeedResolution.modes.get(n.id)
-      const displayData = ['pump', 'motor', 'turbine'].includes(data.nodeType)
+      const displayData = ['pump', 'motor', 'turbine', 'gear'].includes(data.nodeType)
         ? {
           ...data,
-          speed: resolvedSpeed ?? (data.nodeType === 'motor' ? motorRatedSpeed(data) : data.ratedSpeed ?? 1450),
+          speed: resolvedSpeed ?? (data.nodeType === 'motor' ? motorRatedSpeed(data) : data.nodeType === 'gear' ? undefined : data.ratedSpeed ?? 1450),
           ...(resolvedTorque !== undefined ? { shaftTorque: resolvedTorque } : {}),
           ...(solveMode !== undefined ? { speedSolveMode: solveMode } : {}),
         }
@@ -3166,6 +3712,22 @@ function PipeNetworkCalcInner() {
       fluidColor: ((e.data as FlowEdgeData | undefined)?.lineType ?? 'fluid') === 'fluid'
         ? fluidColorForEdge(e, nodes, fluidSystems)
         : undefined,
+      sourceVisualPosition: (() => {
+        const sourceData = nodes.find(n => n.id === e.source)?.data as unknown as NetworkNodeData | undefined
+        return sourceData ? visualPortPosition(sourceData, e.sourceHandle) : undefined
+      })(),
+      targetVisualPosition: (() => {
+        const targetData = nodes.find(n => n.id === e.target)?.data as unknown as NetworkNodeData | undefined
+        return targetData ? visualPortPosition(targetData, e.targetHandle) : undefined
+      })(),
+      sourceVisualPoint: (() => {
+        const sourceNode = nodes.find(n => n.id === e.source)
+        return sourceNode ? rotatedPortPoint(sourceNode, e.sourceHandle) : undefined
+      })(),
+      targetVisualPoint: (() => {
+        const targetNode = nodes.find(n => n.id === e.target)
+        return targetNode ? rotatedPortPoint(targetNode, e.targetHandle) : undefined
+      })(),
     },
   })), [edges, nodes, fluidSystems, showLineResults])
   const selectedDisplayNode: Node | null = displayNodes.find(n => n.id === selectedId) ?? selectedNode
@@ -3273,7 +3835,14 @@ function PipeNetworkCalcInner() {
     const data = defaultData(type, nodeCounter.current)
     setNodes(prev => [...prev, {
       id, type, position: pos,
-      data: { ...data, ...(!['motor', 'speedBoundary'].includes(data.nodeType) ? { fluidSystemId: selectedFluidSystemId } : {}) } as NetworkNodeData,
+      data: {
+        ...data,
+        ...(data.nodeType === 'twoFluidHeatExchanger'
+          ? { hotFluidSystemId: selectedFluidSystemId, coldFluidSystemId: selectedFluidSystemId }
+          : !['motor', 'speedBoundary', 'powerSplitter', 'gear'].includes(data.nodeType)
+            ? { fluidSystemId: selectedFluidSystemId }
+            : {}),
+      } as NetworkNodeData,
     }])
   }, [screenToFlowPosition, selectedFluidSystemId, setNodes])
 
@@ -3348,8 +3917,8 @@ function PipeNetworkCalcInner() {
             params: {
               ...(n.data as Record<string, unknown>),
               ...(!['motor', 'speedBoundary'].includes(d.nodeType) ? { fluidSystemId: d.fluidSystemId ?? fluidSystems[0]?.id ?? DEFAULT_FLUID_SYSTEM_ID } : {}),
-              ...(['pump', 'motor', 'turbine'].includes(d.nodeType) ? {
-                speed: resolvedSpeed ?? (d.nodeType === 'motor' ? motorRatedSpeed(d) : d.ratedSpeed ?? 1450),
+              ...(['pump', 'motor', 'turbine', 'gear'].includes(d.nodeType) ? {
+                speed: resolvedSpeed ?? (d.nodeType === 'motor' ? motorRatedSpeed(d) : d.nodeType === 'gear' ? undefined : d.ratedSpeed ?? 1450),
                 ...(resolvedTorque !== undefined ? { shaftTorque: resolvedTorque } : {}),
                 ...(solveMode !== undefined ? { speedSolveMode: solveMode } : {}),
               } : {}),
@@ -3388,8 +3957,8 @@ function PipeNetworkCalcInner() {
         return {
           ...d,
           rho: system.density,
-          ...(['pump', 'motor', 'turbine'].includes(d.nodeType) ? {
-            speed: resolvedSpeed ?? (d.nodeType === 'motor' ? motorRatedSpeed(d) : d.ratedSpeed ?? 1450),
+          ...(['pump', 'motor', 'turbine', 'gear'].includes(d.nodeType) ? {
+            speed: resolvedSpeed ?? (d.nodeType === 'motor' ? motorRatedSpeed(d) : d.nodeType === 'gear' ? undefined : d.ratedSpeed ?? 1450),
             ...(resolvedTorque !== undefined ? { shaftTorque: resolvedTorque } : {}),
             ...(solveMode !== undefined ? { speedSolveMode: solveMode } : {}),
           } : {}),
@@ -3422,8 +3991,8 @@ function PipeNetworkCalcInner() {
         const sourceData = nodeById.get(edge.source)?.data as unknown as NetworkNodeData | undefined
         const targetData = nodeById.get(edge.target)?.data as unknown as NetworkNodeData | undefined
         const elementId =
-          sourceData?.nodeType === 'pipe' || sourceData?.nodeType === 'pump' || sourceData?.nodeType === 'turbine' || sourceData?.nodeType === 'heatExchanger' || sourceData?.nodeType === 'reducer' || sourceData?.nodeType === 'elbow' || sourceData?.nodeType === 'valve' ? edge.source
-          : targetData?.nodeType === 'pipe' || targetData?.nodeType === 'pump' || targetData?.nodeType === 'turbine' || targetData?.nodeType === 'heatExchanger' || targetData?.nodeType === 'reducer' || targetData?.nodeType === 'elbow' || targetData?.nodeType === 'valve' ? edge.target
+          sourceData?.nodeType === 'pipe' || sourceData?.nodeType === 'pump' || sourceData?.nodeType === 'turbine' || sourceData?.nodeType === 'heatExchanger' || sourceData?.nodeType === 'twoFluidHeatExchanger' || sourceData?.nodeType === 'reducer' || sourceData?.nodeType === 'elbow' || sourceData?.nodeType === 'valve' ? edge.source
+          : targetData?.nodeType === 'pipe' || targetData?.nodeType === 'pump' || targetData?.nodeType === 'turbine' || targetData?.nodeType === 'heatExchanger' || targetData?.nodeType === 'twoFluidHeatExchanger' || targetData?.nodeType === 'reducer' || targetData?.nodeType === 'elbow' || targetData?.nodeType === 'valve' ? edge.target
           : null
         if (!elementId) return undefined
 
@@ -3510,6 +4079,41 @@ function PipeNetworkCalcInner() {
 
           <div className="w-px h-5 bg-gray-200 shrink-0" />
 
+          {/* Manual props (filled from CoolProp or manually) */}
+          <div className="flex items-center gap-2 flex-wrap">
+            <InlineField
+              label="密度 ρ"
+              unit="kg/m³"
+              value={selectedFluidSystem ? selectedFluidSystem.density.toString() : density}
+              onChange={value => {
+                setDensity(value)
+                if (selectedFluidSystem) updateFluidSystem(selectedFluidSystem.id, { density: Number(value) || 0 })
+              }}
+              width="w-24"
+            />
+            <InlineField
+              label="粘度 μ"
+              unit="mPa·s"
+              value={selectedFluidSystem ? (selectedFluidSystem.viscosity * 1000).toString() : viscosity}
+              onChange={value => {
+                setViscosity(value)
+                if (selectedFluidSystem) updateFluidSystem(selectedFluidSystem.id, { viscosity: (Number(value) || 0) / 1000 })
+              }}
+              width="w-20"
+            />
+            {selectedFluidSystem && (
+              <InlineField
+                label="比熱 Cp"
+                unit="J/kg/K"
+                value={selectedFluidSystem.specificHeat.toString()}
+                onChange={value => updateFluidSystem(selectedFluidSystem.id, { specificHeat: Number(value) || 0 })}
+                width="w-24"
+              />
+            )}
+          </div>
+
+          <div className="w-px h-5 bg-gray-200 shrink-0" />
+
           {/* CoolProp lookup */}
           <div className="flex items-center gap-2 flex-wrap">
             <span className="text-xs font-medium text-gray-500 shrink-0">CoolProp</span>
@@ -3531,113 +4135,104 @@ function PipeNetworkCalcInner() {
             </button>
             {coolError && <span className="text-xs text-red-500">{coolError}</span>}
           </div>
-
-          <div className="w-px h-5 bg-gray-200 shrink-0" />
-
-          {/* Manual props (filled from CoolProp or manually) */}
-          <InlineField
-            label="密度 ρ"
-            unit="kg/m³"
-            value={selectedFluidSystem ? selectedFluidSystem.density.toString() : density}
-            onChange={value => {
-              setDensity(value)
-              if (selectedFluidSystem) updateFluidSystem(selectedFluidSystem.id, { density: Number(value) || 0 })
-            }}
-            width="w-24"
-          />
-          <InlineField
-            label="粘度 μ"
-            unit="mPa·s"
-            value={selectedFluidSystem ? (selectedFluidSystem.viscosity * 1000).toString() : viscosity}
-            onChange={value => {
-              setViscosity(value)
-              if (selectedFluidSystem) updateFluidSystem(selectedFluidSystem.id, { viscosity: (Number(value) || 0) / 1000 })
-            }}
-            width="w-20"
-          />
-          {selectedFluidSystem && (
-            <InlineField
-              label="比熱 Cp"
-              unit="J/kg/K"
-              value={selectedFluidSystem.specificHeat.toString()}
-              onChange={value => updateFluidSystem(selectedFluidSystem.id, { specificHeat: Number(value) || 0 })}
-              width="w-24"
-            />
-          )}
-
-          <div className="w-px h-5 bg-gray-200 shrink-0" />
-
-          <label className="flex items-center gap-2 text-sm text-gray-600 cursor-pointer select-none shrink-0">
-            <input
-              type="checkbox"
-              checked={showPressureResults}
-              onChange={e => setShowPressureResults(e.target.checked)}
-              className="h-4 w-4 accent-blue-600"
-            />
-            圧力表示
-          </label>
-
-          <label className="flex items-center gap-2 text-sm text-gray-600 cursor-pointer select-none shrink-0">
-            <input
-              type="checkbox"
-              checked={showLineResults}
-              onChange={e => setShowLineResults(e.target.checked)}
-              className="h-4 w-4 accent-blue-600"
-            />
-            流量表示
-          </label>
-
-          <div className="flex items-center gap-2 shrink-0">
-            <span className="text-sm text-gray-600">圧力単位</span>
-            <select
-              value={pressureUnit}
-              onChange={e => setPressureUnit(e.target.value as PressureUnit)}
-              className="border border-gray-300 rounded-md px-2 py-1.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
-            >
-              {PRESSURE_UNITS.map(u => <option key={u} value={u}>{u}</option>)}
-            </select>
-          </div>
-
-          <div className="w-px h-5 bg-gray-200 shrink-0" />
-
-          <button
-            onClick={handleCalc}
-            disabled={loading || nodes.length === 0}
-            className="bg-blue-600 hover:bg-blue-700 text-white text-sm px-5 py-2 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
-          >
-            {loading ? '計算中...' : '計算開始'}
-          </button>
-
-          <button
-            onClick={clearSketch}
-            disabled={nodes.length === 0 && edges.length === 0}
-            className="border border-gray-300 text-gray-600 hover:bg-gray-50 text-sm px-4 py-2 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
-          >
-            スケッチをクリア
-          </button>
-          {error && <span className="text-sm text-red-500">{error}</span>}
-
-          {totalDp !== null && (
-            <div className="ml-auto flex items-center gap-2 shrink-0">
-              <span className="text-sm text-gray-500">合計 ΔP:</span>
-              <span className="text-xl font-bold text-red-600 tabular-nums">{formatPressure(totalDp, pressureUnit, rho)}</span>
-              <span className="text-sm text-gray-500">{pressureUnit}</span>
-            </div>
-          )}
         </div>
       </div>
 
       {/* ── Section 2: ダイアグラム ──────────────────────────── */}
-      <div className="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden" style={{ height: 520 }}>
-        <div className="flex h-full">
+      <div className="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden" style={{ height: 560 }}>
+        <div className="flex min-h-0 h-full flex-col">
+          <div className="flex items-center gap-4 border-b border-gray-200 bg-slate-50 px-4 py-3 flex-wrap">
+            <span className="text-sm font-semibold text-gray-700 shrink-0">ダイアグラム設定</span>
+            <div className="w-px h-5 bg-gray-200 shrink-0" />
+
+            <label className="flex items-center gap-2 text-sm text-gray-600 cursor-pointer select-none shrink-0">
+              <input
+                type="checkbox"
+                checked={showPressureResults}
+                onChange={e => setShowPressureResults(e.target.checked)}
+                className="h-4 w-4 accent-blue-600"
+              />
+              圧力表示
+            </label>
+
+            <label className="flex items-center gap-2 text-sm text-gray-600 cursor-pointer select-none shrink-0">
+              <input
+                type="checkbox"
+                checked={showLineResults}
+                onChange={e => setShowLineResults(e.target.checked)}
+                className="h-4 w-4 accent-blue-600"
+              />
+              流量表示
+            </label>
+
+            <div className="flex items-center gap-2 shrink-0">
+              <span className="text-sm text-gray-600">圧力単位</span>
+              <select
+                value={pressureUnit}
+                onChange={e => setPressureUnit(e.target.value as PressureUnit)}
+                className="border border-gray-300 rounded-md px-2 py-1.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+              >
+                {PRESSURE_UNITS.map(u => <option key={u} value={u}>{u}</option>)}
+              </select>
+            </div>
+
+            <div className="w-px h-5 bg-gray-200 shrink-0" />
+
+            <button
+              onClick={handleCalc}
+              disabled={loading || nodes.length === 0}
+              className="bg-blue-600 hover:bg-blue-700 text-white text-sm px-5 py-2 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
+            >
+              {loading ? '計算中...' : '計算開始'}
+            </button>
+
+            <button
+              onClick={clearSketch}
+              disabled={nodes.length === 0 && edges.length === 0}
+              className="border border-gray-300 bg-white text-gray-600 hover:bg-gray-50 text-sm px-4 py-2 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
+            >
+              スケッチをクリア
+            </button>
+
+            {error && <span className="text-sm text-red-500">{error}</span>}
+
+            {totalDp !== null && (
+              <div className="ml-auto flex items-center gap-2 shrink-0">
+                <span className="text-sm text-gray-500">合計 ΔP:</span>
+                <span className="text-xl font-bold text-red-600 tabular-nums">{formatPressure(totalDp, pressureUnit, rho)}</span>
+                <span className="text-sm text-gray-500">{pressureUnit}</span>
+              </div>
+            )}
+          </div>
+
+          <div className="flex min-h-0 flex-1">
 
           {/* Palette */}
-          <div className="w-28 shrink-0 bg-slate-800 text-white flex flex-col select-none">
+          <div className="w-36 shrink-0 bg-slate-800 text-white flex flex-col select-none">
             <div className="px-2 py-2 text-xs font-semibold text-slate-400 uppercase tracking-wide border-b border-slate-700 text-center">
               部品
             </div>
+            <div className="grid grid-cols-2 gap-1 p-2 border-b border-slate-700">
+              {PALETTE_CATEGORIES.map(category => {
+                const active = category.id === activePaletteCategory
+                return (
+                  <button
+                    key={category.id}
+                    type="button"
+                    onClick={() => setActivePaletteCategory(category.id)}
+                    className={`h-7 rounded border text-xs font-semibold transition-colors ${
+                      active
+                        ? 'border-sky-400 bg-sky-500/20 text-sky-100'
+                        : 'border-slate-700 bg-slate-900/40 text-slate-400 hover:bg-slate-700 hover:text-slate-100'
+                    }`}
+                  >
+                    {category.label}
+                  </button>
+                )
+              })}
+            </div>
             <div className="min-h-0 flex-1 overflow-y-auto">
-              {PALETTE.map(item => (
+              {paletteItems.map(item => (
                 <div
                   key={item.type}
                   draggable
@@ -3701,6 +4296,7 @@ function PipeNetworkCalcInner() {
               <Controls />
               <MiniMap nodeStrokeWidth={2} zoomable pannable />
             </ReactFlow>
+          </div>
           </div>
         </div>
       </div>

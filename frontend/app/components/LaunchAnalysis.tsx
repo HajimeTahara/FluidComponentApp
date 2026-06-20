@@ -1,8 +1,10 @@
 'use client'
 
 import dynamic from 'next/dynamic'
-import { useMemo, useState } from 'react'
-import { simulateLaunch, type LaunchRequest, type LaunchResult } from '@/app/lib/api'
+import { useCallback, useMemo, useState } from 'react'
+import { simulateLaunch, type LaunchRequest, type LaunchResult, type StageSpec, type Vehicle } from '@/app/lib/api'
+import RocketBuilder from './RocketBuilder'
+import VehicleDatabase from './VehicleDatabase'
 
 const Plot = dynamic(() => import('react-plotly.js'), { ssr: false })
 
@@ -68,10 +70,8 @@ function StatItem({ label, value, color = 'text-gray-900' }: { label: string; va
 // ── Form state ─────────────────────────────────────────────────────
 
 interface FormState {
-  initialMass: string
-  propellantMass: string
-  thrust: string
-  burnTime: string
+  stages: StageSpec[]
+  payloadMass: string
   launchAngle: string
   dragEnabled: boolean
   dragCoefficient: string
@@ -81,10 +81,8 @@ interface FormState {
 }
 
 const DEFAULT_FORM: FormState = {
-  initialMass: '500',
-  propellantMass: '300',
-  thrust: '12000',
-  burnTime: '20',
+  stages: [],
+  payloadMass: '50',
   launchAngle: '90',
   dragEnabled: false,
   dragCoefficient: '0.5',
@@ -106,15 +104,29 @@ export default function LaunchAnalysis() {
     setForm(prev => ({ ...prev, [field]: value }))
   }
 
+  const handleStagesChange = useCallback((stages: StageSpec[]) => {
+    setForm(prev => ({ ...prev, stages }))
+  }, [])
+
+  function loadVehicle(v: Vehicle) {
+    setForm(prev => ({
+      ...prev,
+      stages: v.stages,
+      payloadMass: String(v.payload_mass),
+      launchAngle: String(v.launch_angle),
+      dragEnabled: v.drag_enabled,
+      dragCoefficient: String(v.drag_coefficient),
+      crossSectionArea: String(v.cross_section_area),
+    }))
+  }
+
   async function handleCalc() {
     setError(null)
     setLoading(true)
     try {
       const payload: LaunchRequest = {
-        initial_mass: parseFloat(form.initialMass),
-        propellant_mass: parseFloat(form.propellantMass),
-        thrust: parseFloat(form.thrust),
-        burn_time: parseFloat(form.burnTime),
+        stages: form.stages,
+        payload_mass: parseFloat(form.payloadMass),
         launch_angle: parseFloat(form.launchAngle),
         drag_enabled: form.dragEnabled,
         drag_coefficient: parseFloat(form.dragCoefficient),
@@ -157,167 +169,194 @@ export default function LaunchAnalysis() {
   }, [result, series])
 
   return (
-    <div className="flex gap-6">
+    <div className="flex flex-col gap-6">
+      <RocketBuilder onStagesChange={handleStagesChange} />
 
-      {/* ─── Settings Panel ──────────────────────────────────── */}
-      <div className="w-72 shrink-0 bg-white rounded-lg border border-gray-200 p-4 flex flex-col gap-3 overflow-y-auto" style={{ maxHeight: 'calc(100vh - 160px)' }}>
+      <div className="flex gap-6">
 
-        <div>
-          <SectionHeader>機体</SectionHeader>
-          <Field label="機体全備質量 m₀" unit="kg" value={form.initialMass} onChange={v => set('initialMass', v)} />
-          <Field label="推進剤質量 mₚ" unit="kg" value={form.propellantMass} onChange={v => set('propellantMass', v)} />
-        </div>
+        {/* ─── Settings Panel ──────────────────────────────────── */}
+        <div className="w-72 shrink-0 bg-white rounded-lg border border-gray-200 p-4 flex flex-col gap-3 overflow-y-auto" style={{ maxHeight: 'calc(100vh - 160px)' }}>
 
-        <hr className="border-gray-100" />
+          <div>
+            <SectionHeader>機体（段数 {form.stages.length}）</SectionHeader>
+            <Field label="ペイロード質量" unit="kg" value={form.payloadMass} onChange={v => set('payloadMass', v)} />
+            <p className="text-xs text-gray-400 -mt-1">上のキャンバスで各段を設計し「この段を計算」を押すと反映されます</p>
+          </div>
 
-        <div>
-          <SectionHeader>推力系</SectionHeader>
-          <Field label="推力 F" unit="N" value={form.thrust} onChange={v => set('thrust', v)} />
-          <Field label="燃焼時間" unit="s" value={form.burnTime} onChange={v => set('burnTime', v)} />
-          <Field label="発射角度（水平基準）" unit="deg" value={form.launchAngle} onChange={v => set('launchAngle', v)} />
-          <p className="text-xs text-gray-400 -mt-1">90° = 垂直打ち上げ</p>
-        </div>
+          <hr className="border-gray-100" />
 
-        <hr className="border-gray-100" />
+          <div>
+            <SectionHeader>発射条件</SectionHeader>
+            <Field label="発射角度（水平基準）" unit="deg" value={form.launchAngle} onChange={v => set('launchAngle', v)} />
+            <p className="text-xs text-gray-400 -mt-1">90° = 垂直打ち上げ</p>
+          </div>
 
-        <div>
-          <SectionHeader>空気抵抗</SectionHeader>
-          <label className="flex items-center gap-2 cursor-pointer select-none mb-2">
-            <input
-              type="checkbox"
-              checked={form.dragEnabled}
-              onChange={e => set('dragEnabled', e.target.checked)}
-              className="accent-blue-500"
+          <hr className="border-gray-100" />
+
+          <div>
+            <SectionHeader>空気抵抗</SectionHeader>
+            <label className="flex items-center gap-2 cursor-pointer select-none mb-2">
+              <input
+                type="checkbox"
+                checked={form.dragEnabled}
+                onChange={e => set('dragEnabled', e.target.checked)}
+                className="accent-blue-500"
+              />
+              <span className="text-sm">空気抵抗を考慮する</span>
+            </label>
+            <Field
+              label="抗力係数 Cd"
+              unit="-"
+              value={form.dragCoefficient}
+              onChange={v => set('dragCoefficient', v)}
+              disabled={!form.dragEnabled}
             />
-            <span className="text-sm">空気抵抗を考慮する</span>
-          </label>
-          <Field
-            label="抗力係数 Cd"
-            unit="-"
-            value={form.dragCoefficient}
-            onChange={v => set('dragCoefficient', v)}
-            disabled={!form.dragEnabled}
-          />
-          <Field
-            label="機体投影面積 A"
-            unit="m²"
-            value={form.crossSectionArea}
-            onChange={v => set('crossSectionArea', v)}
-            disabled={!form.dragEnabled}
-          />
-          {form.dragEnabled && (
-            <p className="text-xs text-gray-400 -mt-1">指数大気モデル（海面ρ=1.225 kg/m³, スケール高度8.5km）</p>
+            <Field
+              label="機体投影面積 A"
+              unit="m²"
+              value={form.crossSectionArea}
+              onChange={v => set('crossSectionArea', v)}
+              disabled={!form.dragEnabled}
+            />
+            {form.dragEnabled && (
+              <p className="text-xs text-gray-400 -mt-1">指数大気モデル（海面ρ=1.225 kg/m³, スケール高度8.5km）</p>
+            )}
+          </div>
+
+          <hr className="border-gray-100" />
+
+          <div>
+            <SectionHeader>シミュレーション設定</SectionHeader>
+            <Field label="最大計算時間" unit="s" value={form.duration} onChange={v => set('duration', v)} />
+            <Field label="刻み幅 dt" unit="s" value={form.dt} onChange={v => set('dt', v)} />
+          </div>
+
+          <button
+            onClick={handleCalc}
+            disabled={loading}
+            className="w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-2.5 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {loading ? '計算中...' : '計算する'}
+          </button>
+        </div>
+
+        {/* ─── Results Panel ────────────────────────────────────── */}
+        <div className="flex-1 min-w-0 flex flex-col gap-4">
+
+          {error && (
+            <div className="bg-red-50 border border-red-200 rounded-lg p-3 text-red-700 text-sm">
+              {error}
+            </div>
+          )}
+
+          {result ? (<>
+
+            {/* Summary */}
+            <div className="bg-white rounded-lg border border-gray-200 p-4">
+              <div className="flex gap-8 flex-wrap mb-3">
+                <StatItem label="最大到達高度" value={`${result.stats.apogee_altitude_m.toFixed(1)} m`} color="text-blue-600" />
+                <StatItem label="最高到達時刻" value={`${result.stats.apogee_time_s.toFixed(1)} s`} />
+                <StatItem label="最大速度" value={`${result.stats.max_speed_ms.toFixed(1)} m/s`} color="text-red-500" />
+                <StatItem
+                  label={result.landed ? '飛行時間（着地）' : '飛行時間（計算終了）'}
+                  value={`${result.stats.flight_time_s.toFixed(1)} s`}
+                />
+                <StatItem label="ダウンレンジ距離" value={`${result.stats.downrange_m.toFixed(1)} m`} />
+                <StatItem label="推力重量比 T/W（第1段）" value={result.stats.thrust_to_weight.toFixed(2)} />
+                <StatItem label="速度増分 Δv（全段）" value={`${result.stats.delta_v_ms.toFixed(1)} m/s`} />
+              </div>
+              {result.stats.stage_burnouts.length > 0 && (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="text-left text-gray-500 border-b border-gray-200">
+                        <th className="py-1.5 pr-3">段</th>
+                        <th className="py-1.5 pr-3">燃焼終了時刻</th>
+                        <th className="py-1.5 pr-3">燃焼終了高度</th>
+                        <th className="py-1.5 pr-3">燃焼終了速度</th>
+                        <th className="py-1.5 pr-3">燃焼終了質量</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {result.stats.stage_burnouts.map(b => (
+                        <tr key={b.stage_index} className="border-b border-gray-100 last:border-0">
+                          <td className="py-1.5 pr-3 font-medium text-gray-900">第{b.stage_index}段</td>
+                          <td className="py-1.5 pr-3 tabular-nums">{b.time_s.toFixed(1)} s</td>
+                          <td className="py-1.5 pr-3 tabular-nums">{b.altitude_m.toFixed(1)} m</td>
+                          <td className="py-1.5 pr-3 tabular-nums">{b.speed_ms.toFixed(1)} m/s</td>
+                          <td className="py-1.5 pr-3 tabular-nums">{b.mass_kg.toFixed(1)} kg</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+
+            {/* Trajectory Chart */}
+            <div className="bg-white rounded-lg border border-gray-200 p-4">
+              <Plot
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                data={trajectoryTrace as any}
+                layout={{
+                  title: { text: '飛行軌道（ダウンレンジ–高度）', font: { size: 13 } },
+                  xaxis: { title: { text: 'ダウンレンジ x [m]', standoff: 8 }, showgrid: true, gridcolor: '#f0f0f0', zeroline: false },
+                  yaxis: { title: { text: '高度 h [m]', standoff: 8 }, showgrid: true, gridcolor: '#f0f0f0', zeroline: false },
+                  margin: { t: 45, r: 20, b: 55, l: 70 },
+                  autosize: true,
+                  font: { family: 'system-ui, sans-serif', size: 12 },
+                }}
+                config={{ displayModeBar: true, responsive: true, displaylogo: false }}
+                style={{ width: '100%', height: '360px' }}
+              />
+            </div>
+
+            {/* Time-series Chart */}
+            <div className="bg-white rounded-lg border border-gray-200 p-4">
+              <div className="flex gap-1.5 mb-3">
+                <span className="text-xs text-gray-500 self-center mr-1">表示量:</span>
+                {(['altitude', 'speed', 'mass'] as SeriesKey[]).map(s => (
+                  <button
+                    key={s}
+                    onClick={() => setSeries(s)}
+                    className={`px-3 py-1 text-xs rounded-full border transition-colors ${
+                      series === s
+                        ? 'bg-blue-600 text-white border-blue-600'
+                        : 'bg-white text-gray-600 border-gray-300 hover:border-blue-400 hover:text-blue-600'
+                    }`}
+                  >
+                    {s === 'altitude' ? '高度' : s === 'speed' ? '速度' : '質量'}
+                  </button>
+                ))}
+              </div>
+              <Plot
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                data={seriesTrace as any}
+                layout={{
+                  title: { text: `${SERIES_LABEL[series]} の時間変化`, font: { size: 13 } },
+                  xaxis: { title: { text: '時刻 t [s]', standoff: 8 }, showgrid: true, gridcolor: '#f0f0f0', zeroline: false },
+                  yaxis: { title: { text: SERIES_LABEL[series], standoff: 8 }, showgrid: true, gridcolor: '#f0f0f0', zeroline: false },
+                  margin: { t: 45, r: 20, b: 55, l: 70 },
+                  autosize: true,
+                  font: { family: 'system-ui, sans-serif', size: 12 },
+                }}
+                config={{ displayModeBar: true, responsive: true, displaylogo: false }}
+                style={{ width: '100%', height: '320px' }}
+              />
+            </div>
+
+          </>) : (
+            <div className="flex-1 bg-white rounded-lg border border-gray-200 flex items-center justify-center min-h-64">
+              <div className="text-center text-gray-400">
+                <p className="text-sm mb-1">左パネルで条件を設定して「計算する」を押してください</p>
+                <p className="text-xs">機体質量・推力をもとにした弾道軌道の簡易計算</p>
+              </div>
+            </div>
           )}
         </div>
-
-        <hr className="border-gray-100" />
-
-        <div>
-          <SectionHeader>シミュレーション設定</SectionHeader>
-          <Field label="最大計算時間" unit="s" value={form.duration} onChange={v => set('duration', v)} />
-          <Field label="刻み幅 dt" unit="s" value={form.dt} onChange={v => set('dt', v)} />
-        </div>
-
-        <button
-          onClick={handleCalc}
-          disabled={loading}
-          className="w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-2.5 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-        >
-          {loading ? '計算中...' : '計算する'}
-        </button>
       </div>
 
-      {/* ─── Results Panel ────────────────────────────────────── */}
-      <div className="flex-1 min-w-0 flex flex-col gap-4">
-
-        {error && (
-          <div className="bg-red-50 border border-red-200 rounded-lg p-3 text-red-700 text-sm">
-            {error}
-          </div>
-        )}
-
-        {result ? (<>
-
-          {/* Summary */}
-          <div className="bg-white rounded-lg border border-gray-200 p-4">
-            <div className="flex gap-8 flex-wrap">
-              <StatItem label="最大到達高度" value={`${result.stats.apogee_altitude_m.toFixed(1)} m`} color="text-blue-600" />
-              <StatItem label="最高到達時刻" value={`${result.stats.apogee_time_s.toFixed(1)} s`} />
-              <StatItem label="燃焼終了高度" value={`${result.stats.burnout_altitude_m.toFixed(1)} m`} />
-              <StatItem label="燃焼終了速度" value={`${result.stats.burnout_speed_ms.toFixed(1)} m/s`} />
-              <StatItem label="燃焼終了質量" value={`${result.stats.burnout_mass_kg.toFixed(1)} kg`} />
-              <StatItem label="最大速度" value={`${result.stats.max_speed_ms.toFixed(1)} m/s`} color="text-red-500" />
-              <StatItem
-                label={result.landed ? '飛行時間（着地）' : '飛行時間（計算終了）'}
-                value={`${result.stats.flight_time_s.toFixed(1)} s`}
-              />
-              <StatItem label="ダウンレンジ距離" value={`${result.stats.downrange_m.toFixed(1)} m`} />
-              <StatItem label="推力重量比 T/W" value={result.stats.thrust_to_weight.toFixed(2)} />
-              <StatItem label="速度増分 Δv" value={`${result.stats.delta_v_ms.toFixed(1)} m/s`} />
-            </div>
-          </div>
-
-          {/* Trajectory Chart */}
-          <div className="bg-white rounded-lg border border-gray-200 p-4">
-            <Plot
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              data={trajectoryTrace as any}
-              layout={{
-                title: { text: '飛行軌道（ダウンレンジ–高度）', font: { size: 13 } },
-                xaxis: { title: { text: 'ダウンレンジ x [m]', standoff: 8 }, showgrid: true, gridcolor: '#f0f0f0', zeroline: false },
-                yaxis: { title: { text: '高度 h [m]', standoff: 8 }, showgrid: true, gridcolor: '#f0f0f0', zeroline: false },
-                margin: { t: 45, r: 20, b: 55, l: 70 },
-                autosize: true,
-                font: { family: 'system-ui, sans-serif', size: 12 },
-              }}
-              config={{ displayModeBar: true, responsive: true, displaylogo: false }}
-              style={{ width: '100%', height: '360px' }}
-            />
-          </div>
-
-          {/* Time-series Chart */}
-          <div className="bg-white rounded-lg border border-gray-200 p-4">
-            <div className="flex gap-1.5 mb-3">
-              <span className="text-xs text-gray-500 self-center mr-1">表示量:</span>
-              {(['altitude', 'speed', 'mass'] as SeriesKey[]).map(s => (
-                <button
-                  key={s}
-                  onClick={() => setSeries(s)}
-                  className={`px-3 py-1 text-xs rounded-full border transition-colors ${
-                    series === s
-                      ? 'bg-blue-600 text-white border-blue-600'
-                      : 'bg-white text-gray-600 border-gray-300 hover:border-blue-400 hover:text-blue-600'
-                  }`}
-                >
-                  {s === 'altitude' ? '高度' : s === 'speed' ? '速度' : '質量'}
-                </button>
-              ))}
-            </div>
-            <Plot
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              data={seriesTrace as any}
-              layout={{
-                title: { text: `${SERIES_LABEL[series]} の時間変化`, font: { size: 13 } },
-                xaxis: { title: { text: '時刻 t [s]', standoff: 8 }, showgrid: true, gridcolor: '#f0f0f0', zeroline: false },
-                yaxis: { title: { text: SERIES_LABEL[series], standoff: 8 }, showgrid: true, gridcolor: '#f0f0f0', zeroline: false },
-                margin: { t: 45, r: 20, b: 55, l: 70 },
-                autosize: true,
-                font: { family: 'system-ui, sans-serif', size: 12 },
-              }}
-              config={{ displayModeBar: true, responsive: true, displaylogo: false }}
-              style={{ width: '100%', height: '320px' }}
-            />
-          </div>
-
-        </>) : (
-          <div className="flex-1 bg-white rounded-lg border border-gray-200 flex items-center justify-center min-h-64">
-            <div className="text-center text-gray-400">
-              <p className="text-sm mb-1">左パネルで条件を設定して「計算する」を押してください</p>
-              <p className="text-xs">機体質量・推力をもとにした弾道軌道の簡易計算</p>
-            </div>
-          </div>
-        )}
-      </div>
+      <VehicleDatabase onLoad={loadVehicle} />
     </div>
   )
 }

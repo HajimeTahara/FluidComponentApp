@@ -1,11 +1,21 @@
 'use client'
 
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
+import { createPart, deletePart, fetchParts, type Part } from '@/app/lib/api'
 
-type ComponentCategory = 'pipe' | 'valve' | 'pump'
+type ComponentCategory =
+  | 'pipe'
+  | 'valve'
+  | 'pump'
+  | 'structure'
+  | 'tank'
+  | 'combustor'
+  | 'nozzle'
+  | 'fairing'
+  | 'fixed_mass'
 
 type ComponentRecord = {
-  id: string
+  id: number
   code: string
   name: string
   category: ComponentCategory
@@ -13,6 +23,10 @@ type ComponentRecord = {
   model: string
   note: string
   params: Record<string, string>
+}
+
+function partToRecord(part: Part): ComponentRecord {
+  return { ...part, category: part.category as ComponentCategory }
 }
 
 type FieldDef = {
@@ -26,12 +40,24 @@ const CATEGORY_LABEL: Record<ComponentCategory, string> = {
   pipe: '配管',
   valve: 'バルブ',
   pump: 'ポンプ',
+  structure: '外壁構造材',
+  tank: 'タンク',
+  combustor: '燃焼器',
+  nozzle: 'ノズル',
+  fairing: 'フェアリング',
+  fixed_mass: '固定質量',
 }
 
 const CATEGORY_BADGE: Record<ComponentCategory, string> = {
   pipe: 'bg-sky-50 text-sky-700 border-sky-200',
   valve: 'bg-amber-50 text-amber-700 border-amber-200',
   pump: 'bg-violet-50 text-violet-700 border-violet-200',
+  structure: 'bg-slate-50 text-slate-700 border-slate-200',
+  tank: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+  combustor: 'bg-rose-50 text-rose-700 border-rose-200',
+  nozzle: 'bg-orange-50 text-orange-700 border-orange-200',
+  fairing: 'bg-cyan-50 text-cyan-700 border-cyan-200',
+  fixed_mass: 'bg-stone-50 text-stone-700 border-stone-200',
 }
 
 const CATEGORY_FIELDS: Record<ComponentCategory, FieldDef[]> = {
@@ -57,59 +83,57 @@ const CATEGORY_FIELDS: Record<ComponentCategory, FieldDef[]> = {
     { key: 'efficiencyPct', label: '効率', unit: '%', placeholder: '75' },
     { key: 'ratedSpeedRpm', label: '定格回転数', unit: 'rpm', placeholder: '1450' },
   ],
+  structure: [
+    { key: 'diameterMm', label: '外径', unit: 'mm', placeholder: '3700' },
+    { key: 'lengthMm', label: '長さ', unit: 'mm', placeholder: '5000' },
+    { key: 'thicknessMm', label: '肉厚', unit: 'mm', placeholder: '5' },
+    { key: 'densityKgM3', label: '材料密度', unit: 'kg/m3', placeholder: '2700' },
+    { key: 'material', label: '材質', placeholder: 'Al-Li 2195' },
+  ],
+  tank: [
+    { key: 'diameterMm', label: '外径', unit: 'mm', placeholder: '3700' },
+    { key: 'lengthMm', label: '長さ', unit: 'mm', placeholder: '8000' },
+    { key: 'designPressurePa', label: '設計圧力', unit: 'Pa', placeholder: '300000' },
+    { key: 'yieldStrengthPa', label: '降伏強度', unit: 'Pa', placeholder: '430000000' },
+    { key: 'safetyFactor', label: '安全係数', placeholder: '1.5' },
+    { key: 'densityKgM3', label: '材料密度', unit: 'kg/m3', placeholder: '2700' },
+    { key: 'propellantDensityKgM3', label: '推進剤密度', unit: 'kg/m3', placeholder: '423' },
+    { key: 'ullagePercent', label: 'アレージ', unit: '%', placeholder: '3' },
+  ],
+  combustor: [
+    { key: 'diameterMm', label: '燃焼室外径', unit: 'mm', placeholder: '400' },
+    { key: 'lengthMm', label: '燃焼室長さ', unit: 'mm', placeholder: '600' },
+    { key: 'throatDiameterMm', label: 'スロート径', unit: 'mm', placeholder: '150' },
+    { key: 'chamberPressurePa', label: '燃焼圧', unit: 'Pa', placeholder: '6000000' },
+    { key: 'cStarMS', label: '特性排気速度 c*', unit: 'm/s', placeholder: '1800' },
+    { key: 'gamma', label: '比熱比 γ', placeholder: '1.2' },
+    { key: 'oxidizer', label: '酸化剤', placeholder: 'LOX' },
+    { key: 'fuel', label: '燃料', placeholder: 'LCH4' },
+    { key: 'ofRatio', label: 'O/F比', placeholder: '3.5' },
+    { key: 'yieldStrengthPa', label: '降伏強度', unit: 'Pa', placeholder: '900000000' },
+    { key: 'safetyFactor', label: '安全係数', placeholder: '1.5' },
+    { key: 'densityKgM3', label: '材料密度', unit: 'kg/m3', placeholder: '8400' },
+  ],
+  nozzle: [
+    { key: 'exitDiameterMm', label: '出口径', unit: 'mm', placeholder: '900' },
+    { key: 'lengthMm', label: '長さ', unit: 'mm', placeholder: '1200' },
+    { key: 'expansionRatio', label: '拡大比 Ae/At', placeholder: '36' },
+    { key: 'ambientPressurePa', label: '外気圧', unit: 'Pa', placeholder: '101325' },
+    { key: 'thicknessMm', label: '肉厚', unit: 'mm', placeholder: '3' },
+    { key: 'densityKgM3', label: '材料密度', unit: 'kg/m3', placeholder: '8400' },
+  ],
+  fairing: [
+    { key: 'diameterMm', label: '外径', unit: 'mm', placeholder: '4000' },
+    { key: 'lengthMm', label: '長さ', unit: 'mm', placeholder: '9000' },
+    { key: 'thicknessMm', label: '肉厚', unit: 'mm', placeholder: '4' },
+    { key: 'densityKgM3', label: '材料密度', unit: 'kg/m3', placeholder: '1600' },
+    { key: 'material', label: '材質', placeholder: 'CFRP' },
+  ],
+  fixed_mass: [
+    { key: 'massKg', label: '質量', unit: 'kg', placeholder: '50' },
+    { key: 'description', label: '内容', placeholder: 'アビオニクス' },
+  ],
 }
-
-const SAMPLE_COMPONENTS: ComponentRecord[] = [
-  {
-    id: 'sample-pipe-100a',
-    code: 'PIPE-100A-SGP',
-    name: 'SGP 100A 標準配管',
-    category: 'pipe',
-    maker: '標準',
-    model: 'SGP-100A',
-    note: '定常解析の配管ノード初期値用',
-    params: {
-      shape: '円管',
-      diameterMm: '105.3',
-      lengthM: '6',
-      roughnessMm: '0.046',
-      material: 'SGP',
-      pressureClass: '10K',
-    },
-  },
-  {
-    id: 'sample-valve-50a',
-    code: 'VALVE-GATE-50A',
-    name: 'ゲートバルブ 50A',
-    category: 'valve',
-    maker: '標準',
-    model: 'GV-50A',
-    note: '開度100%の初期値',
-    params: {
-      diameterMm: '50',
-      cv: '48',
-      openingPct: '100',
-      pressureClass: 'JIS 10K',
-      connection: 'フランジ',
-    },
-  },
-  {
-    id: 'sample-pump-30m3h',
-    code: 'PUMP-030-020',
-    name: '遠心ポンプ 30m3/h 20m',
-    category: 'pump',
-    maker: '標準',
-    model: 'CP-030',
-    note: '二次PQ特性の初期登録例',
-    params: {
-      ratedFlowM3h: '30',
-      ratedHeadM: '20',
-      shutoffHeadM: '30',
-      efficiencyPct: '75',
-      ratedSpeedRpm: '1450',
-    },
-  },
-]
 
 const EMPTY_RECORD: Omit<ComponentRecord, 'id'> = {
   code: '',
@@ -121,10 +145,6 @@ const EMPTY_RECORD: Omit<ComponentRecord, 'id'> = {
   params: {},
 }
 
-function makeId() {
-  return `component-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
-}
-
 function normalizeParams(category: ComponentCategory, params: Record<string, string>) {
   return Object.fromEntries(
     CATEGORY_FIELDS[category].map(field => [field.key, params[field.key] ?? '']),
@@ -132,13 +152,27 @@ function normalizeParams(category: ComponentCategory, params: Record<string, str
 }
 
 function categorySummary(record: ComponentRecord) {
-  if (record.category === 'pipe') {
-    return `${record.params.diameterMm || '-'} mm / L=${record.params.lengthM || '-'} m`
+  switch (record.category) {
+    case 'pipe':
+      return `${record.params.diameterMm || '-'} mm / L=${record.params.lengthM || '-'} m`
+    case 'valve':
+      return `Cv ${record.params.cv || '-'} / ${record.params.diameterMm || '-'} mm`
+    case 'pump':
+      return `${record.params.ratedFlowM3h || '-'} m3/h / H=${record.params.ratedHeadM || '-'} m`
+    case 'structure':
+    case 'fairing':
+      return `${record.params.diameterMm || '-'} mm / t=${record.params.thicknessMm || '-'} mm`
+    case 'tank':
+      return `${record.params.diameterMm || '-'} mm / P=${record.params.designPressurePa || '-'} Pa`
+    case 'combustor':
+      return `Pc=${record.params.chamberPressurePa || '-'} Pa / At径=${record.params.throatDiameterMm || '-'} mm`
+    case 'nozzle':
+      return `ε=${record.params.expansionRatio || '-'} / 出口径=${record.params.exitDiameterMm || '-'} mm`
+    case 'fixed_mass':
+      return `${record.params.massKg || '-'} kg`
+    default:
+      return '-'
   }
-  if (record.category === 'valve') {
-    return `Cv ${record.params.cv || '-'} / ${record.params.diameterMm || '-'} mm`
-  }
-  return `${record.params.ratedFlowM3h || '-'} m3/h / H=${record.params.ratedHeadM || '-'} m`
 }
 
 function ParamPreview({ record }: { record: ComponentRecord | null }) {
@@ -178,10 +212,20 @@ function ParamPreview({ record }: { record: ComponentRecord | null }) {
 }
 
 export default function ComponentLibrary() {
-  const [records, setRecords] = useState<ComponentRecord[]>(SAMPLE_COMPONENTS)
+  const [records, setRecords] = useState<ComponentRecord[]>([])
   const [filter, setFilter] = useState<ComponentCategory | 'all'>('all')
-  const [selectedId, setSelectedId] = useState(SAMPLE_COMPONENTS[0]?.id ?? '')
+  const [selectedId, setSelectedId] = useState<number | null>(null)
   const [draft, setDraft] = useState<Omit<ComponentRecord, 'id'>>(EMPTY_RECORD)
+  const [error, setError] = useState<string | null>(null)
+  const [saving, setSaving] = useState(false)
+
+  function reload() {
+    fetchParts()
+      .then(parts => setRecords(parts.map(partToRecord)))
+      .catch(e => setError(e instanceof Error ? e.message : '部品データの取得に失敗しました'))
+  }
+
+  useEffect(() => { reload() }, [])
 
   const visibleRecords = useMemo(
     () => records.filter(record => filter === 'all' || record.category === filter),
@@ -203,22 +247,39 @@ export default function ComponentLibrary() {
     setDraft(prev => ({ ...prev, params: { ...prev.params, [key]: value } }))
   }
 
-  const registerComponent = () => {
+  const registerComponent = async () => {
     const category = draft.category
-    const next: ComponentRecord = {
-      ...draft,
-      id: makeId(),
-      code: draft.code.trim() || `COMP-${records.length + 1}`,
-      name: draft.name.trim() || '新規部品',
-      maker: draft.maker.trim(),
-      model: draft.model.trim(),
-      note: draft.note.trim(),
-      params: normalizeParams(category, draft.params),
+    setSaving(true)
+    setError(null)
+    try {
+      const created = await createPart({
+        code: draft.code.trim() || `COMP-${records.length + 1}`,
+        name: draft.name.trim() || '新規部品',
+        category,
+        maker: draft.maker.trim(),
+        model: draft.model.trim(),
+        note: draft.note.trim(),
+        params: normalizeParams(category, draft.params),
+      })
+      reload()
+      setSelectedId(created.id)
+      setFilter(category)
+      setDraft({ ...EMPTY_RECORD, category, params: normalizeParams(category, {}) })
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : '部品の登録に失敗しました')
+    } finally {
+      setSaving(false)
     }
-    setRecords(prev => [next, ...prev])
-    setSelectedId(next.id)
-    setFilter(category)
-    setDraft({ ...EMPTY_RECORD, category, params: normalizeParams(category, {}) })
+  }
+
+  const removeComponent = async (id: number) => {
+    setError(null)
+    try {
+      await deletePart(id)
+      reload()
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : '部品の削除に失敗しました')
+    }
   }
 
   return (
@@ -229,7 +290,7 @@ export default function ComponentLibrary() {
           <p className="mt-1 text-sm text-gray-500">配管、バルブ、ポンプの解析用マスタを登録します</p>
         </div>
         <div className="flex items-center gap-2">
-          {(['all', 'pipe', 'valve', 'pump'] as const).map(item => (
+          {(['all', 'pipe', 'valve', 'pump', 'structure', 'tank', 'combustor', 'nozzle', 'fairing', 'fixed_mass'] as const).map(item => (
             <button
               key={item}
               type="button"
@@ -246,6 +307,10 @@ export default function ComponentLibrary() {
         </div>
       </div>
 
+      {error && (
+        <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-2 text-sm text-red-700">{error}</div>
+      )}
+
       <div className="grid grid-cols-1 gap-5 xl:grid-cols-[minmax(520px,1fr)_420px]">
         <section className="rounded-lg border border-gray-200 bg-white shadow-sm">
           <div className="flex items-center justify-between border-b border-gray-100 px-5 py-4">
@@ -261,6 +326,7 @@ export default function ComponentLibrary() {
                   <th className="px-4 py-2 text-left font-medium">カテゴリ</th>
                   <th className="px-4 py-2 text-left font-medium">型式</th>
                   <th className="px-4 py-2 text-left font-medium">主要パラメータ</th>
+                  <th className="px-4 py-2 text-left font-medium"></th>
                 </tr>
               </thead>
               <tbody>
@@ -281,8 +347,22 @@ export default function ComponentLibrary() {
                     </td>
                     <td className="px-4 py-3 text-gray-600">{record.model || '-'}</td>
                     <td className="px-4 py-3 text-gray-600 tabular-nums">{categorySummary(record)}</td>
+                    <td className="px-4 py-3 text-right">
+                      <button
+                        type="button"
+                        onClick={e => { e.stopPropagation(); removeComponent(record.id) }}
+                        className="text-xs text-gray-400 hover:text-red-500 transition-colors"
+                      >
+                        削除
+                      </button>
+                    </td>
                   </tr>
                 ))}
+                {visibleRecords.length === 0 && (
+                  <tr>
+                    <td colSpan={6} className="px-4 py-6 text-center text-sm text-gray-400">登録済みの部品はありません</td>
+                  </tr>
+                )}
               </tbody>
             </table>
           </div>
@@ -299,7 +379,7 @@ export default function ComponentLibrary() {
                 onChange={e => updateDraft('category', e.target.value)}
                 className="w-full rounded-md border border-gray-300 bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
               >
-                {(['pipe', 'valve', 'pump'] as ComponentCategory[]).map(category => (
+                {(['pipe', 'valve', 'pump', 'structure', 'tank', 'combustor', 'nozzle', 'fairing', 'fixed_mass'] as ComponentCategory[]).map(category => (
                   <option key={category} value={category}>{CATEGORY_LABEL[category]}</option>
                 ))}
               </select>
@@ -356,9 +436,10 @@ export default function ComponentLibrary() {
           <button
             type="button"
             onClick={registerComponent}
-            className="mt-5 w-full rounded-lg bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-blue-700"
+            disabled={saving}
+            className="mt-5 w-full rounded-lg bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            部品を登録
+            {saving ? '登録中...' : '部品を登録'}
           </button>
         </section>
       </div>

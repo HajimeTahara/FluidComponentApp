@@ -4,3 +4,4 @@ CoolProp==6.6.0
 pandas==2.2.3
 numpy==2.1.1
 scipy==1.14.1
+tinydb==4.8.2
