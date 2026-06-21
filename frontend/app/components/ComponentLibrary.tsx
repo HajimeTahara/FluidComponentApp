@@ -93,9 +93,7 @@ const CATEGORY_FIELDS: Record<ComponentCategory, FieldDef[]> = {
   tank: [
     { key: 'diameterMm', label: '外径', unit: 'mm', placeholder: '3700' },
     { key: 'lengthMm', label: '長さ', unit: 'mm', placeholder: '8000' },
-    { key: 'designPressurePa', label: '設計圧力', unit: 'Pa', placeholder: '300000' },
-    { key: 'yieldStrengthPa', label: '降伏強度', unit: 'Pa', placeholder: '430000000' },
-    { key: 'safetyFactor', label: '安全係数', placeholder: '1.5' },
+    { key: 'thicknessMm', label: '肉厚', unit: 'mm', placeholder: '5' },
     { key: 'densityKgM3', label: '材料密度', unit: 'kg/m3', placeholder: '2700' },
     { key: 'propellantDensityKgM3', label: '推進剤密度', unit: 'kg/m3', placeholder: '423' },
     { key: 'ullagePercent', label: 'アレージ', unit: '%', placeholder: '3' },
@@ -163,7 +161,7 @@ function categorySummary(record: ComponentRecord) {
     case 'fairing':
       return `${record.params.diameterMm || '-'} mm / t=${record.params.thicknessMm || '-'} mm`
     case 'tank':
-      return `${record.params.diameterMm || '-'} mm / P=${record.params.designPressurePa || '-'} Pa`
+      return `${record.params.diameterMm || '-'} mm / t=${record.params.thicknessMm || '-'} mm`
     case 'combustor':
       return `Pc=${record.params.chamberPressurePa || '-'} Pa / At径=${record.params.throatDiameterMm || '-'} mm`
     case 'nozzle':

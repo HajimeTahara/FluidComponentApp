@@ -1,24 +1,29 @@
 'use client'
 
 import { useEffect, useState } from 'react'
-import { createVehicle, deleteVehicle, fetchVehicles, type StageSpec, type Vehicle, type VehicleSpec } from '@/app/lib/api'
+import { createVehicle, deleteVehicle, fetchVehicles, type FairingSpec, type StageSpec, type Vehicle, type VehicleSpec } from '@/app/lib/api'
 import { OXIDIZER_OPTIONS, FUEL_OPTIONS_BY_OXIDIZER } from '@/app/lib/propellants'
 
 const DEFAULT_STAGE: StageSpec = {
   propellant_mass: 300,
   dry_mass: 150,
+  payload_mass: 0,
   oxidizer: 'LOX',
   fuel: 'LCH4',
   thrust: 12000,
   burn_time: 20,
+  length_m: 0,
+  diameter_m: 0,
+  separation_delay_s: 0,
 }
+
+const DEFAULT_FAIRING: FairingSpec = { mass_kg: 0, length_m: 0, diameter_m: 0 }
 
 const DEFAULT_NEW_VEHICLE: VehicleSpec = {
   name: '',
   stages: [{ ...DEFAULT_STAGE }],
   payload_mass: 50,
-  length: 0,
-  diameter: 0,
+  fairing: { ...DEFAULT_FAIRING },
   launch_angle: 90,
   drag_enabled: false,
   drag_coefficient: 0.5,
@@ -31,7 +36,8 @@ function totalPropellantMass(v: VehicleSpec): number {
 }
 
 function totalInitialMass(v: VehicleSpec): number {
-  return v.stages.reduce((sum, s) => sum + s.propellant_mass + s.dry_mass, 0) + v.payload_mass
+  return v.stages.reduce((sum, s) => sum + s.propellant_mass + s.dry_mass + s.payload_mass, 0)
+    + v.payload_mass + v.fairing.mass_kg
 }
 
 export default function VehicleDatabase({ onLoad }: { onLoad: (vehicle: Vehicle) => void }) {
@@ -122,20 +128,6 @@ export default function VehicleDatabase({ onLoad }: { onLoad: (vehicle: Vehicle)
             />
             <input
               type="number"
-              placeholder="全長 [m]"
-              value={newVehicle.length}
-              onChange={e => setNewVehicle(v => ({ ...v, length: parseFloat(e.target.value) }))}
-              className="border border-gray-300 rounded px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500"
-            />
-            <input
-              type="number"
-              placeholder="直径 [m]"
-              value={newVehicle.diameter}
-              onChange={e => setNewVehicle(v => ({ ...v, diameter: parseFloat(e.target.value) }))}
-              className="border border-gray-300 rounded px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500"
-            />
-            <input
-              type="number"
               placeholder="ペイロード質量 [kg]"
               value={newVehicle.payload_mass}
               onChange={e => setNewVehicle(v => ({ ...v, payload_mass: parseFloat(e.target.value) }))}
@@ -195,6 +187,8 @@ export default function VehicleDatabase({ onLoad }: { onLoad: (vehicle: Vehicle)
                   ['dry_mass', '構造質量 [kg]'],
                   ['thrust', '推力 [N]'],
                   ['burn_time', '燃焼時間 [s]'],
+                  ['length_m', '全長 [m]'],
+                  ['diameter_m', '直径 [m]'],
                 ] as [keyof StageSpec, string][]).map(([field, label]) => (
                   <input
                     key={field}
@@ -208,6 +202,26 @@ export default function VehicleDatabase({ onLoad }: { onLoad: (vehicle: Vehicle)
               </div>
             </div>
           ))}
+
+          <div className="bg-white rounded-lg p-2 border border-gray-200">
+            <span className="mb-1 block text-xs font-semibold text-gray-600">フェアリング</span>
+            <div className="grid grid-cols-3 gap-2">
+              {([
+                ['mass_kg', '質量 [kg]'],
+                ['length_m', '全長 [m]'],
+                ['diameter_m', '直径 [m]'],
+              ] as [keyof FairingSpec, string][]).map(([field, label]) => (
+                <input
+                  key={field}
+                  type="number"
+                  placeholder={label}
+                  value={newVehicle.fairing[field]}
+                  onChange={e => setNewVehicle(v => ({ ...v, fairing: { ...v.fairing, [field]: parseFloat(e.target.value) } }))}
+                  className="border border-gray-300 rounded px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500"
+                />
+              ))}
+            </div>
+          </div>
 
           <input
             placeholder="補足・出典"
@@ -230,54 +244,74 @@ export default function VehicleDatabase({ onLoad }: { onLoad: (vehicle: Vehicle)
         <table className="w-full text-sm">
           <thead>
             <tr className="text-left text-xs text-gray-500 border-b border-gray-200">
-              <th className="py-2 pr-3">機体名</th>
-              <th className="py-2 pr-3">段数</th>
-              <th className="py-2 pr-3">全長</th>
-              <th className="py-2 pr-3">直径</th>
-              <th className="py-2 pr-3">全備質量</th>
-              <th className="py-2 pr-3">推進剤質量</th>
-              <th className="py-2 pr-3">ペイロード</th>
-              <th className="py-2 pr-3">第1段推力</th>
-              <th className="py-2 pr-3">補足</th>
-              <th className="py-2 pr-3"></th>
+              <th className="py-2 pr-3" rowSpan={2}>機体名</th>
+              <th className="py-2 pr-3 text-center border-l border-gray-100" colSpan={3}>第1段</th>
+              <th className="py-2 pr-3 text-center border-l border-gray-100" colSpan={3}>第2段</th>
+              <th className="py-2 pr-3 text-center border-l border-gray-100" colSpan={3}>フェアリング</th>
+              <th className="py-2 pr-3 border-l border-gray-100" rowSpan={2}>全備質量</th>
+              <th className="py-2 pr-3" rowSpan={2}>ペイロード</th>
+              <th className="py-2 pr-3" rowSpan={2}>第1段推力</th>
+              <th className="py-2 pr-3" rowSpan={2}>補足</th>
+              <th className="py-2 pr-3" rowSpan={2}></th>
+            </tr>
+            <tr className="text-left text-xs text-gray-400 border-b border-gray-200">
+              <th className="py-1 pr-3 border-l border-gray-100">質量</th>
+              <th className="py-1 pr-3">全長</th>
+              <th className="py-1 pr-3">直径</th>
+              <th className="py-1 pr-3 border-l border-gray-100">質量</th>
+              <th className="py-1 pr-3">全長</th>
+              <th className="py-1 pr-3">直径</th>
+              <th className="py-1 pr-3 border-l border-gray-100">質量</th>
+              <th className="py-1 pr-3">全長</th>
+              <th className="py-1 pr-3">直径</th>
             </tr>
           </thead>
           <tbody>
-            {vehicles.map(v => (
-              <tr key={v.id} className="border-b border-gray-100 last:border-0">
-                <td className="py-2 pr-3 font-medium text-gray-900">{v.name}</td>
-                <td className="py-2 pr-3 tabular-nums">{v.stages.length}</td>
-                <td className="py-2 pr-3 tabular-nums">{v.length} m</td>
-                <td className="py-2 pr-3 tabular-nums">{v.diameter} m</td>
-                <td className="py-2 pr-3 tabular-nums">{totalInitialMass(v).toLocaleString()} kg</td>
-                <td className="py-2 pr-3 tabular-nums">{totalPropellantMass(v).toLocaleString()} kg</td>
-                <td className="py-2 pr-3 tabular-nums">{v.payload_mass.toLocaleString()} kg</td>
-                <td className="py-2 pr-3 tabular-nums">{(v.stages[0].thrust / 1000).toLocaleString()} kN</td>
-                <td className="py-2 pr-3 text-xs text-gray-400 max-w-64 truncate" title={v.note}>{v.note}</td>
-                <td className="py-2 pr-3 whitespace-nowrap">
-                  <button
-                    onClick={() => onLoad(v)}
-                    className="text-xs px-2 py-1 rounded border border-blue-300 text-blue-600 hover:bg-blue-50 transition-colors mr-1"
-                  >
-                    設定に読み込む
-                  </button>
-                  <button
-                    onClick={() => handleDelete(v.id)}
-                    className="text-xs px-2 py-1 rounded border border-gray-300 text-gray-500 hover:bg-gray-50 transition-colors"
-                  >
-                    削除
-                  </button>
-                </td>
-              </tr>
-            ))}
+            {vehicles.map(v => {
+              const stage1 = v.stages[0]
+              const stage2 = v.stages[1]
+              return (
+                <tr key={v.id} className="border-b border-gray-100 last:border-0">
+                  <td className="py-2 pr-3 font-medium text-gray-900">{v.name}</td>
+                  <td className="py-2 pr-3 tabular-nums border-l border-gray-100">{stage1 ? `${(stage1.propellant_mass + stage1.dry_mass).toLocaleString()} kg` : '-'}</td>
+                  <td className="py-2 pr-3 tabular-nums">{stage1 ? `${stage1.length_m} m` : '-'}</td>
+                  <td className="py-2 pr-3 tabular-nums">{stage1 ? `${stage1.diameter_m} m` : '-'}</td>
+                  <td className="py-2 pr-3 tabular-nums border-l border-gray-100">{stage2 ? `${(stage2.propellant_mass + stage2.dry_mass).toLocaleString()} kg` : '-'}</td>
+                  <td className="py-2 pr-3 tabular-nums">{stage2 ? `${stage2.length_m} m` : '-'}</td>
+                  <td className="py-2 pr-3 tabular-nums">{stage2 ? `${stage2.diameter_m} m` : '-'}</td>
+                  <td className="py-2 pr-3 tabular-nums border-l border-gray-100">{v.fairing.mass_kg.toLocaleString()} kg</td>
+                  <td className="py-2 pr-3 tabular-nums">{v.fairing.length_m} m</td>
+                  <td className="py-2 pr-3 tabular-nums">{v.fairing.diameter_m} m</td>
+                  <td className="py-2 pr-3 tabular-nums border-l border-gray-100">{totalInitialMass(v).toLocaleString()} kg</td>
+                  <td className="py-2 pr-3 tabular-nums">{v.payload_mass.toLocaleString()} kg</td>
+                  <td className="py-2 pr-3 tabular-nums">{(v.stages[0].thrust / 1000).toLocaleString()} kN</td>
+                  <td className="py-2 pr-3 text-xs text-gray-400 max-w-64 truncate" title={v.note}>{v.note}</td>
+                  <td className="py-2 pr-3 whitespace-nowrap">
+                    <button
+                      onClick={() => onLoad(v)}
+                      className="text-xs px-2 py-1 rounded border border-blue-300 text-blue-600 hover:bg-blue-50 transition-colors mr-1"
+                    >
+                      設定に読み込む
+                    </button>
+                    <button
+                      onClick={() => handleDelete(v.id)}
+                      className="text-xs px-2 py-1 rounded border border-gray-300 text-gray-500 hover:bg-gray-50 transition-colors"
+                    >
+                      削除
+                    </button>
+                  </td>
+                </tr>
+              )
+            })}
             {vehicles.length === 0 && (
               <tr>
-                <td colSpan={10} className="py-4 text-center text-gray-400 text-sm">登録済みの機体はありません</td>
+                <td colSpan={15} className="py-4 text-center text-gray-400 text-sm">登録済みの機体はありません</td>
               </tr>
             )}
           </tbody>
         </table>
       </div>
+      <p className="mt-2 text-xs text-gray-400">全長・直径は段ごとの値です（全備質量には全段・ペイロード・フェアリングの質量を含みます）</p>
     </div>
   )
 }

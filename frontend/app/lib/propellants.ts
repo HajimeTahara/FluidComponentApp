@@ -19,3 +19,13 @@ export const FUEL_OPTIONS_BY_OXIDIZER: Record<string, { value: string; label: st
     { value: 'MMH', label: 'モノメチルヒドラジン MMH', ratio: 2.67 },
   ],
 }
+
+// 配管（エッジ）1本は酸化剤・燃料いずれか一種類の推進剤のみを運ぶため、
+// 酸化剤・燃料を一つのリストにまとめた選択肢（配管の「推進剤」パラメータ用）。
+const ALL_FUELS = Object.values(FUEL_OPTIONS_BY_OXIDIZER).flat()
+const UNIQUE_FUELS = [...new Map(ALL_FUELS.map(f => [f.value, f])).values()]
+
+export const PROPELLANT_OPTIONS: { value: string; label: string; role: 'oxidizer' | 'fuel' }[] = [
+  ...OXIDIZER_OPTIONS.map(o => ({ ...o, role: 'oxidizer' as const })),
+  ...UNIQUE_FUELS.map(f => ({ value: f.value, label: f.label, role: 'fuel' as const })),
+]

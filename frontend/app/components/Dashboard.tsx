@@ -5,16 +5,19 @@ import { fetchFluids, fetchProperties, type Properties } from '@/app/lib/api'
 import SaturationChart from './SaturationChart'
 import PHDiagramChart from './PHDiagramChart'
 import PropertiesLookup from './PropertiesLookup'
-import PIDDiagram from './PIDDiagram'
-import PipeNetworkCalc from './PipeNetworkCalc'
+import PipeNetworkCalc, { type PipeNetworkDiagramSnapshot } from './PipeNetworkCalc'
+import TransientNetworkCalc, { type TransientNetworkSeed } from './TransientNetworkCalc'
 import ComponentLibrary from './ComponentLibrary'
+import MaterialDatabase from './MaterialDatabase'
+import FluidLibrary from './FluidLibrary'
 import LaunchAnalysis from './LaunchAnalysis'
 
-type Tab = 'fluid-library' | 'component-library' | 'pid' | 'pressure-drop' | 'launch'
+type Tab = 'fluid-library' | 'component-library' | 'material-library' | 'pid' | 'pressure-drop' | 'launch'
 
 const TABS: { id: Tab; label: string }[] = [
-  { id: 'fluid-library', label: '流体ライブラリ' },
+  { id: 'fluid-library', label: '状態方程式' },
   { id: 'component-library', label: '部品管理' },
+  { id: 'material-library', label: '材料DB' },
   { id: 'pid', label: '非定常解析' },
   { id: 'pressure-drop', label: '定常流れ解析' },
   { id: 'launch', label: '打ち上げ解析' },
@@ -27,6 +30,7 @@ export default function Dashboard() {
   const [backendError, setBackendError] = useState<string | null>(null)
   const [selectedPoint, setSelectedPoint] = useState<{ T: number; P: number } | null>(null)
   const [fluidMeta, setFluidMeta] = useState<Properties | null>(null)
+  const [transientSeed, setTransientSeed] = useState<TransientNetworkSeed | null>(null)
 
   useEffect(() => {
     fetchFluids()
@@ -47,6 +51,11 @@ export default function Dashboard() {
       })
     return () => { cancelled = true }
   }, [fluid])
+
+  const copyToTransient = (snapshot: PipeNetworkDiagramSnapshot) => {
+    setTransientSeed(snapshot)
+    setTab('pid')
+  }
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -153,8 +162,14 @@ export default function Dashboard() {
                 </div>
               )}
               {tab === 'component-library' && <ComponentLibrary />}
-              {tab === 'pid' && <PIDDiagram />}
-              {tab === 'pressure-drop' && <PipeNetworkCalc />}
+              {tab === 'material-library' && (
+                <div className="flex flex-col gap-8">
+                  <MaterialDatabase />
+                  <FluidLibrary />
+                </div>
+              )}
+              {tab === 'pid' && <TransientNetworkCalc seed={transientSeed} />}
+              {tab === 'pressure-drop' && <PipeNetworkCalc onCopyToTransient={copyToTransient} />}
               {tab === 'launch' && <LaunchAnalysis />}
             </>
           )}

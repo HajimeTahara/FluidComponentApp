@@ -82,7 +82,7 @@ interface FormState {
 
 const DEFAULT_FORM: FormState = {
   stages: [],
-  payloadMass: '50',
+  payloadMass: '0',
   launchAngle: '90',
   dragEnabled: false,
   dragCoefficient: '0.5',
@@ -144,15 +144,31 @@ export default function LaunchAnalysis() {
 
   const trajectoryTrace = useMemo(() => {
     if (!result) return []
-    return [{
-      x: result.x,
-      y: result.altitude,
-      type: 'scatter' as const,
-      mode: 'lines' as const,
-      name: '軌道',
-      line: { color: '#2563eb', width: 2.5 },
-      hovertemplate: 'x: %{x:.1f} m<br>h: %{y:.1f} m<extra></extra>',
-    }]
+    const separations = result.stats.stage_separations
+    return [
+      {
+        x: result.x,
+        y: result.altitude,
+        type: 'scatter' as const,
+        mode: 'lines' as const,
+        name: '軌道',
+        line: { color: '#2563eb', width: 2.5 },
+        hovertemplate: 'x: %{x:.1f} m<br>h: %{y:.1f} m<extra></extra>',
+      },
+      ...(separations.length > 0 ? [{
+        x: separations.map(s => s.x_m),
+        y: separations.map(s => s.altitude_m),
+        type: 'scatter' as const,
+        mode: 'markers+text' as const,
+        name: '段分離',
+        text: separations.map(s => `第${s.stage_index}段分離`),
+        textposition: 'top center' as const,
+        textfont: { size: 10, color: '#dc2626' },
+        marker: { color: '#dc2626', size: 10, symbol: 'x' },
+        hovertemplate: '第%{customdata}段分離<br>x: %{x:.1f} m<br>h: %{y:.1f} m<extra></extra>',
+        customdata: separations.map(s => s.stage_index),
+      }] : []),
+    ]
   }, [result])
 
   const seriesTrace = useMemo(() => {
@@ -179,7 +195,6 @@ export default function LaunchAnalysis() {
 
           <div>
             <SectionHeader>機体（段数 {form.stages.length}）</SectionHeader>
-            <Field label="ペイロード質量" unit="kg" value={form.payloadMass} onChange={v => set('payloadMass', v)} />
             <p className="text-xs text-gray-400 -mt-1">上のキャンバスで各段を設計し「この段を計算」を押すと反映されます</p>
           </div>
 

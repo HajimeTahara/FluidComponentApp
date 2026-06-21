@@ -32,6 +32,9 @@ import {
   calcPipeNetwork,
   calcPressureDrop,
   fetchProperties,
+  type PipeNetworkEdgePayload,
+  type PipeNetworkFluidSystemPayload,
+  type PipeNetworkNodePayload,
   type PipeSegmentResult,
   type PressureDropRequest,
   type PressureDropResult,
@@ -64,6 +67,18 @@ type FluidSystem = {
   viscosity: number // Pa·s
   specificHeat: number
   color: string
+}
+
+export type PipeNetworkDiagramSnapshot = {
+  nodes: PipeNetworkNodePayload[]
+  edges: PipeNetworkEdgePayload[]
+  fluidSystems: PipeNetworkFluidSystemPayload[]
+  density: number
+  viscosity: number
+}
+
+type PipeNetworkCalcProps = {
+  onCopyToTransient?: (snapshot: PipeNetworkDiagramSnapshot) => void
 }
 
 const PRESSURE_UNITS: PressureUnit[] = ['m', 'Pa', 'kPa', 'MPa', 'bar']
@@ -3601,7 +3616,7 @@ function SystemResultsTable({ components, runHistory, pressureUnit, rho, baselin
 
 // ── Inner component ────────────────────────────────────────────────
 
-function PipeNetworkCalcInner() {
+function PipeNetworkCalcInner({ onCopyToTransient }: PipeNetworkCalcProps) {
   const [defaultDiagram] = useState(() => createDefaultDiagram())
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>(defaultDiagram.nodes)
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>(defaultDiagram.edges)
@@ -3788,6 +3803,53 @@ function PipeNetworkCalcInner() {
     setRunHistory([])
     setBaselineRunId(null)
   }
+
+  const copyToTransient = useCallback(() => {
+    onCopyToTransient?.({
+      nodes: nodes.map(n => {
+        const d = n.data as unknown as NetworkNodeData
+        const resolvedSpeed = powerSpeedResolution.speeds.get(n.id)
+        const resolvedTorque = powerSpeedResolution.torques.get(n.id)
+        const solveMode = powerSpeedResolution.modes.get(n.id)
+        return {
+          id: n.id,
+          node_type: d.nodeType,
+          params: {
+            ...(n.data as Record<string, unknown>),
+            position: n.position,
+            width: n.width,
+            height: n.height,
+            ...(!['motor', 'speedBoundary'].includes(d.nodeType) ? { fluidSystemId: d.fluidSystemId ?? fluidSystems[0]?.id ?? DEFAULT_FLUID_SYSTEM_ID } : {}),
+            ...(['pump', 'motor', 'turbine', 'gear'].includes(d.nodeType) ? {
+              speed: resolvedSpeed ?? (d.nodeType === 'motor' ? motorRatedSpeed(d) : d.nodeType === 'gear' ? undefined : d.ratedSpeed ?? 1450),
+              ...(resolvedTorque !== undefined ? { shaftTorque: resolvedTorque } : {}),
+              ...(solveMode !== undefined ? { speedSolveMode: solveMode } : {}),
+            } : {}),
+          },
+        }
+      }),
+      edges: edges.map(e => ({
+        id: e.id,
+        source: e.source,
+        target: e.target,
+        source_handle: e.sourceHandle ?? null,
+        target_handle: e.targetHandle ?? null,
+        line_type: ((e.data as FlowEdgeData | undefined)?.lineType ?? 'fluid'),
+      })),
+      density: parseFloat(density) || 1000,
+      viscosity: (parseFloat(viscosity) || 1.0) / 1000,
+      fluidSystems: fluidSystems.map(system => ({
+        id: system.id,
+        name: system.name,
+        fluid: system.fluid,
+        propertyMode: system.propertyMode,
+        density: system.density,
+        viscosity: system.viscosity,
+        specificHeat: system.specificHeat,
+        color: system.color,
+      })),
+    })
+  }, [density, edges, fluidSystems, nodes, onCopyToTransient, powerSpeedResolution.modes, powerSpeedResolution.speeds, powerSpeedResolution.torques, viscosity])
 
   // CoolProp auto-fill
   const [coolFluid,   setCoolFluid]   = useState('Water')
@@ -4194,6 +4256,17 @@ function PipeNetworkCalcInner() {
               スケッチをクリア
             </button>
 
+            {onCopyToTransient && (
+              <button
+                type="button"
+                onClick={copyToTransient}
+                disabled={nodes.length === 0}
+                className="border border-teal-200 bg-teal-50 text-teal-700 hover:bg-teal-100 text-sm px-4 py-2 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
+              >
+                非定常解析へコピー
+              </button>
+            )}
+
             {error && <span className="text-sm text-red-500">{error}</span>}
 
             {totalDp !== null && (
@@ -4395,10 +4468,10 @@ function PipeNetworkCalcInner() {
 
 // ── Export ─────────────────────────────────────────────────────────
 
-export default function PipeNetworkCalc() {
+export default function PipeNetworkCalc(props: PipeNetworkCalcProps) {
   return (
     <ReactFlowProvider>
-      <PipeNetworkCalcInner />
+      <PipeNetworkCalcInner {...props} />
     </ReactFlowProvider>
   )
 }

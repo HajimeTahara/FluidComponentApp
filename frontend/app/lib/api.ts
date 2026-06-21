@@ -164,7 +164,7 @@ export type PipeNetworkEdgePayload = {
   target: string
   source_handle: string | null
   target_handle: string | null
-  line_type?: 'fluid' | 'power'
+  line_type?: 'fluid' | 'power' | 'heat' | 'signal' | 'rotational'
 }
 export type PipeNetworkFluidSystemPayload = {
   id: string
@@ -226,7 +226,8 @@ export type PipeSegmentResult = {
   diameter_mm?: number
   angle_deg?: number
   zeta90?: number
-  valve_zeta_full_open?: number
+  valve_cv?: number
+  valve_effective_cv?: number
   valve_opening_percent?: number
   valve_relative_capacity?: number
   valve_characteristic?: string
@@ -265,14 +266,62 @@ export async function calcPipeNetwork(payload: PipeNetworkPayload): Promise<Pipe
   return res.json()
 }
 
+export type TransientNetworkPayload = PipeNetworkPayload & {
+  duration: number
+  dt: number
+}
+
+export type TransientNodeSeries = {
+  pressure_kpa?: number[]
+  flow_m3h?: number[]
+  level_m?: number[]
+  velocity_mps?: number[]
+  reynolds?: number[]
+  pressure_loss_kpa?: number[]
+  boost_kpa?: number[]
+  head_m?: number[]
+  shaft_power_kw?: number[]
+  speed_rpm?: number[]
+  shaft_torque_nm?: number[]
+  temperature_k?: number[]
+  wall_temperature_k?: number[]
+  heat_transfer_w?: number[]
+  heat_transfer_coefficient_w_m2k?: number[]
+}
+
+export type TransientNetworkResult = {
+  time: number[]
+  nodes: Record<string, TransientNodeSeries>
+  edges: Record<string, TransientNodeSeries>
+  ports?: Record<string, Record<string, TransientNodeSeries>>
+  warnings: string[]
+}
+
+export async function simulateTransientNetwork(payload: TransientNetworkPayload): Promise<TransientNetworkResult> {
+  const res = await fetch(`${API_BASE}/pipe-network/transient`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error((err as { detail?: string }).detail ?? '非定常ネットワーク計算に失敗しました')
+  }
+  return res.json()
+}
+
 // ── Launch Trajectory ──────────────────────────────────────────────
 export type StageSpec = {
   propellant_mass: number
   dry_mass: number
+  payload_mass: number
   oxidizer: string
   fuel: string
   thrust: number
   burn_time: number
+  length_m: number
+  diameter_m: number
+  separation_delay_s: number
 }
 
 export type LaunchRequest = {
@@ -294,10 +343,20 @@ export type StageBurnout = {
   mass_kg: number
 }
 
+export type StageSeparation = {
+  stage_index: number
+  time_s: number
+  x_m: number
+  altitude_m: number
+  speed_ms: number
+  mass_kg: number
+}
+
 export type LaunchStats = {
   apogee_altitude_m: number
   apogee_time_s: number
   stage_burnouts: StageBurnout[]
+  stage_separations: StageSeparation[]
   max_speed_ms: number
   flight_time_s: number
   downrange_m: number
@@ -342,16 +401,23 @@ export type RocketEdgePayload = {
   target: string
   source_handle?: string | null
   target_handle?: string | null
+  diameter_mm?: number
+  length_mm?: number
+  thickness_mm?: number
+  material?: string | null
+  density_kg_m3?: number
+  propellant?: string | null
 }
 export type RocketFixedMassPayload = {
   id: string
   label: string
   massKg: number
+  isPayload?: boolean
 }
 export type RocketStagePayload = {
   nodes: RocketNodePayload[]
   edges: RocketEdgePayload[]
-  structure?: Record<string, number>
+  structure?: Record<string, number | string>
   fixed_masses?: RocketFixedMassPayload[]
 }
 export type RocketNodeResult = {
@@ -365,8 +431,12 @@ export type RocketNodeResult = {
   mach_exit?: number
   cf?: number
 }
+export type RocketEdgeResult = {
+  mass_kg: number
+}
 export type RocketStageBuildResult = {
   nodes: Record<string, RocketNodeResult>
+  edges: Record<string, RocketEdgeResult>
   stage: StageSpec
 }
 
@@ -384,12 +454,17 @@ export async function buildRocketStage(payload: RocketStagePayload): Promise<Roc
 }
 
 // ── Vehicle Database ────────────────────────────────────────────────
+export type FairingSpec = {
+  mass_kg: number
+  length_m: number
+  diameter_m: number
+}
+
 export type VehicleSpec = {
   name: string
   stages: StageSpec[]
   payload_mass: number
-  length: number
-  diameter: number
+  fairing: FairingSpec
   launch_angle: number
   drag_enabled: boolean
   drag_coefficient: number
@@ -456,6 +531,93 @@ export async function createPart(payload: PartSpec): Promise<Part> {
 export async function deletePart(id: number): Promise<void> {
   const res = await fetch(`${API_BASE}/parts/${id}`, { method: 'DELETE' })
   await vehicleResponse(res, '部品の削除に失敗しました')
+}
+
+// ── Material Database ──────────────────────────────────────────────
+export type MaterialSpec = {
+  name: string
+  category: string
+  density_kg_m3: number
+  yield_strength_pa: number
+  thermal_conductivity_w_m_k: number
+  specific_heat_j_kg_k: number
+  reference_temperature_k: number
+  note: string
+}
+
+export type Material = MaterialSpec & { id: number }
+
+export async function fetchMaterials(): Promise<Material[]> {
+  const res = await fetch(`${API_BASE}/materials`)
+  return vehicleResponse(res, '材料データベースの取得に失敗しました')
+}
+
+export async function createMaterial(payload: MaterialSpec): Promise<Material> {
+  const res = await fetch(`${API_BASE}/materials`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  return vehicleResponse(res, '材料の登録に失敗しました')
+}
+
+export async function updateMaterial(id: number, payload: MaterialSpec): Promise<Material> {
+  const res = await fetch(`${API_BASE}/materials/${id}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  return vehicleResponse(res, '材料の更新に失敗しました')
+}
+
+export async function deleteMaterial(id: number): Promise<void> {
+  const res = await fetch(`${API_BASE}/materials/${id}`, { method: 'DELETE' })
+  await vehicleResponse(res, '材料の削除に失敗しました')
+}
+
+// ── 流体ライブラリ（推進剤・汎用流体、材料DBとは別管理） ──────────────
+export type FluidLibrarySpec = {
+  name: string
+  phase: string
+  is_oxidizer: boolean
+  is_fuel: boolean
+  density_kg_m3: number
+  viscosity_pa_s: number
+  thermal_conductivity_w_m_k: number
+  specific_heat_j_kg_k: number
+  reference_temperature_k: number
+  reference_pressure_pa: number
+  note: string
+}
+
+export type FluidLibraryEntry = FluidLibrarySpec & { id: number }
+
+export async function fetchFluidLibrary(): Promise<FluidLibraryEntry[]> {
+  const res = await fetch(`${API_BASE}/fluid-library`)
+  return vehicleResponse(res, '流体ライブラリの取得に失敗しました')
+}
+
+export async function createFluidLibraryEntry(payload: FluidLibrarySpec): Promise<FluidLibraryEntry> {
+  const res = await fetch(`${API_BASE}/fluid-library`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  return vehicleResponse(res, '流体の登録に失敗しました')
+}
+
+export async function updateFluidLibraryEntry(id: number, payload: FluidLibrarySpec): Promise<FluidLibraryEntry> {
+  const res = await fetch(`${API_BASE}/fluid-library/${id}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  return vehicleResponse(res, '流体の更新に失敗しました')
+}
+
+export async function deleteFluidLibraryEntry(id: number): Promise<void> {
+  const res = await fetch(`${API_BASE}/fluid-library/${id}`, { method: 'DELETE' })
+  await vehicleResponse(res, '流体の削除に失敗しました')
 }
 
 export async function runSimulate(payload: {

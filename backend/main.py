@@ -604,6 +604,10 @@ class PipeNetworkRequest(BaseModel):
     friction_method: str = "colebrook"
     fluidSystems: list[PipeNetworkFluidSystem] = Field(default_factory=list)
 
+class PipeNetworkTransientRequest(PipeNetworkRequest):
+    duration: float = 20.0
+    dt: float = 0.05
+
 
 def _calc_pipe_segment(params: dict, Q_m3s: float, rho: float, mu: float, method: str) -> dict:
     # Per-pipe friction method overrides the global default
@@ -1007,11 +1011,6 @@ def _elbow_flow_for_pressure_drop(params: dict, dp_kpa: float, rho: float) -> fl
     return area * np.sqrt(2.0 * dp_kpa * 1000.0 / (rho * zeta))
 
 
-def _valve_area(params: dict) -> float:
-    diameter = max(float(params.get("diameter", 100.0)) / 1000.0, 1e-9)
-    return np.pi * diameter ** 2 / 4.0
-
-
 def _valve_relative_capacity(params: dict) -> tuple[float, str]:
     characteristic = str(params.get("valveCharacteristic", "linear"))
     opening = min(max(float(params.get("valveOpening", 100.0)), 0.0), 100.0) / 100.0
@@ -1025,29 +1024,47 @@ def _valve_relative_capacity(params: dict) -> tuple[float, str]:
     return max(opening, 1e-6), "linear"
 
 
-def _valve_loss_coefficient(params: dict) -> tuple[float, float, str]:
-    zeta_full_open = max(float(params.get("valveZetaFullOpen", 1.0)), 0.0)
+def _valve_full_open_cv(params: dict) -> float:
+    if "valveCv" in params or "cv" in params:
+        return max(float(params.get("valveCv", params.get("cv", 50.0))), 0.0)
+    zeta = max(float(params.get("valveZetaFullOpen", 0.0)), 0.0)
+    diameter = max(float(params.get("diameter", 100.0)) / 1000.0, 1e-9)
+    if zeta <= 1e-12:
+        return 50.0
+    area = np.pi * diameter ** 2 / 4.0
+    q_m3s = 1.0
+    rho_water = 999.016
+    v = q_m3s / area
+    dp_kpa = zeta * rho_water * v ** 2 / 2.0 / 1000.0
+    q_gpm = q_m3s * 15850.323141489
+    return q_gpm / np.sqrt(max(dp_kpa / 6.894757293, 1e-12))
+
+
+def _valve_effective_cv(params: dict) -> tuple[float, float, str]:
+    cv_full_open = _valve_full_open_cv(params)
     relative_capacity, characteristic = _valve_relative_capacity(params)
-    if zeta_full_open <= 0:
-        return 0.0, relative_capacity, characteristic
-    return zeta_full_open / (relative_capacity ** 2), relative_capacity, characteristic
+    return cv_full_open * relative_capacity, relative_capacity, characteristic
 
 
 def _valve_pressure_drop_kpa(params: dict, q_m3s: float, rho: float) -> float:
-    area = _valve_area(params)
-    v = abs(q_m3s) / area if area > 0 else 0.0
-    zeta, _, _ = _valve_loss_coefficient(params)
-    return zeta * rho * v ** 2 / 2.0 / 1000.0
+    cv_effective, _, _ = _valve_effective_cv(params)
+    if cv_effective <= 1e-12:
+        return 1e12 if abs(q_m3s) > 1e-12 else 0.0
+    q_gpm = abs(q_m3s) * 15850.323141489
+    specific_gravity = max(rho / 999.016, 1e-12)
+    dp_psi = specific_gravity * (q_gpm / cv_effective) ** 2
+    return dp_psi * 6.894757293
 
 
 def _valve_flow_for_pressure_drop(params: dict, dp_kpa: float, rho: float) -> float:
     if dp_kpa <= 1e-12:
         return 0.0
-    area = _valve_area(params)
-    zeta, _, _ = _valve_loss_coefficient(params)
-    if area <= 0 or zeta <= 1e-12:
+    cv_effective, _, _ = _valve_effective_cv(params)
+    if cv_effective <= 1e-12:
         return 0.0
-    return area * np.sqrt(2.0 * dp_kpa * 1000.0 / (rho * zeta))
+    specific_gravity = max(rho / 999.016, 1e-12)
+    q_gpm = cv_effective * np.sqrt((dp_kpa / 6.894757293) / specific_gravity)
+    return q_gpm / 15850.323141489
 
 
 def _pipe_flow_for_pressure_drop(
@@ -1173,7 +1190,14 @@ def _pump_boost_kpa(params: dict, q_m3h: float, rho: float) -> float:
     return rho * 9.80665 * _pump_head_m(params, q_m3h) / 1000.0
 
 
-def _pump_flow_for_required_boost(params: dict, boost_kpa: float, rho: float) -> float:
+def _pump_params_at_speed(params: dict, speed_rpm: float) -> dict:
+    next_params = dict(params)
+    next_params["speed"] = max(speed_rpm, 0.0)
+    next_params["driveMode"] = "speed"
+    return next_params
+
+
+def _pump_flow_for_required_boost_at_speed(params: dict, boost_kpa: float, rho: float) -> float:
     """要求昇圧[kPa]に対応するポンプ流量[m³/s]を返す。逆流は許可しない。"""
     q_max = max(_pump_max_flow(params), 1e-9)
     boost_zero = _pump_boost_kpa(params, 0.0, rho)
@@ -1188,6 +1212,39 @@ def _pump_flow_for_required_boost(params: dict, boost_kpa: float, rho: float) ->
         return _pump_boost_kpa(params, q_m3h, rho) - boost_kpa
 
     return brentq(residual, 0.0, q_max, xtol=1e-9, maxiter=80) / 3600.0
+
+
+def _pump_torque_operating_point(params: dict, boost_kpa: float, rho: float) -> tuple[float, float]:
+    torque_limit = max(float(params.get("driveTorque", 0.0)), 0.0)
+    if torque_limit <= 1e-12:
+        return 0.0, 0.0
+    rated_speed = max(float(params.get("ratedSpeed", 1450.0)), 1e-9)
+    speed_hi = max(float(params.get("speed", rated_speed)), rated_speed) * 3.0
+    best_q = 0.0
+    best_speed = 0.0
+    best_gap = float("inf")
+    for speed in np.linspace(rated_speed * 0.02, speed_hi, 100):
+        speed_params = _pump_params_at_speed(params, float(speed))
+        q = _pump_flow_for_required_boost_at_speed(speed_params, boost_kpa, rho)
+        segment = _calc_pump_segment(speed_params, q, rho)
+        torque = float(segment["shaft_torque_nm"])
+        gap = abs(torque - torque_limit)
+        if torque <= torque_limit and q >= best_q:
+            best_q = q
+            best_speed = float(speed)
+            best_gap = gap
+        elif best_q <= 0.0 and gap < best_gap:
+            best_q = q
+            best_speed = float(speed)
+            best_gap = gap
+    return best_q, best_speed
+
+
+def _pump_flow_for_required_boost(params: dict, boost_kpa: float, rho: float) -> float:
+    if params.get("driveMode") == "torque":
+        q, _ = _pump_torque_operating_point(params, boost_kpa, rho)
+        return q
+    return _pump_flow_for_required_boost_at_speed(params, boost_kpa, rho)
 
 
 def _calc_pump_segment(params: dict, q_m3s: float, rho: float) -> dict:
@@ -1324,19 +1381,16 @@ def _calc_elbow_segment(params: dict, q_m3s: float, rho: float) -> dict:
 
 
 def _calc_valve_segment(params: dict, q_m3s: float, rho: float) -> dict:
-    area = _valve_area(params)
-    v = abs(q_m3s) / area if area > 0 else 0.0
-    zeta, relative_capacity, characteristic = _valve_loss_coefficient(params)
+    cv_effective, relative_capacity, characteristic = _valve_effective_cv(params)
     return {
         "Q_m3h": round(q_m3s * 3600.0, 4),
-        "v": round(np.sign(q_m3s) * v, 4),
+        "v": 0.0,
         "Re": 0.0,
         "f": 0.0,
         "dP_kpa": round(_valve_pressure_drop_kpa(params, q_m3s, rho), 6),
         "regime": "valve",
-        "diameter_mm": round(float(params.get("diameter", 100.0)), 6),
-        "loss_coefficient": round(zeta, 6),
-        "valve_zeta_full_open": round(float(params.get("valveZetaFullOpen", 1.0)), 6),
+        "valve_cv": round(_valve_full_open_cv(params), 6),
+        "valve_effective_cv": round(cv_effective, 6),
         "valve_opening_percent": round(min(max(float(params.get("valveOpening", 100.0)), 0.0), 100.0), 6),
         "valve_relative_capacity": round(relative_capacity, 6),
         "valve_characteristic": characteristic,
@@ -2120,6 +2174,979 @@ def calc_pipe_network(req: PipeNetworkRequest):
     }
 
 
+@app.post("/pipe-network/transient")
+def simulate_pipe_network_transient(req: PipeNetworkTransientRequest):
+    """Minimal port-based liquid single-phase transient solver."""
+    duration = float(req.duration)
+    dt = float(req.dt)
+    if duration <= 0:
+        raise HTTPException(status_code=400, detail="計算時間は0より大きくしてください")
+    if dt <= 0:
+        raise HTTPException(status_code=400, detail="時間刻みは0より大きくしてください")
+    if duration / dt > 20000:
+        raise HTTPException(status_code=400, detail="時間ステップ数が多すぎます。計算時間または時間刻みを見直してください")
+
+    nodes_dict = {n.id: n for n in req.nodes}
+    resistor_types = {"resistor", "pipe", "valve", "elbow", "reducer", "heatExchanger"}
+    supported_node_types = BOUNDARY_NODE_TYPES | {"fluid", "volume", "tank", "thermalMass", "pump"} | resistor_types
+    warnings: list[str] = []
+    unsupported = sorted({n.node_type for n in req.nodes if n.node_type not in supported_node_types})
+    if unsupported:
+        warnings.append("未対応ノードは計算対象外です: " + ", ".join(unsupported))
+
+    def coolprop_state(fluid_name: str, temperature_k: float, pressure_kpa: float, fallback: dict[str, Any] | None = None) -> dict[str, Any]:
+        if fluid_name not in SUPPORTED_FLUIDS:
+            raise HTTPException(status_code=400, detail=f"未対応のCoolProp流体です: {fluid_name}")
+        pressure_pa = max(float(pressure_kpa) * 1000.0, 1.0)
+        temperature = max(float(temperature_k), 1.0)
+        try:
+            return {
+                "propertyMode": "state",
+                "coolPropFluid": fluid_name,
+                "density": float(CP.PropsSI("D", "T", temperature, "P", pressure_pa, fluid_name)),
+                "viscosity": float(CP.PropsSI("V", "T", temperature, "P", pressure_pa, fluid_name)),
+                "specificHeat": float(CP.PropsSI("C", "T", temperature, "P", pressure_pa, fluid_name)),
+                "thermalConductivity": float(CP.PropsSI("L", "T", temperature, "P", pressure_pa, fluid_name)),
+                "temperature": temperature,
+            }
+        except Exception as exc:
+            if fallback:
+                return dict(fallback)
+            raise HTTPException(status_code=400, detail=f"{fluid_name}: CoolPropで物性を計算できません: {exc}")
+
+    fluid_nodes: dict[str, dict[str, Any]] = {}
+    for node in req.nodes:
+        if node.node_type != "fluid":
+            continue
+        temperature = float(node.params.get("temperature", 293.15))
+        if node.params.get("propertyMode") == "state":
+            fluid_name = str(node.params.get("coolPropFluid", "Water"))
+            fluid_nodes[node.id] = coolprop_state(fluid_name, temperature, float(node.params.get("pressure", 101.325)))
+            continue
+        density = float(node.params.get("density", req.density))
+        viscosity = float(node.params.get("viscosity", req.viscosity))
+        specific_heat = float(node.params.get("specificHeat", DEFAULT_SPECIFIC_HEAT_J_KG_K))
+        thermal_conductivity = float(node.params.get("thermalConductivity", 0.6))
+        if density <= 0 or viscosity <= 0 or specific_heat <= 0 or thermal_conductivity <= 0:
+            raise HTTPException(status_code=400, detail=f"{node.id}: 流体の密度、粘度、比熱、熱伝導率は0より大きくしてください")
+        fluid_nodes[node.id] = {
+            "propertyMode": "constantDensity",
+            "density": density,
+            "viscosity": viscosity,
+            "specificHeat": specific_heat,
+            "thermalConductivity": thermal_conductivity,
+            "temperature": temperature,
+        }
+    if not fluid_nodes:
+        raise HTTPException(status_code=400, detail="非定常計算では流体ノードを少なくとも1つ配置してください")
+
+    DEFAULT_COMPLIANCE_M3_PER_KPA = 1e-5
+    DEFAULT_RESISTANCE_KPA_PER_M3S = 100000.0
+    DEFAULT_TANK_AREA_M2 = 1.0
+    G_ACCEL = 9.80665
+
+    def pipe_heat_area_m2(params: dict[str, Any]) -> float:
+        length = max(float(params.get("length", 10.0)), 0.0)
+        pipe_shape = params.get("pipeShape", "circular")
+        if pipe_shape == "rectangular":
+            width = max(float(params.get("width", 100.0)) / 1000.0, 0.0)
+            height = max(float(params.get("ductHeight", 50.0)) / 1000.0, 0.0)
+            perimeter = 2.0 * (width + height)
+        else:
+            diameter = max(float(params.get("diameter", 100.0)) / 1000.0, 0.0)
+            perimeter = np.pi * diameter
+        return perimeter * length
+
+    def pipe_hydraulic_diameter_m(params: dict[str, Any]) -> float:
+        pipe_shape = params.get("pipeShape", "circular")
+        if pipe_shape == "rectangular":
+            width = max(float(params.get("width", 100.0)) / 1000.0, 0.0)
+            height = max(float(params.get("ductHeight", 50.0)) / 1000.0, 0.0)
+            return 2.0 * width * height / (width + height) if (width + height) > 0 else 0.0
+        return max(float(params.get("diameter", 100.0)) / 1000.0, 0.0)
+
+    def pipe_fluid_volume_m3(params: dict[str, Any]) -> float:
+        length = max(float(params.get("length", 10.0)), 0.0)
+        if params.get("pipeShape", "circular") == "rectangular":
+            width = max(float(params.get("width", 100.0)) / 1000.0, 0.0)
+            height = max(float(params.get("ductHeight", 50.0)) / 1000.0, 0.0)
+            area = width * height
+        else:
+            diameter = max(float(params.get("diameter", 100.0)) / 1000.0, 0.0)
+            area = np.pi * diameter ** 2 / 4.0
+        return max(area * length, 0.0)
+
+    def pipe_heat_transfer_coefficient(params: dict[str, Any], re: float) -> float:
+        d_h = pipe_hydraulic_diameter_m(params)
+        k = max(float(params.get("thermalConductivity", 0.6)), 1e-12)
+        mu = max(float(params.get("viscosity", 0.001)), 1e-12)
+        cp = max(float(params.get("specificHeat", DEFAULT_SPECIFIC_HEAT_J_KG_K)), 1e-12)
+        pr = max(cp * mu / k, 1e-12)
+        if d_h <= 0:
+            return 0.0
+        if re < 2300.0:
+            nu = 3.66
+        elif re < 4000.0:
+            nu_lam = 3.66
+            nu_turb = 0.023 * (4000.0 ** 0.8) * (pr ** 0.4)
+            nu = nu_lam + (nu_turb - nu_lam) * (re - 2300.0) / 1700.0
+        else:
+            nu = 0.023 * (max(re, 1e-12) ** 0.8) * (pr ** 0.4)
+        return nu * k / d_h
+
+    def canonical_kind(node: PipeNetworkNode) -> str:
+        if node.node_type in BOUNDARY_NODE_TYPES:
+            return "boundary"
+        if node.node_type == "pipe":
+            return "pipe"
+        if node.node_type == "pump":
+            return "pump"
+        if node.node_type == "valve":
+            return "valve"
+        if node.node_type in resistor_types:
+            return "resistor"
+        return node.node_type
+
+    def fluid_for_node(node: PipeNetworkNode) -> dict[str, Any]:
+        ref = node.params.get("fluidRef") or node.params.get("fluidSystemId")
+        if not ref:
+            raise HTTPException(status_code=400, detail=f"{node.id}: 流体を設定してください")
+        ref_id = str(ref)
+        if ref_id not in fluid_nodes:
+            raise HTTPException(status_code=400, detail=f"{node.id}: 参照先の流体が見つかりません: {ref_id}")
+        return fluid_nodes[ref_id]
+
+    def fluid_ref_for_node(node: PipeNetworkNode) -> str:
+        ref = node.params.get("fluidRef") or node.params.get("fluidSystemId")
+        return str(ref) if ref else ""
+
+    def port_ids(node: PipeNetworkNode) -> list[str]:
+        kind = canonical_kind(node)
+        if kind in ("resistor", "pipe", "pump", "valve"):
+            return ["a", "b"]
+        if kind == "tank":
+            count = max(int(float(node.params.get("portCount", 1))), 1)
+            return [f"port{i + 1}" for i in range(count)]
+        return ["port"]
+
+    def endpoint_port(node: PipeNetworkNode, handle: str | None, outgoing_side: bool) -> str:
+        ids = port_ids(node)
+        if len(ids) == 1:
+            return ids[0]
+        text = handle or ""
+        if text in ids:
+            return text
+        if canonical_kind(node) == "tank":
+            return ids[0]
+        if text in ("in", "left"):
+            return "a"
+        if text in ("out", "right"):
+            return "b"
+        return "b" if outgoing_side else "a"
+
+    def component_from_node(node: PipeNetworkNode) -> dict[str, Any]:
+        kind = canonical_kind(node)
+        if kind == "resistor":
+            fluid = fluid_for_node(node)
+            return {
+                "id": node.id,
+                "kind": "resistor",
+                "fluid": fluid,
+                "fluidRef": fluid_ref_for_node(node),
+                "params": {
+                    "resistance": max(float(node.params.get("resistance", DEFAULT_RESISTANCE_KPA_PER_M3S)), 1e-12),
+                },
+                "state": {},
+                "ports": {
+                    "a": {"domain": "fluid", "variables": {"p": None, "q": None}},
+                    "b": {"domain": "fluid", "variables": {"p": None, "q": None}},
+                },
+                "equations": [{
+                    "type": "linear_resistance",
+                    "port_a": "a",
+                    "port_b": "b",
+                    "resistance": max(float(node.params.get("resistance", DEFAULT_RESISTANCE_KPA_PER_M3S)), 1e-12),
+                }],
+            }
+        if kind == "pipe":
+            fluid = fluid_for_node(node)
+            pipe_params = {
+                "pipeShape": node.params.get("pipeShape", "circular"),
+                "diameter": float(node.params.get("diameter", 100.0)),
+                "width": float(node.params.get("width", 100.0)),
+                "ductHeight": float(node.params.get("ductHeight", 50.0)),
+                "length": float(node.params.get("length", 10.0)),
+                "roughness": float(node.params.get("roughness", 0.046)),
+                "heatEnabled": bool(node.params.get("heatEnabled", False)),
+                "fluidTemperature": float(node.params.get("initialTemperature", node.params.get("temperature", fluid.get("temperature", 293.15)))),
+                "specificHeat": float(fluid.get("specificHeat", DEFAULT_SPECIFIC_HEAT_J_KG_K)),
+                "thermalConductivity": float(fluid.get("thermalConductivity", 0.6)),
+                "viscosity": float(fluid.get("viscosity", req.viscosity)),
+                "heatTemperature": float(node.params.get("heatTemperature", 293.15)),
+                "heatInput": float(node.params.get("heatInput", 0.0)),
+                "frictionMethod": "blasius",
+            }
+            pipe_params["heatArea"] = pipe_heat_area_m2(pipe_params)
+            pipe_params["fluidVolume"] = pipe_fluid_volume_m3(pipe_params)
+            return {
+                "id": node.id,
+                "kind": "pipe",
+                "fluid": fluid,
+                "fluidRef": fluid_ref_for_node(node),
+                "params": pipe_params,
+                "state": {},
+                "ports": {
+                    "a": {"domain": "fluid", "variables": {"p": None, "q": None}},
+                    "b": {"domain": "fluid", "variables": {"p": None, "q": None}},
+                },
+                "equations": [{
+                    "type": "pipe_blasius",
+                    "port_a": "a",
+                    "port_b": "b",
+                    "params": pipe_params,
+                }],
+            }
+        if kind == "pump":
+            fluid = fluid_for_node(node)
+            pump_params = {
+                "pumpCurveMode": "table" if node.params.get("pumpCurveMode") == "table" else "simple",
+                "pumpCurvePoints": node.params.get("pumpCurvePoints", []),
+                "ratedFlow": max(float(node.params.get("ratedFlow", 30.0)), 0.0),
+                "ratedHead": max(float(node.params.get("ratedHead", 20.0)), 0.0),
+                "shutoffHead": max(float(node.params.get("shutoffHead", 30.0)), 0.0),
+                "ratedSpeed": max(float(node.params.get("ratedSpeed", 1450.0)), 1e-9),
+                "speed": max(float(node.params.get("speed", node.params.get("ratedSpeed", 1450.0))), 0.0),
+                "driveMode": "torque" if node.params.get("driveMode") == "torque" else "speed",
+                "driveTorque": max(float(node.params.get("driveTorque", 0.0)), 0.0),
+                "efficiency": max(float(node.params.get("efficiency", 70.0)), 1e-9),
+            }
+            return {
+                "id": node.id,
+                "kind": "pump",
+                "fluid": fluid,
+                "fluidRef": fluid_ref_for_node(node),
+                "params": pump_params,
+                "state": {},
+                "ports": {
+                    "a": {"domain": "fluid", "variables": {"p": None, "q": None}},
+                    "b": {"domain": "fluid", "variables": {"p": None, "q": None}},
+                },
+                "equations": [{
+                    "type": "pump_curve",
+                    "port_a": "a",
+                    "port_b": "b",
+                    "params": pump_params,
+                }],
+            }
+        if kind == "valve":
+            fluid = fluid_for_node(node)
+            valve_params = {
+                "valveCv": max(float(node.params.get("valveCv", node.params.get("cv", 50.0))), 0.0),
+                "valveOpening": min(max(float(node.params.get("valveOpening", 100.0)), 0.0), 100.0),
+                "valveCharacteristic": str(node.params.get("valveCharacteristic", "linear")),
+                "valveRangeability": max(float(node.params.get("valveRangeability", 50.0)), 1.000001),
+            }
+            return {
+                "id": node.id,
+                "kind": "valve",
+                "fluid": fluid,
+                "fluidRef": fluid_ref_for_node(node),
+                "params": valve_params,
+                "state": {},
+                "ports": {
+                    "a": {"domain": "fluid", "variables": {"p": None, "q": None}},
+                    "b": {"domain": "fluid", "variables": {"p": None, "q": None}},
+                },
+                "equations": [{
+                    "type": "valve_loss",
+                    "port_a": "a",
+                    "port_b": "b",
+                    "params": valve_params,
+                }],
+            }
+        if kind == "volume":
+            fluid = fluid_for_node(node)
+            return {
+                "id": node.id,
+                "kind": "volume",
+                "fluid": fluid,
+                "fluidRef": fluid_ref_for_node(node),
+                "params": {
+                    "compliance": max(float(node.params.get("compliance", DEFAULT_COMPLIANCE_M3_PER_KPA)), 1e-12),
+                },
+                "state": {
+                    "pressure_kpa": float(node.params.get("pressure", 100.0)),
+                },
+                "ports": {
+                    "port": {"domain": "fluid", "variables": {"p": None, "q": None}},
+                },
+                "equations": [{
+                    "type": "storage",
+                    "port": "port",
+                    "state": "pressure_kpa",
+                    "compliance": max(float(node.params.get("compliance", DEFAULT_COMPLIANCE_M3_PER_KPA)), 1e-12),
+                }],
+            }
+        if kind == "tank":
+            fluid = fluid_for_node(node)
+            rho = float(fluid["density"])
+            specific_heat = float(fluid.get("specificHeat", DEFAULT_SPECIFIC_HEAT_J_KG_K))
+            temperature = float(node.params.get("initialTemperature", node.params.get("temperature", fluid.get("temperature", 293.15))))
+            if temperature <= 0:
+                raise HTTPException(status_code=400, detail=f"{node.id}: タンクの初期温度は0より大きくしてください")
+            ports = port_ids(node)
+            max_level = max(float(node.params.get("maxLevel", 2.0)), 0.0)
+            initial_level = min(max(float(node.params.get("initialLevel", 1.0)), 0.0), max_level)
+            tank_params = {
+                "area_m2": max(float(node.params.get("tankArea", DEFAULT_TANK_AREA_M2)), 1e-12),
+                "max_level_m": max_level,
+                "density": rho,
+                "specificHeat": specific_heat,
+                "heatEnabled": bool(node.params.get("heatEnabled", False)),
+                "heatTemperature": float(node.params.get("heatTemperature", 293.15)),
+                "outerHeatTransferCoeff": max(float(node.params.get("outerHeatTransferCoeff", node.params.get("heatTransferCoeff", 10.0))), 0.0),
+                "innerHeatTransferCoeff": max(float(node.params.get("innerHeatTransferCoeff", node.params.get("heatTransferCoeff", 50.0))), 0.0),
+                "heatArea": max(float(node.params.get("heatArea", 1.0)), 0.0),
+                "wallThickness": max(float(node.params.get("wallThickness", 2.0)) / 1000.0, 0.0),
+                "wallDensity": max(float(node.params.get("wallDensity", 7800.0)), 1e-12),
+                "wallSpecificHeat": max(float(node.params.get("wallSpecificHeat", DEFAULT_SPECIFIC_HEAT_J_KG_K)), 1e-12),
+                "wallThermalConductivity": max(float(node.params.get("wallThermalConductivity", 16.0)), 1e-12),
+            }
+            return {
+                "id": node.id,
+                "kind": "tank",
+                "fluid": fluid,
+                "fluidRef": fluid_ref_for_node(node),
+                "params": tank_params,
+                "state": {
+                    "level_m": initial_level,
+                    "temperature_k": temperature,
+                    "wall_temperature_k": temperature,
+                },
+                "ports": {
+                    port_id: {"domain": "fluid", "variables": {"p": None, "q": None}}
+                    for port_id in ports
+                },
+                "equations": [{
+                    "type": "tank_storage",
+                    "ports": ports,
+                    "state": "level_m",
+                    "temperature_state": "temperature_k",
+                    "area_m2": tank_params["area_m2"],
+                    "max_level_m": max_level,
+                    "density": rho,
+                    "specificHeat": specific_heat,
+                    "params": tank_params,
+                }],
+            }
+        if kind == "boundary":
+            fluid = fluid_for_node(node)
+            btype = _boundary_type(node.params)
+            equation = {
+                "type": "pressure_constraint",
+                "port": "port",
+                "pressure_kpa": float(node.params.get("pressure", 0.0)),
+            } if btype == "pressure" else {
+                "type": "flow_source",
+                "port": "port",
+                "flow_m3s": float(node.params.get("flowRate", 0.0)) / 3600.0,
+                "boundary_type": btype,
+            }
+            return {
+                "id": node.id,
+                "kind": "boundary",
+                "fluid": fluid,
+                "fluidRef": fluid_ref_for_node(node),
+                "params": {"boundaryType": btype},
+                "state": {},
+                "ports": {
+                    "port": {"domain": "fluid", "variables": {"p": None, "q": None}},
+                },
+                "equations": [equation],
+            }
+        if kind == "thermalMass":
+            heat_capacity = max(float(node.params.get("heatCapacity", 500.0)), 1e-12)
+            temperature = float(node.params.get("temperature", 293.15))
+            if temperature <= 0:
+                raise HTTPException(status_code=400, detail=f"{node.id}: 熱質量の初期温度は0より大きくしてください")
+            return {
+                "id": node.id,
+                "kind": "thermalMass",
+                "fluid": None,
+                "params": {
+                    "heat_capacity_j_k": heat_capacity,
+                    "temperature_k": temperature,
+                },
+                "state": {
+                    "temperature_k": temperature,
+                },
+                "ports": {},
+                "equations": [{
+                    "type": "thermal_mass",
+                    "state": "temperature_k",
+                    "heat_capacity_j_k": heat_capacity,
+                }],
+            }
+        return {
+            "id": node.id,
+            "kind": kind,
+            "fluid": None,
+            "params": dict(node.params),
+            "state": {},
+            "ports": {},
+            "equations": [],
+        }
+
+    components = {
+        node.id: component_from_node(node)
+        for node in req.nodes
+        if node.node_type in supported_node_types
+    }
+
+    parent: dict[str, str] = {}
+
+    def add_point(pid: str) -> None:
+        parent.setdefault(pid, pid)
+
+    def find(pid: str) -> str:
+        add_point(pid)
+        if parent[pid] != pid:
+            parent[pid] = find(parent[pid])
+        return parent[pid]
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    def port_ref(node_id: str, port_id: str) -> str:
+        return f"{node_id}.{port_id}"
+
+    for component in components.values():
+        for pid in component["ports"]:
+            add_point(port_ref(component["id"], pid))
+
+    for e in (edge for edge in req.edges if edge.line_type == "fluid"):
+        if e.source not in nodes_dict or e.target not in nodes_dict:
+            continue
+        source = nodes_dict[e.source]
+        target = nodes_dict[e.target]
+        if source.node_type not in supported_node_types or target.node_type not in supported_node_types:
+            continue
+        union(
+            port_ref(source.id, endpoint_port(source, e.source_handle, outgoing_side=True)),
+            port_ref(target.id, endpoint_port(target, e.target_handle, outgoing_side=False)),
+        )
+
+    fixed_p: dict[str, float] = {}
+    fixed_q: dict[str, float] = defaultdict(float)
+    flow_boundary_series: dict[str, float] = {}
+    volume_roots: dict[str, str] = {}
+    volume_state: dict[str, float] = {}
+    volume_compliance: dict[str, float] = {}
+    tank_roots: dict[str, list[str]] = {}
+    tank_level: dict[str, float] = {}
+    tank_area: dict[str, float] = {}
+    tank_max_level: dict[str, float] = {}
+    tank_density: dict[str, float] = {}
+    tank_temperature: dict[str, float] = {}
+    tank_wall_temperature: dict[str, float] = {}
+    tank_wall_heat_capacity: dict[str, float] = {}
+    tank_specific_heat: dict[str, float] = {}
+    tank_heat_params: dict[str, dict[str, float | bool]] = {}
+    tank_fluid_ref: dict[str, str] = {}
+    thermal_mass_temperature: dict[str, float] = {}
+    thermal_mass_capacity: dict[str, float] = {}
+    resistors: list[dict[str, Any]] = []
+
+    for component in components.values():
+        for equation in component["equations"]:
+            eq_type = equation["type"]
+            if eq_type == "pressure_constraint":
+                fixed_p[find(port_ref(component["id"], equation["port"]))] = float(equation["pressure_kpa"])
+            elif eq_type == "flow_source":
+                if equation.get("boundary_type") != "flow":
+                    warnings.append(f"{component['id']}: 未対応の境界条件です: {equation.get('boundary_type')}")
+                    continue
+                q_m3s = float(equation["flow_m3s"])
+                fixed_q[find(port_ref(component["id"], equation["port"]))] += q_m3s
+                flow_boundary_series[component["id"]] = q_m3s
+            elif eq_type == "storage":
+                root_id = find(port_ref(component["id"], equation["port"]))
+                volume_roots[component["id"]] = root_id
+                volume_state[component["id"]] = float(component["state"]["pressure_kpa"])
+                volume_compliance[component["id"]] = float(equation["compliance"])
+            elif eq_type == "tank_storage":
+                root_ids = [find(port_ref(component["id"], port_id)) for port_id in equation["ports"]]
+                tank_roots[component["id"]] = root_ids
+                tank_level[component["id"]] = float(component["state"]["level_m"])
+                tank_area[component["id"]] = float(equation["area_m2"])
+                tank_max_level[component["id"]] = float(equation["max_level_m"])
+                tank_density[component["id"]] = float(equation["density"])
+                tank_temperature[component["id"]] = float(component["state"].get("temperature_k", 293.15))
+                tank_wall_temperature[component["id"]] = float(component["state"].get("wall_temperature_k", component["state"].get("temperature_k", 293.15)))
+                tank_specific_heat[component["id"]] = float(equation.get("specificHeat", DEFAULT_SPECIFIC_HEAT_J_KG_K))
+                tank_heat_params[component["id"]] = dict(equation.get("params", {}))
+                params = tank_heat_params[component["id"]]
+                tank_wall_heat_capacity[component["id"]] = max(
+                    float(params.get("wallDensity", 7800.0))
+                    * float(params.get("wallThickness", 0.002))
+                    * float(params.get("heatArea", 1.0))
+                    * float(params.get("wallSpecificHeat", DEFAULT_SPECIFIC_HEAT_J_KG_K)),
+                    1e-12,
+                )
+                tank_fluid_ref[component["id"]] = str(component.get("fluidRef", ""))
+            elif eq_type == "linear_resistance":
+                a = find(port_ref(component["id"], equation["port_a"]))
+                b = find(port_ref(component["id"], equation["port_b"]))
+                if a == b:
+                    continue
+                resistors.append({
+                    "id": component["id"],
+                    "model": "linear",
+                    "a": a,
+                    "b": b,
+                    "fluidRef": component.get("fluidRef", ""),
+                    "density": float((component.get("fluid") or {}).get("density", req.density)),
+                    "viscosity": float((component.get("fluid") or {}).get("viscosity", req.viscosity)),
+                    "resistance": float(equation["resistance"]),
+                })
+            elif eq_type == "pipe_blasius":
+                a = find(port_ref(component["id"], equation["port_a"]))
+                b = find(port_ref(component["id"], equation["port_b"]))
+                if a == b:
+                    continue
+                resistors.append({
+                    "id": component["id"],
+                    "model": "pipe_blasius",
+                    "a": a,
+                    "b": b,
+                    "fluidRef": component.get("fluidRef", ""),
+                    "density": float((component.get("fluid") or {}).get("density", req.density)),
+                    "viscosity": float((component.get("fluid") or {}).get("viscosity", req.viscosity)),
+                    "params": equation["params"],
+                })
+            elif eq_type == "pump_curve":
+                a = find(port_ref(component["id"], equation["port_a"]))
+                b = find(port_ref(component["id"], equation["port_b"]))
+                if a == b:
+                    continue
+                resistors.append({
+                    "id": component["id"],
+                    "model": "pump",
+                    "a": a,
+                    "b": b,
+                    "fluidRef": component.get("fluidRef", ""),
+                    "density": float((component.get("fluid") or {}).get("density", req.density)),
+                    "viscosity": float((component.get("fluid") or {}).get("viscosity", req.viscosity)),
+                    "params": equation["params"],
+                })
+            elif eq_type == "valve_loss":
+                a = find(port_ref(component["id"], equation["port_a"]))
+                b = find(port_ref(component["id"], equation["port_b"]))
+                if a == b:
+                    continue
+                resistors.append({
+                    "id": component["id"],
+                    "model": "valve",
+                    "a": a,
+                    "b": b,
+                    "fluidRef": component.get("fluidRef", ""),
+                    "density": float((component.get("fluid") or {}).get("density", req.density)),
+                    "viscosity": float((component.get("fluid") or {}).get("viscosity", req.viscosity)),
+                    "params": equation["params"],
+                })
+            elif eq_type == "thermal_mass":
+                thermal_mass_temperature[component["id"]] = float(component["state"]["temperature_k"])
+                thermal_mass_capacity[component["id"]] = float(equation["heat_capacity_j_k"])
+
+    if not volume_state and not tank_level:
+        raise HTTPException(status_code=400, detail="非定常計算には容量ノードまたはタンクが少なくとも1つ必要です")
+    if not resistors and not fixed_q:
+        raise HTTPException(status_code=400, detail="非定常計算には抵抗またはポンプなどの2ポート要素が必要です")
+
+    root_to_volumes: dict[str, list[str]] = defaultdict(list)
+    for vid, root_id in volume_roots.items():
+        root_to_volumes[root_id].append(vid)
+        if root_id in fixed_p:
+            warnings.append(f"{vid}: 圧力境界と抵抗なしで直結しているため圧力は境界に拘束されます")
+    root_to_tanks: dict[str, list[str]] = defaultdict(list)
+    for tid, root_ids in tank_roots.items():
+        for root_id in root_ids:
+            root_to_tanks[root_id].append(tid)
+            if root_id in fixed_p:
+                warnings.append(f"{tid}: 圧力境界と抵抗なしで直結しているため水位圧は境界に拘束されます")
+
+    def resistor_flow(resistor: dict[str, Any], pressures: dict[str, float]) -> float:
+        if resistor.get("model") == "pump":
+            required_boost = pressures[resistor["b"]] - pressures[resistor["a"]]
+            return _component_flow_for_pressure_delta(
+                "pump",
+                resistor["params"],
+                required_boost,
+                float(resistor["density"]),
+                float(resistor["viscosity"]),
+                "blasius",
+            )
+        if resistor.get("model") == "pipe_blasius":
+            dp = pressures[resistor["a"]] - pressures[resistor["b"]]
+            q_abs = _component_flow_for_pressure_delta(
+                "pipe",
+                resistor["params"],
+                abs(dp),
+                float(resistor["density"]),
+                float(resistor["viscosity"]),
+                "blasius",
+            )
+            return q_abs if dp >= 0 else -q_abs
+        if resistor.get("model") == "valve":
+            dp = pressures[resistor["a"]] - pressures[resistor["b"]]
+            q_abs = _component_flow_for_pressure_delta(
+                "valve",
+                resistor["params"],
+                abs(dp),
+                float(resistor["density"]),
+                float(resistor["viscosity"]),
+                "blasius",
+            )
+            return q_abs if dp >= 0 else -q_abs
+        return (pressures[resistor["a"]] - pressures[resistor["b"]]) / resistor["resistance"]
+
+    def pressure_map() -> dict[str, float]:
+        known_p = dict(fixed_p)
+        for root_id, vids in root_to_volumes.items():
+            if root_id in known_p:
+                continue
+            known_p[root_id] = sum(volume_state[vid] for vid in vids) / len(vids)
+        for root_id, tids in root_to_tanks.items():
+            if root_id in known_p:
+                continue
+            known_p[root_id] = sum((tank_density[tid] * G_ACCEL * tank_level[tid] / 1000.0) for tid in tids) / len(tids)
+
+        all_roots = sorted({
+            *(resistor["a"] for resistor in resistors),
+            *(resistor["b"] for resistor in resistors),
+            *fixed_q.keys(),
+            *known_p.keys(),
+        })
+        unknown_roots = [root_id for root_id in all_roots if root_id not in known_p]
+        if not unknown_roots:
+            return known_p
+
+        unknown_index = {root_id: i for i, root_id in enumerate(unknown_roots)}
+        mean_known_p = sum(known_p.values()) / len(known_p) if known_p else 0.0
+
+        def values_from_unknowns(x: np.ndarray) -> dict[str, float]:
+            values = dict(known_p)
+            values.update({root_id: float(x[i]) for root_id, i in unknown_index.items()})
+            return values
+
+        def residual(x: np.ndarray) -> np.ndarray:
+            values = values_from_unknowns(x)
+            net_out: dict[str, float] = defaultdict(float)
+            for resistor in resistors:
+                q = resistor_flow(resistor, values)
+                net_out[resistor["a"]] += q
+                net_out[resistor["b"]] -= q
+            return np.array([net_out[root_id] - fixed_q.get(root_id, 0.0) for root_id in unknown_roots], dtype=float)
+
+        sol = least_squares(residual, np.full(len(unknown_roots), mean_known_p, dtype=float), xtol=1e-10, ftol=1e-10, gtol=1e-10, max_nfev=200)
+        if not sol.success:
+            raise HTTPException(
+                status_code=400,
+                detail=f"非定常ネットワークの連立方程式を解けません: {sol.message}",
+            )
+
+        values = dict(known_p)
+        values.update({root_id: float(sol.x[i]) for root_id, i in unknown_index.items()})
+        return values
+
+    def update_dynamic_fluid_properties(pressures: dict[str, float]) -> None:
+        for resistor in resistors:
+            fluid = fluid_nodes.get(str(resistor.get("fluidRef", "")))
+            if not fluid:
+                continue
+            local_fluid = fluid
+            if fluid.get("propertyMode") == "state":
+                samples = [float(pressures[root]) for root in (resistor["a"], resistor["b"]) if root in pressures]
+                pressure_kpa = sum(samples) / len(samples) if samples else 101.325
+                local_fluid = coolprop_state(
+                    str(fluid.get("coolPropFluid", "Water")),
+                    float(resistor.get("params", {}).get("fluidTemperature", fluid.get("temperature", 293.15))),
+                    pressure_kpa,
+                    fallback=fluid,
+                )
+            resistor["density"] = float(local_fluid.get("density", resistor.get("density", req.density)))
+            resistor["viscosity"] = float(local_fluid.get("viscosity", resistor.get("viscosity", req.viscosity)))
+            if "params" in resistor:
+                resistor["params"]["specificHeat"] = float(local_fluid.get("specificHeat", DEFAULT_SPECIFIC_HEAT_J_KG_K))
+                resistor["params"]["thermalConductivity"] = float(local_fluid.get("thermalConductivity", 0.6))
+                resistor["params"]["viscosity"] = float(local_fluid.get("viscosity", req.viscosity))
+        for tid, fluid_id in tank_fluid_ref.items():
+            fluid = fluid_nodes.get(fluid_id)
+            if fluid:
+                local_fluid = fluid
+                if fluid.get("propertyMode") == "state":
+                    root_ids = tank_roots.get(tid, [])
+                    samples = [float(pressures[root_id]) for root_id in root_ids if root_id in pressures]
+                    pressure_kpa = sum(samples) / len(samples) if samples else 101.325
+                    local_fluid = coolprop_state(
+                        str(fluid.get("coolPropFluid", "Water")),
+                        float(tank_temperature.get(tid, fluid.get("temperature", 293.15))),
+                        pressure_kpa,
+                        fallback=fluid,
+                    )
+                tank_density[tid] = float(local_fluid.get("density", tank_density[tid]))
+                tank_specific_heat[tid] = float(local_fluid.get("specificHeat", tank_specific_heat.get(tid, DEFAULT_SPECIFIC_HEAT_J_KG_K)))
+
+    time: list[float] = []
+    node_series: dict[str, dict[str, list[float]]] = {vid: {"pressure_kpa": []} for vid in volume_state}
+    for tid in tank_level:
+        node_series[tid] = {"pressure_kpa": [], "level_m": [], "temperature_k": [], "wall_temperature_k": []}
+        if tank_heat_params.get(tid, {}).get("heatEnabled"):
+            node_series[tid]["heat_transfer_w"] = []
+    for thermal_id in thermal_mass_temperature:
+        node_series[thermal_id] = {"temperature_k": [], "heat_transfer_w": []}
+    for resistor in resistors:
+        node_series.setdefault(resistor["id"], {})["flow_m3h"] = []
+        if resistor.get("model") == "pipe_blasius":
+            node_series[resistor["id"]]["velocity_mps"] = []
+            node_series[resistor["id"]]["reynolds"] = []
+            node_series[resistor["id"]]["pressure_loss_kpa"] = []
+            node_series[resistor["id"]]["temperature_k"] = []
+            if resistor["params"].get("heatEnabled"):
+                node_series[resistor["id"]]["heat_transfer_w"] = []
+                node_series[resistor["id"]]["heat_transfer_coefficient_w_m2k"] = []
+        elif resistor.get("model") == "pump":
+            node_series[resistor["id"]]["boost_kpa"] = []
+            node_series[resistor["id"]]["head_m"] = []
+            node_series[resistor["id"]]["shaft_power_kw"] = []
+            node_series[resistor["id"]]["speed_rpm"] = []
+            node_series[resistor["id"]]["shaft_torque_nm"] = []
+        elif resistor.get("model") == "valve":
+            node_series[resistor["id"]]["pressure_loss_kpa"] = []
+    for boundary_id in flow_boundary_series:
+        node_series.setdefault(boundary_id, {})["flow_m3h"] = []
+    port_series: dict[str, dict[str, dict[str, list[float]]]] = {
+        component["id"]: {
+            pid: {"pressure_kpa": [], "flow_m3h": []}
+            for pid in component["ports"]
+        }
+        for component in components.values()
+    }
+    edge_series: dict[str, dict[str, list[float]]] = {}
+    thermal_source_for_target: dict[str, str] = {}
+    for edge in req.edges:
+        if edge.line_type != "heat":
+            continue
+        source_node = nodes_dict.get(edge.source)
+        target_node = nodes_dict.get(edge.target)
+        if source_node and target_node and source_node.node_type == "thermalMass" and target_node.node_type in ("pipe", "tank"):
+            thermal_source_for_target[target_node.id] = source_node.id
+
+    steps = int(np.floor(duration / dt)) + 1
+    for step in range(steps):
+        t = min(step * dt, duration)
+        pressures = pressure_map()
+        update_dynamic_fluid_properties(pressures)
+        pressures = pressure_map()
+        resistor_flows: dict[str, float] = {}
+        thermal_mass_heat_to_fluid: dict[str, float] = defaultdict(float)
+        tank_heat_to_fluid: dict[str, float] = defaultdict(float)
+        tank_heat_to_wall: dict[str, float] = defaultdict(float)
+        pipe_heat_to_fluid: dict[str, float] = defaultdict(float)
+        port_flows: dict[tuple[str, str], float] = defaultdict(float)
+        for resistor in resistors:
+            q = resistor_flow(resistor, pressures)
+            resistor_flows[resistor["id"]] = q
+            node_series[resistor["id"]]["flow_m3h"].append(round(q * 3600.0, 6))
+            if resistor.get("model") == "pipe_blasius":
+                segment = _calc_pipe_segment(
+                    resistor["params"],
+                    q,
+                    float(resistor["density"]),
+                    float(resistor["viscosity"]),
+                    "blasius",
+                )
+                node_series[resistor["id"]]["velocity_mps"].append(round(float(segment["v"]), 6))
+                node_series[resistor["id"]]["reynolds"].append(round(float(segment["Re"]), 6))
+                node_series[resistor["id"]]["pressure_loss_kpa"].append(round(float(segment["dP_kpa"]), 6))
+                node_series[resistor["id"]]["temperature_k"].append(round(float(resistor["params"].get("fluidTemperature", 293.15)), 6))
+                if "heat_transfer_w" in node_series[resistor["id"]]:
+                    htc = pipe_heat_transfer_coefficient(resistor["params"], float(segment["Re"]))
+                    thermal_source_id = thermal_source_for_target.get(resistor["id"])
+                    heat_source_temperature = (
+                        thermal_mass_temperature[thermal_source_id]
+                        if thermal_source_id in thermal_mass_temperature
+                        else float(resistor["params"].get("heatTemperature", 293.15))
+                    )
+                    heat_q = (
+                        htc
+                        * float(resistor["params"].get("heatArea", 0.0))
+                        * (heat_source_temperature - float(resistor["params"].get("fluidTemperature", 293.15)))
+                    )
+                    if thermal_source_id in thermal_mass_temperature:
+                        thermal_mass_heat_to_fluid[thermal_source_id] += float(heat_q)
+                    pipe_heat_to_fluid[resistor["id"]] = float(heat_q)
+                    node_series[resistor["id"]]["heat_transfer_w"].append(round(float(heat_q), 6))
+                    node_series[resistor["id"]]["heat_transfer_coefficient_w_m2k"].append(round(float(htc), 6))
+            elif resistor.get("model") == "pump":
+                segment_params = resistor["params"]
+                if segment_params.get("driveMode") == "torque":
+                    required_boost = pressures[resistor["b"]] - pressures[resistor["a"]]
+                    _, speed = _pump_torque_operating_point(segment_params, required_boost, float(resistor["density"]))
+                    segment_params = _pump_params_at_speed(segment_params, speed)
+                segment = _calc_pump_segment(segment_params, q, float(resistor["density"]))
+                node_series[resistor["id"]]["boost_kpa"].append(round(float(segment["boost_kpa"]), 6))
+                node_series[resistor["id"]]["head_m"].append(round(float(segment["head_m"]), 6))
+                node_series[resistor["id"]]["shaft_power_kw"].append(round(float(segment["shaft_power_kw"]), 6))
+                node_series[resistor["id"]]["speed_rpm"].append(round(float(segment["speed_rpm"]), 6))
+                node_series[resistor["id"]]["shaft_torque_nm"].append(round(float(segment["shaft_torque_nm"]), 6))
+            elif resistor.get("model") == "valve":
+                segment = _calc_valve_segment(resistor["params"], q, float(resistor["density"]))
+                node_series[resistor["id"]]["pressure_loss_kpa"].append(round(float(segment["dP_kpa"]), 6))
+            port_flows[(resistor["id"], "a")] += q
+            port_flows[(resistor["id"], "b")] -= q
+        for boundary_id, q in flow_boundary_series.items():
+            node_series[boundary_id]["flow_m3h"].append(round(q * 3600.0, 6))
+            port_flows[(boundary_id, "port")] += q
+
+        for tid, params in tank_heat_params.items():
+            if not params.get("heatEnabled"):
+                continue
+            thermal_source_id = thermal_source_for_target.get(tid)
+            heat_source_temperature = (
+                thermal_mass_temperature[thermal_source_id]
+                if thermal_source_id in thermal_mass_temperature
+                else float(params.get("heatTemperature", 293.15))
+            )
+            area = float(params.get("heatArea", 0.0))
+            q_external = float(params.get("outerHeatTransferCoeff", 0.0)) * area * (heat_source_temperature - tank_wall_temperature[tid])
+            wall_thickness = max(float(params.get("wallThickness", 0.0)), 0.0)
+            wall_k = max(float(params.get("wallThermalConductivity", 16.0)), 1e-12)
+            h_inner = float(params.get("innerHeatTransferCoeff", 0.0))
+            if area <= 0.0 or h_inner <= 0.0:
+                conductance_to_fluid = 0.0
+            else:
+                conductance_to_fluid = area / (wall_thickness / wall_k + 1.0 / h_inner)
+            heat_q = conductance_to_fluid * (tank_wall_temperature[tid] - tank_temperature[tid])
+            tank_heat_to_wall[tid] = float(q_external)
+            tank_heat_to_fluid[tid] = float(heat_q)
+            if thermal_source_id in thermal_mass_temperature:
+                thermal_mass_heat_to_fluid[thermal_source_id] += float(q_external)
+
+        time.append(round(float(t), 9))
+        for vid, p in volume_state.items():
+            root_id = volume_roots[vid]
+            stored_p = fixed_p[root_id] if root_id in fixed_p else p
+            node_series[vid]["pressure_kpa"].append(round(float(stored_p), 6))
+        for tid, level in tank_level.items():
+            root_ids = tank_roots[tid]
+            free_pressure = tank_density[tid] * G_ACCEL * level / 1000.0
+            constrained = [fixed_p[root_id] for root_id in root_ids if root_id in fixed_p]
+            stored_p = sum(constrained) / len(constrained) if constrained else free_pressure
+            node_series[tid]["pressure_kpa"].append(round(float(stored_p), 6))
+            node_series[tid]["level_m"].append(round(float(level), 6))
+            node_series[tid]["temperature_k"].append(round(float(tank_temperature[tid]), 6))
+            node_series[tid]["wall_temperature_k"].append(round(float(tank_wall_temperature[tid]), 6))
+            if "heat_transfer_w" in node_series[tid]:
+                node_series[tid]["heat_transfer_w"].append(round(float(tank_heat_to_fluid.get(tid, 0.0)), 6))
+        for thermal_id, temperature in thermal_mass_temperature.items():
+            node_series[thermal_id]["temperature_k"].append(round(float(temperature), 6))
+            node_series[thermal_id]["heat_transfer_w"].append(round(float(-thermal_mass_heat_to_fluid.get(thermal_id, 0.0)), 6))
+
+        net_in_for_ports: dict[str, float] = defaultdict(float)
+        for resistor in resistors:
+            q = resistor_flows[resistor["id"]]
+            net_in_for_ports[resistor["a"]] -= q
+            net_in_for_ports[resistor["b"]] += q
+        for root_id, q in fixed_q.items():
+            net_in_for_ports[root_id] += q
+        for vid, root_id in volume_roots.items():
+            port_flows[(vid, "port")] += net_in_for_ports[root_id] / max(len(root_to_volumes[root_id]), 1)
+        for tid, root_ids in tank_roots.items():
+            for component in [components[tid]]:
+                for pid in component["ports"]:
+                    root_id = find(port_ref(tid, pid))
+                    port_flows[(tid, pid)] += net_in_for_ports[root_id] / max(len(root_to_tanks[root_id]), 1)
+        for component in components.values():
+            if component["kind"] == "boundary" and component["params"].get("boundaryType") == "pressure":
+                root_id = find(port_ref(component["id"], "port"))
+                port_flows[(component["id"], "port")] += net_in_for_ports[root_id]
+
+        for component in components.values():
+            for pid in component["ports"]:
+                root_id = find(port_ref(component["id"], pid))
+                p_val = pressures.get(root_id, volume_state.get(component["id"], 0.0))
+                port_series[component["id"]][pid]["pressure_kpa"].append(round(float(p_val), 6))
+                port_series[component["id"]][pid]["flow_m3h"].append(round(float(port_flows[(component["id"], pid)] * 3600.0), 6))
+
+        if step == steps - 1:
+            break
+
+        net_in: dict[str, float] = defaultdict(float)
+        for resistor in resistors:
+            q = resistor_flows[resistor["id"]]
+            net_in[resistor["a"]] -= q
+            net_in[resistor["b"]] += q
+        for root_id, q in fixed_q.items():
+            net_in[root_id] += q
+
+        for vid, root_id in volume_roots.items():
+            if root_id in fixed_p:
+                volume_state[vid] = fixed_p[root_id]
+                continue
+            q_share = net_in[root_id] / max(len(root_to_volumes[root_id]), 1)
+            volume_state[vid] += (q_share / volume_compliance[vid]) * dt
+            if not np.isfinite(volume_state[vid]):
+                raise HTTPException(status_code=400, detail=f"{vid}: 圧力が発散しました。時間刻みを小さくしてください")
+        for tid, root_ids in tank_roots.items():
+            if not all(root_id in fixed_p for root_id in root_ids):
+                q_total = sum(
+                    net_in[root_id] / max(len(root_to_tanks[root_id]), 1)
+                    for root_id in root_ids
+                    if root_id not in fixed_p
+                )
+                tank_level[tid] = min(max(tank_level[tid] + (q_total / tank_area[tid]) * dt, 0.0), tank_max_level[tid])
+                if not np.isfinite(tank_level[tid]):
+                    raise HTTPException(status_code=400, detail=f"{tid}: 水位が発散しました。時間刻みを小さくしてください")
+            heat_q = tank_heat_to_fluid.get(tid, 0.0)
+            if heat_q != 0.0:
+                mass = max(tank_level[tid] * tank_area[tid] * tank_density[tid], 1e-9)
+                tank_temperature[tid] += (heat_q / (mass * max(tank_specific_heat[tid], 1e-12))) * dt
+                if not np.isfinite(tank_temperature[tid]) or tank_temperature[tid] <= 0:
+                    raise HTTPException(status_code=400, detail=f"{tid}: 温度が発散しました。時間刻みを小さくしてください")
+            wall_heat = tank_heat_to_wall.get(tid, 0.0) - tank_heat_to_fluid.get(tid, 0.0)
+            if wall_heat != 0.0:
+                tank_wall_temperature[tid] += (wall_heat / tank_wall_heat_capacity[tid]) * dt
+                if not np.isfinite(tank_wall_temperature[tid]) or tank_wall_temperature[tid] <= 0:
+                    raise HTTPException(status_code=400, detail=f"{tid}: 壁温度が発散しました。時間刻みを小さくしてください")
+        for thermal_id, heat_to_fluid in thermal_mass_heat_to_fluid.items():
+            thermal_mass_temperature[thermal_id] -= (heat_to_fluid / thermal_mass_capacity[thermal_id]) * dt
+            if not np.isfinite(thermal_mass_temperature[thermal_id]) or thermal_mass_temperature[thermal_id] <= 0:
+                raise HTTPException(status_code=400, detail=f"{thermal_id}: 温度が発散しました。時間刻みを小さくしてください")
+        for resistor in resistors:
+            if resistor.get("model") != "pipe_blasius":
+                continue
+            heat_q = pipe_heat_to_fluid.get(resistor["id"], 0.0)
+            if heat_q == 0.0:
+                continue
+            params = resistor["params"]
+            mass = max(float(resistor["density"]) * float(params.get("fluidVolume", 0.0)), 1e-9)
+            cp = max(float(params.get("specificHeat", DEFAULT_SPECIFIC_HEAT_J_KG_K)), 1e-12)
+            params["fluidTemperature"] = float(params.get("fluidTemperature", 293.15)) + (heat_q / (mass * cp)) * dt
+            if not np.isfinite(params["fluidTemperature"]) or params["fluidTemperature"] <= 0:
+                raise HTTPException(status_code=400, detail=f"{resistor['id']}: 温度が発散しました。時間刻みを小さくしてください")
+
+    return {
+        "time": time,
+        "nodes": node_series,
+        "ports": port_series,
+        "edges": edge_series,
+        "warnings": warnings,
+    }
+
+
 @app.get("/fluids/{fluid}/saturation/csv")
 def download_saturation_csv(fluid: str):
     """飽和蒸気圧曲線データをCSVでダウンロード"""
@@ -2143,17 +3170,27 @@ def download_saturation_csv(fluid: str):
 class StageSpec(BaseModel):
     propellant_mass: float             # 推進剤質量 [kg]
     dry_mass: float                    # 段構造質量（推進剤を除く、分離時に投棄）[kg]
+    payload_mass: float = 0.0          # ペイロード質量（段分離時にも投棄しない）[kg]
     oxidizer: str = "LOX"              # 酸化剤
     fuel: str = "LCH4"                 # 燃料
     thrust: float                      # 推力 [N]（燃焼中一定）
     burn_time: float                   # 燃焼時間 [s]
+    length_m: float = 0.0              # 段の全長 [m]
+    diameter_m: float = 0.0            # 段の直径 [m]
+    separation_delay_s: float = 0.0    # 燃焼終了（切り離しポイント）から段分離（質量投棄）までのコースト時間 [s]
+
+
+class FairingSpec(BaseModel):
+    mass_kg: float = 0.0               # フェアリング質量 [kg]
+    length_m: float = 0.0              # フェアリング全長 [m]
+    diameter_m: float = 0.0            # フェアリング直径 [m]
 
 
 class LaunchRequest(BaseModel):
     stages: list[StageSpec] = Field(default_factory=lambda: [
         StageSpec(propellant_mass=300.0, dry_mass=150.0, thrust=12000.0, burn_time=20.0),
     ])
-    payload_mass: float = 50.0         # ペイロード質量 [kg]
+    payload_mass: float = 0.0          # 追加ペイロード質量（スケッチ外、手動入力分）[kg]
     launch_angle: float = 90.0         # 発射角度（水平からの角度）[deg]、90=垂直
     drag_enabled: bool = False
     drag_coefficient: float = 0.5
@@ -2165,7 +3202,8 @@ class LaunchRequest(BaseModel):
 @app.post("/launch/simulate")
 def simulate_launch(req: LaunchRequest):
     """機体質量・推力から弾道軌道を計算する（点質量・重力一定の簡易モデル）。
-    各段は順番に燃焼し、燃焼終了時に段の構造質量（dry_mass）を投棄して次の段に進む。
+    各段は順番に燃焼し、燃焼終了（切り離しポイント）後は`separation_delay_s`の間コースト飛行し、
+    その後に段の構造質量（dry_mass）を投棄（段分離）して次の段に進む。
     全段燃焼後は無動力（慣性飛行）として計算を続ける。
     推力方向は発射角度に固定（姿勢変化・重力旋回は未対応）。
     """
@@ -2183,7 +3221,7 @@ def simulate_launch(req: LaunchRequest):
 
     g0 = 9.80665
     angle_rad = np.radians(req.launch_angle)
-    initial_mass = sum(s.propellant_mass + s.dry_mass for s in req.stages) + req.payload_mass
+    initial_mass = sum(s.propellant_mass + s.dry_mass + s.payload_mass for s in req.stages) + req.payload_mass
 
     thrust_vertical = req.stages[0].thrust * np.sin(angle_rad)
     weight0 = initial_mass * g0
@@ -2239,6 +3277,7 @@ def simulate_launch(req: LaunchRequest):
     landed = False
     delta_v_total = 0.0
     stage_burnouts: list[dict] = []
+    stage_separations: list[dict] = []
 
     for stage_idx, stage in enumerate(req.stages, start=1):
         if landed or remaining <= 1e-9:
@@ -2285,12 +3324,57 @@ def simulate_launch(req: LaunchRequest):
 
         t_cursor += float(sol.t[-1])
         remaining -= float(sol.t[-1])
-        # 段分離: 燃焼を終えた段の構造質量を投棄
-        state = [
+        # 切り離しポイント（燃焼終了）の状態。段分離（質量投棄）まではこの質量を維持する
+        sep_state = [
             float(sol.y[0][-1]), float(sol.y[1][-1]),
-            float(sol.y[2][-1]), float(sol.y[3][-1]),
-            mass_at_burnout - stage.dry_mass,
+            float(sol.y[2][-1]), float(sol.y[3][-1]), mass_at_burnout,
         ]
+
+        # 燃焼終了から段分離までのコースト飛行（separation_delay_s）
+        if stage.separation_delay_s > 1e-9 and remaining > 1e-9:
+            coast_span = min(stage.separation_delay_s, remaining)
+            n_steps = max(int(np.ceil(coast_span / req.dt)), 1)
+            t_eval = np.linspace(0.0, coast_span, n_steps + 1)
+            try:
+                sol_coast = solve_ivp(
+                    make_ode(0.0, 0.0, False), (0.0, coast_span), sep_state,
+                    t_eval=t_eval, method="RK45", events=hit_ground,
+                    max_step=req.dt, rtol=1e-6, atol=1e-9,
+                )
+            except Exception as ex:
+                raise HTTPException(status_code=500, detail=f"計算エラー: {ex}")
+            if not sol_coast.success:
+                raise HTTPException(status_code=500, detail=f"ODE 未収束: {sol_coast.message}")
+
+            t_all.extend((t_cursor + sol_coast.t[1:]).tolist())
+            x_all.extend(sol_coast.y[0][1:].tolist())
+            y_all.extend(sol_coast.y[1][1:].tolist())
+            vx_all.extend(sol_coast.y[2][1:].tolist())
+            vy_all.extend(sol_coast.y[3][1:].tolist())
+            m_all.extend(sol_coast.y[4][1:].tolist())
+
+            t_cursor += float(sol_coast.t[-1])
+            remaining -= float(sol_coast.t[-1])
+            sep_state = [
+                float(sol_coast.y[0][-1]), float(sol_coast.y[1][-1]),
+                float(sol_coast.y[2][-1]), float(sol_coast.y[3][-1]), float(sol_coast.y[4][-1]),
+            ]
+            if len(sol_coast.t_events[0]) > 0:
+                landed = True
+
+        # 段分離: 切り離したステージ分の質量（dry_mass）をここで投棄する
+        state = [sep_state[0], sep_state[1], sep_state[2], sep_state[3], sep_state[4] - stage.dry_mass]
+        stage_separations.append({
+            "stage_index": stage_idx,
+            "time_s": round(t_cursor, 2),
+            "x_m": round(state[0], 2),
+            "altitude_m": round(state[1], 2),
+            "speed_ms": round(float(np.hypot(state[2], state[3])), 2),
+            "mass_kg": round(state[4], 2),
+        })
+
+        if landed:
+            break
 
     if not landed and remaining > 1e-9:
         n_steps = max(int(np.ceil(remaining / req.dt)), 1)
@@ -2338,6 +3422,7 @@ def simulate_launch(req: LaunchRequest):
             "apogee_altitude_m": round(float(y[apogee_idx]), 2),
             "apogee_time_s": round(float(t[apogee_idx]), 2),
             "stage_burnouts": stage_burnouts,
+            "stage_separations": stage_separations,
             "max_speed_ms": round(float(np.max(speed)), 2),
             "flight_time_s": round(float(t[-1]), 2),
             "downrange_m": round(float(x[-1]), 2),
@@ -2357,10 +3442,9 @@ vehicle_table = vehicle_db.table("vehicles")
 
 class VehicleSpec(BaseModel):
     name: str                          # 機体名
-    stages: list[StageSpec]            # 段構成（1段目から順）
+    stages: list[StageSpec]            # 段構成（1段目から順、各段が長さ・直径を持つ）
     payload_mass: float = 0.0          # ペイロード質量 [kg]
-    length: float = 0.0                # 全長 [m]
-    diameter: float = 0.0              # 直径 [m]
+    fairing: FairingSpec = FairingSpec()  # フェアリング（質量・全長・直径）
     launch_angle: float = 90.0         # 発射角度 [deg]
     drag_enabled: bool = False
     drag_coefficient: float = 0.5
@@ -2368,15 +3452,17 @@ class VehicleSpec(BaseModel):
     note: str = ""                     # 出典・補足
 
 
-# サンプルデータ（公開情報をもとにした概算値の2段構成モデル。各段のdry_massは推定値を含む）
+# サンプルデータ（公開情報をもとにした概算値の2段構成モデル。各段のdry_mass・寸法は推定値を含む）
 # H3-30: JAXA/MHI H3ロケット（SRBなし構成）
-#   1段目: 3×LE-9（LOX/LH2）推進剤225t・燃焼214s
-#   2段目: LE-5B-3（LOX/LH2）推進剤約23t・推力137kN・燃焼700s（定格値）
-#   全長63m、直径5.27m、ペイロードはSSO換算で約4,000kg
+#   1段目: 3×LE-9（LOX/LH2）推進剤225t・燃焼214s、全長約38m・直径5.2m
+#   2段目: LE-5B-3（LOX/LH2）推進剤約23t・推力137kN・燃焼700s（定格値）、全長約11m・直径5.2m
+#   フェアリング: 全長約12m・直径5.2m・質量約2,600kg（標準型の概算）
+#   全長63m、ペイロードはSSO換算で約4,000kg
 # Falcon 9 Block 5: SpaceX
-#   1段目: 9×Merlin 1D（LOX/RP-1）推進剤411t・燃焼162s
-#   2段目: Merlin 1D Vacuum（LOX/RP-1）推進剤約92.7t・推力934kN・燃焼397s
-#   全長69.8m、直径3.7m、ペイロードはLEO使い切り条件で約22,800kg
+#   1段目: 9×Merlin 1D（LOX/RP-1）推進剤411t・燃焼162s、全長約42.6m・直径3.7m
+#   2段目: Merlin 1D Vacuum（LOX/RP-1）推進剤約92.7t・推力934kN・燃焼397s、全長約12.6m・直径3.7m
+#   フェアリング: 全長約13.1m・直径5.2m・質量約1,900kg
+#   全長69.8m、ペイロードはLEO使い切り条件で約22,800kg
 SAMPLE_VEHICLES = [
     VehicleSpec(
         name="H3-30",
@@ -2385,19 +3471,20 @@ SAMPLE_VEHICLES = [
                 propellant_mass=225_000.0, dry_mass=48_000.0,
                 oxidizer="LOX", fuel="LH2",
                 thrust=4_416_000.0, burn_time=214.0,
+                length_m=38.0, diameter_m=5.2,
             ),
             StageSpec(
                 propellant_mass=23_000.0, dry_mass=3_500.0,
                 oxidizer="LOX", fuel="LH2",
                 thrust=137_000.0, burn_time=700.0,
+                length_m=11.0, diameter_m=5.2,
             ),
         ],
         payload_mass=4_000.0,
-        length=63.0,
-        diameter=5.27,
+        fairing=FairingSpec(mass_kg=2_600.0, length_m=12.0, diameter_m=5.2),
         launch_angle=90.0,
-        cross_section_area=round(math.pi * (5.27 / 2) ** 2, 2),
-        note="JAXA/MHI H3-30（SRBなし、LE-9 ×3 + LE-5B-3）。2段dry_massは推定値、ペイロードはSSO換算",
+        cross_section_area=round(math.pi * (5.2 / 2) ** 2, 2),
+        note="JAXA/MHI H3-30（SRBなし、LE-9 ×3 + LE-5B-3）。2段dry_mass・各段寸法は推定値、ペイロードはSSO換算",
     ),
     VehicleSpec(
         name="Falcon 9 Block 5",
@@ -2406,19 +3493,20 @@ SAMPLE_VEHICLES = [
                 propellant_mass=411_000.0, dry_mass=41_384.0,
                 oxidizer="LOX", fuel="RP-1",
                 thrust=7_607_000.0, burn_time=162.0,
+                length_m=42.6, diameter_m=3.7,
             ),
             StageSpec(
                 propellant_mass=92_670.0, dry_mass=4_000.0,
                 oxidizer="LOX", fuel="RP-1",
                 thrust=934_000.0, burn_time=397.0,
+                length_m=12.6, diameter_m=3.7,
             ),
         ],
         payload_mass=22_800.0,
-        length=69.8,
-        diameter=3.7,
+        fairing=FairingSpec(mass_kg=1_900.0, length_m=13.1, diameter_m=5.2),
         launch_angle=90.0,
         cross_section_area=round(math.pi * (3.7 / 2) ** 2, 2),
-        note="SpaceX Falcon 9 Block 5（Merlin 1D ×9 + Merlin 1D Vacuum）。1段dry_massは概算、ペイロードはLEO使い切り条件",
+        note="SpaceX Falcon 9 Block 5（Merlin 1D ×9 + Merlin 1D Vacuum）。1段dry_mass・各段寸法は概算、ペイロードはLEO使い切り条件",
     ),
 ]
 
@@ -2531,26 +3619,238 @@ def delete_part(part_id: int):
     return {"ok": True}
 
 
+# ── 材料データベース（機体データベースと同じTinyDBファイルを使用） ──────
+
+materials_table = vehicle_db.table("materials")
+
+
+class MaterialSpec(BaseModel):
+    name: str                          # 材料名（例: SUS304, Inconel 718）
+    category: str = ""                 # 系統（アルミ合金・ステンレス鋼・ニッケル合金など）
+    density_kg_m3: float               # 密度 [kg/m3]
+    yield_strength_pa: float = 0.0     # 降伏強度 [Pa]
+    thermal_conductivity_w_m_k: float = 0.0  # 熱伝導率 [W/(m·K)]
+    specific_heat_j_kg_k: float = 0.0  # 比熱 [J/(kg·K)]
+    reference_temperature_k: float = 0.0     # 物性値の参照温度 [K]
+    note: str = ""                     # 用途・出典メモ
+
+
+# ロケット構造・タンク・燃焼器でよく使われる金属材料の概算値（公開文献ベース）
+SAMPLE_MATERIALS = [
+    MaterialSpec(name="Al 2219-T87", category="アルミ合金", density_kg_m3=2840, yield_strength_pa=352e6,
+                 thermal_conductivity_w_m_k=120, specific_heat_j_kg_k=864, reference_temperature_k=293.15,
+                 note="タンク外壁（Atlas V, Falcon 9 一部）"),
+    MaterialSpec(name="Al-Li 2195-T8", category="アルミ合金", density_kg_m3=2710, yield_strength_pa=440e6,
+                 thermal_conductivity_w_m_k=84, specific_heat_j_kg_k=860, reference_temperature_k=293.15,
+                 note="タンク外壁（Space Shuttle 外部タンク, Falcon 9）"),
+    MaterialSpec(name="Al 6061-T6", category="アルミ合金", density_kg_m3=2700, yield_strength_pa=276e6,
+                 thermal_conductivity_w_m_k=167, specific_heat_j_kg_k=896, reference_temperature_k=293.15,
+                 note="汎用構造材"),
+    MaterialSpec(name="Al 7075-T6", category="アルミ合金", density_kg_m3=2810, yield_strength_pa=503e6,
+                 thermal_conductivity_w_m_k=130, specific_heat_j_kg_k=960, reference_temperature_k=293.15,
+                 note="高強度構造材"),
+    MaterialSpec(name="SUS304", category="ステンレス鋼", density_kg_m3=7900, yield_strength_pa=215e6,
+                 thermal_conductivity_w_m_k=16.2, specific_heat_j_kg_k=500, reference_temperature_k=293.15,
+                 note="汎用耐食構造材・配管"),
+    MaterialSpec(name="SUS316L", category="ステンレス鋼", density_kg_m3=8000, yield_strength_pa=170e6,
+                 thermal_conductivity_w_m_k=16.3, specific_heat_j_kg_k=500, reference_temperature_k=293.15,
+                 note="耐食配管・タンク"),
+    MaterialSpec(name="Inconel 718", category="ニッケル合金", density_kg_m3=8190, yield_strength_pa=1035e6,
+                 thermal_conductivity_w_m_k=11.4, specific_heat_j_kg_k=435, reference_temperature_k=293.15,
+                 note="燃焼室・ノズル・タービン部品"),
+    MaterialSpec(name="Inconel 625", category="ニッケル合金", density_kg_m3=8440, yield_strength_pa=414e6,
+                 thermal_conductivity_w_m_k=9.8, specific_heat_j_kg_k=410, reference_temperature_k=293.15,
+                 note="高温配管・燃焼室周辺部品"),
+    MaterialSpec(name="Ti-6Al-4V", category="チタン合金", density_kg_m3=4430, yield_strength_pa=880e6,
+                 thermal_conductivity_w_m_k=6.7, specific_heat_j_kg_k=526, reference_temperature_k=293.15,
+                 note="タンク・高圧ガス容器（COPV）・構造材"),
+    MaterialSpec(name="マルエージング鋼 C-300", category="高強度鋼", density_kg_m3=8000, yield_strength_pa=1900e6,
+                 thermal_conductivity_w_m_k=25, specific_heat_j_kg_k=460, reference_temperature_k=293.15,
+                 note="モータケース・タービンシャフト等高強度部品"),
+    MaterialSpec(name="GRCop-84", category="銅合金", density_kg_m3=8900, yield_strength_pa=290e6,
+                 thermal_conductivity_w_m_k=310, specific_heat_j_kg_k=380, reference_temperature_k=293.15,
+                 note="燃焼室ライナー（高熱伝導、室温降伏強度の概算値）"),
+    MaterialSpec(name="純銅 C1100", category="銅", density_kg_m3=8960, yield_strength_pa=70e6,
+                 thermal_conductivity_w_m_k=391, specific_heat_j_kg_k=385, reference_temperature_k=293.15,
+                 note="無酸素銅（焼きなまし材）。高熱伝導が必要な部位の概算値"),
+    MaterialSpec(name="NARloy-Z", category="銅合金", density_kg_m3=8930, yield_strength_pa=140e6,
+                 thermal_conductivity_w_m_k=290, specific_heat_j_kg_k=390, reference_temperature_k=293.15,
+                 note="Cu-Ag-Zr合金。SSME/RS-25等の燃焼室ライナー"),
+    MaterialSpec(name="Cu-Cr-Zr合金", category="銅合金", density_kg_m3=8900, yield_strength_pa=380e6,
+                 thermal_conductivity_w_m_k=320, specific_heat_j_kg_k=380, reference_temperature_k=293.15,
+                 note="高強度・高熱伝導銅合金。燃焼室ライナー（Vulcain等）"),
+    MaterialSpec(name="鋳鉄 FC250", category="鉄", density_kg_m3=7200, yield_strength_pa=250e6,
+                 thermal_conductivity_w_m_k=50, specific_heat_j_kg_k=460, reference_temperature_k=293.15,
+                 note="ねずみ鋳鉄。汎用構造・機械部品（引張強さを概算値として記載）"),
+]
+
+
+def _seed_materials_db() -> None:
+    if len(materials_table) == 0:
+        for material in SAMPLE_MATERIALS:
+            materials_table.insert(material.model_dump())
+
+
+_seed_materials_db()
+
+
+@app.get("/materials")
+def list_materials():
+    return [{"id": doc.doc_id, **doc} for doc in materials_table.all()]
+
+
+@app.post("/materials")
+def create_material(material: MaterialSpec):
+    doc_id = materials_table.insert(material.model_dump())
+    return {"id": doc_id, **material.model_dump()}
+
+
+@app.put("/materials/{material_id}")
+def update_material(material_id: int, material: MaterialSpec):
+    if not materials_table.contains(doc_id=material_id):
+        raise HTTPException(status_code=404, detail="材料が見つかりません")
+    materials_table.update(material.model_dump(), doc_ids=[material_id])
+    return {"id": material_id, **material.model_dump()}
+
+
+@app.delete("/materials/{material_id}")
+def delete_material(material_id: int):
+    if not materials_table.contains(doc_id=material_id):
+        raise HTTPException(status_code=404, detail="材料が見つかりません")
+    materials_table.remove(doc_ids=[material_id])
+    return {"ok": True}
+
+
+# ── 流体ライブラリ（推進剤・汎用流体。固体材料の材料DBとはテーブルを分離） ──
+
+fluid_library_table = vehicle_db.table("fluid_library")
+
+
+class FluidLibrarySpec(BaseModel):
+    name: str                              # 流体名（推進剤として使う場合は配管エッジの propellant 値と一致させる。例: LOX, LCH4）
+    phase: str = "liquid"                  # gas | liquid
+    is_oxidizer: bool = False              # 酸化剤として使えるか
+    is_fuel: bool = False                  # 燃料として使えるか
+    density_kg_m3: float = 0.0             # 密度 [kg/m3]
+    viscosity_pa_s: float = 0.0            # 粘度 [Pa·s]
+    thermal_conductivity_w_m_k: float = 0.0  # 熱伝導率 [W/(m·K)]
+    specific_heat_j_kg_k: float = 0.0      # 定圧比熱 [J/(kg·K)]
+    reference_temperature_k: float = 0.0   # 物性値の参照温度 [K]
+    reference_pressure_pa: float = 0.0     # 物性値の参照圧力 [Pa]
+    note: str = ""                         # 補足
+
+
+SAMPLE_FLUID_LIBRARY = [
+    FluidLibrarySpec(
+        name="LOX", phase="liquid", is_oxidizer=True,
+        density_kg_m3=1141.0, viscosity_pa_s=1.96e-4, thermal_conductivity_w_m_k=0.150, specific_heat_j_kg_k=1700.0,
+        reference_temperature_k=90.2, reference_pressure_pa=101325.0, note="液体酸素（沸点付近の概算値）",
+    ),
+    FluidLibrarySpec(
+        name="NTO", phase="liquid", is_oxidizer=True,
+        density_kg_m3=1443.0, viscosity_pa_s=4.1e-4, thermal_conductivity_w_m_k=0.13, specific_heat_j_kg_k=1500.0,
+        reference_temperature_k=293.15, reference_pressure_pa=101325.0, note="四酸化二窒素（常温の概算値）",
+    ),
+    FluidLibrarySpec(
+        name="LCH4", phase="liquid", is_fuel=True,
+        density_kg_m3=423.0, viscosity_pa_s=1.18e-4, thermal_conductivity_w_m_k=0.187, specific_heat_j_kg_k=3480.0,
+        reference_temperature_k=111.6, reference_pressure_pa=101325.0, note="液化メタン（沸点付近の概算値）",
+    ),
+    FluidLibrarySpec(
+        name="LH2", phase="liquid", is_fuel=True,
+        density_kg_m3=71.0, viscosity_pa_s=1.33e-5, thermal_conductivity_w_m_k=0.099, specific_heat_j_kg_k=9800.0,
+        reference_temperature_k=20.3, reference_pressure_pa=101325.0, note="液体水素（沸点付近の概算値）",
+    ),
+    FluidLibrarySpec(
+        name="RP-1", phase="liquid", is_fuel=True,
+        density_kg_m3=810.0, viscosity_pa_s=1.6e-3, thermal_conductivity_w_m_k=0.12, specific_heat_j_kg_k=2000.0,
+        reference_temperature_k=293.15, reference_pressure_pa=101325.0, note="ケロシン系推進剤（常温の概算値）",
+    ),
+    FluidLibrarySpec(
+        name="MMH", phase="liquid", is_fuel=True,
+        density_kg_m3=880.0, viscosity_pa_s=8.5e-4, thermal_conductivity_w_m_k=0.18, specific_heat_j_kg_k=2980.0,
+        reference_temperature_k=293.15, reference_pressure_pa=101325.0, note="モノメチルヒドラジン（常温の概算値）",
+    ),
+    FluidLibrarySpec(
+        name="Water", phase="liquid",
+        density_kg_m3=998.0, viscosity_pa_s=1.0e-3, thermal_conductivity_w_m_k=0.6, specific_heat_j_kg_k=4186.0,
+        reference_temperature_k=293.15, reference_pressure_pa=101325.0, note="水（汎用、常温の概算値）",
+    ),
+    FluidLibrarySpec(
+        name="GHe", phase="gas",
+        density_kg_m3=0.1786, viscosity_pa_s=1.96e-5, thermal_conductivity_w_m_k=0.1513, specific_heat_j_kg_k=5193.0,
+        reference_temperature_k=273.15, reference_pressure_pa=101325.0, note="加圧用ヘリウムガス（標準状態の概算値、実使用は高圧）",
+    ),
+]
+
+
+def _seed_fluid_library_db() -> None:
+    if len(fluid_library_table) == 0:
+        for fluid in SAMPLE_FLUID_LIBRARY:
+            fluid_library_table.insert(fluid.model_dump())
+
+
+_seed_fluid_library_db()
+
+
+@app.get("/fluid-library")
+def list_fluid_library():
+    return [{"id": doc.doc_id, **doc} for doc in fluid_library_table.all()]
+
+
+@app.post("/fluid-library")
+def create_fluid_library_entry(fluid: FluidLibrarySpec):
+    doc_id = fluid_library_table.insert(fluid.model_dump())
+    return {"id": doc_id, **fluid.model_dump()}
+
+
+@app.put("/fluid-library/{fluid_id}")
+def update_fluid_library_entry(fluid_id: int, fluid: FluidLibrarySpec):
+    if not fluid_library_table.contains(doc_id=fluid_id):
+        raise HTTPException(status_code=404, detail="流体が見つかりません")
+    fluid_library_table.update(fluid.model_dump(), doc_ids=[fluid_id])
+    return {"id": fluid_id, **fluid.model_dump()}
+
+
+@app.delete("/fluid-library/{fluid_id}")
+def delete_fluid_library_entry(fluid_id: int):
+    if not fluid_library_table.contains(doc_id=fluid_id):
+        raise HTTPException(status_code=404, detail="流体が見つかりません")
+    fluid_library_table.remove(doc_ids=[fluid_id])
+    return {"ok": True}
+
+
 # ── ロケット段デザイナー（コンポーネント単位のノードグラフ→段集計） ───────
 
 class RocketNode(BaseModel):
     id: str
-    node_type: str  # structure | tank | pipe | pump | combustor | nozzle | fairing | fixed_mass
+    node_type: str  # structure | tank | pump | combustor | fixed_mass
     params: dict[str, float | str] = {}
 
 
+PROPELLANT_OXIDIZERS = {"LOX", "NTO"}
+
+
 class RocketEdge(BaseModel):
+    """段内のノード同士をつなぐ配管そのもの。寸法・材質から配管質量を、
+    propellant から燃焼器の酸化剤・燃料種類を決定する。"""
     id: str
     source: str
     target: str
     source_handle: str | None = None
     target_handle: str | None = None
+    diameter_mm: float = 0.0
+    length_mm: float = 0.0
+    thickness_mm: float = 0.0
+    material: str | None = None
+    density_kg_m3: float = 0.0
+    propellant: str | None = None      # この配管が運ぶ推進剤（酸化剤または燃料、1種類のみ）
 
 
 class RocketStagePayload(BaseModel):
     nodes: list[RocketNode]
     edges: list[RocketEdge]
-    structure: dict[str, float] = {}
+    structure: dict[str, float | str] = {}
     fixed_masses: list[dict] = []
 
 
@@ -2580,7 +3880,7 @@ def _pressure_vessel_thickness(pressure_pa: float, diameter_mm: float, yield_str
 
 
 def _calc_shell_component(params: dict) -> dict:
-    """外壁構造材・フェアリング・配管: 指定肉厚からのシェル質量"""
+    """外壁構造材: 指定肉厚からのシェル質量"""
     mass = _shell_mass(
         _rocket_num(params, "diameterMm"),
         _rocket_num(params, "lengthMm"),
@@ -2596,16 +3896,10 @@ def _calc_direct_mass(params: dict) -> dict:
 
 
 def _calc_tank(params: dict) -> dict:
-    """タンク: フープ応力からシェル質量、円筒近似体積から推進剤質量を算出"""
+    """タンク: 指定肉厚からのシェル質量、円筒近似体積から推進剤質量を算出"""
     diameter_mm = _rocket_num(params, "diameterMm")
     length_mm = _rocket_num(params, "lengthMm")
-    thickness = _pressure_vessel_thickness(
-        _rocket_num(params, "designPressurePa"),
-        diameter_mm,
-        _rocket_num(params, "yieldStrengthPa"),
-        _rocket_num(params, "safetyFactor", 1.5),
-    )
-    shell_mass = _shell_mass(diameter_mm, length_mm, thickness, _rocket_num(params, "densityKgM3"))
+    shell_mass = _shell_mass(diameter_mm, length_mm, _rocket_num(params, "thicknessMm"), _rocket_num(params, "densityKgM3"))
 
     radius_m = diameter_mm / 1000.0 / 2.0
     length_m = length_mm / 1000.0
@@ -2614,7 +3908,6 @@ def _calc_tank(params: dict) -> dict:
     propellant_mass = usable_volume * _rocket_num(params, "propellantDensityKgM3")
 
     return {
-        "thickness_mm": round(thickness, 3),
         "shell_mass_kg": round(shell_mass, 3),
         "propellant_mass_kg": round(propellant_mass, 3),
     }
@@ -2625,24 +3918,6 @@ def _combustor_mdot(params: dict) -> float:
     c_star = _rocket_num(params, "cStarMS")
     throat_area_m2 = math.pi * (_rocket_num(params, "throatDiameterMm") / 1000.0 / 2.0) ** 2
     return (chamber_pressure * throat_area_m2 / c_star) if c_star > 0 else 0.0
-
-
-def _calc_combustor(params: dict) -> dict:
-    """燃焼器: フープ応力からシェル質量、Pc・At・c*から質量流量を算出"""
-    diameter_mm = _rocket_num(params, "diameterMm")
-    length_mm = _rocket_num(params, "lengthMm")
-    thickness = _pressure_vessel_thickness(
-        _rocket_num(params, "chamberPressurePa"),
-        diameter_mm,
-        _rocket_num(params, "yieldStrengthPa"),
-        _rocket_num(params, "safetyFactor", 1.5),
-    )
-    shell_mass = _shell_mass(diameter_mm, length_mm, thickness, _rocket_num(params, "densityKgM3"))
-    return {
-        "thickness_mm": round(thickness, 3),
-        "shell_mass_kg": round(shell_mass, 3),
-        "mdot_kg_s": round(_combustor_mdot(params), 5),
-    }
 
 
 def _nozzle_exit_mach(expansion_ratio: float, gamma: float) -> float | None:
@@ -2660,24 +3935,40 @@ def _nozzle_exit_mach(expansion_ratio: float, gamma: float) -> float | None:
         return None
 
 
-def _calc_nozzle(params: dict, combustor_params: dict | None) -> dict:
-    """ノズル: 燃焼器とのペアリングがあれば燃焼圧・拡大比から推力・Ispを計算"""
-    shell_mass = _shell_mass(
-        _rocket_num(params, "exitDiameterMm") or _rocket_num(params, "diameterMm"),
-        _rocket_num(params, "lengthMm"),
-        _rocket_num(params, "thicknessMm"),
-        _rocket_num(params, "densityKgM3"),
+def _calc_combustor(params: dict) -> dict:
+    """燃焼器+ノズル一体部品: フープ応力から燃焼室シェル質量、指定肉厚からノズルシェル質量、
+    Pc・At・c*から質量流量、拡大比・外気圧から推力・Ispを算出する"""
+    diameter_mm = _rocket_num(params, "diameterMm")
+    length_mm = _rocket_num(params, "lengthMm")
+    chamber_thickness = _pressure_vessel_thickness(
+        _rocket_num(params, "chamberPressurePa"),
+        diameter_mm,
+        _rocket_num(params, "yieldStrengthPa"),
+        _rocket_num(params, "safetyFactor", 1.5),
     )
-    result = {"shell_mass_kg": round(shell_mass, 3), "thrust_n": 0.0, "isp_s": 0.0}
-    if not combustor_params:
-        return result
+    density = _rocket_num(params, "densityKgM3")
+    chamber_shell_mass = _shell_mass(diameter_mm, length_mm, chamber_thickness, density)
+    nozzle_shell_mass = _shell_mass(
+        _rocket_num(params, "exitDiameterMm") or diameter_mm,
+        _rocket_num(params, "nozzleLengthMm"),
+        _rocket_num(params, "thicknessMm"),
+        density,
+    )
+    mdot = _combustor_mdot(params)
+
+    result = {
+        "thickness_mm": round(chamber_thickness, 3),
+        "shell_mass_kg": round(chamber_shell_mass + nozzle_shell_mass, 3),
+        "mdot_kg_s": round(mdot, 5),
+        "thrust_n": 0.0,
+        "isp_s": 0.0,
+    }
 
     expansion_ratio = _rocket_num(params, "expansionRatio")
     ambient_pressure = _rocket_num(params, "ambientPressurePa", 101325.0)
-    gamma = _rocket_num(combustor_params, "gamma", 1.2)
-    chamber_pressure = _rocket_num(combustor_params, "chamberPressurePa")
-    mdot = _combustor_mdot(combustor_params)
-    throat_area_m2 = math.pi * (_rocket_num(combustor_params, "throatDiameterMm") / 1000.0 / 2.0) ** 2
+    gamma = _rocket_num(params, "gamma", 1.2)
+    chamber_pressure = _rocket_num(params, "chamberPressurePa")
+    throat_area_m2 = math.pi * (_rocket_num(params, "throatDiameterMm") / 1000.0 / 2.0) ** 2
 
     mach_e = _nozzle_exit_mach(expansion_ratio, gamma)
     if mach_e is None or chamber_pressure <= 0:
@@ -2692,35 +3983,38 @@ def _calc_nozzle(params: dict, combustor_params: dict | None) -> dict:
     thrust = cf * chamber_pressure * throat_area_m2
     isp = (thrust / (mdot * 9.80665)) if mdot > 0 else 0.0
 
-    return {
-        "shell_mass_kg": round(shell_mass, 3),
-        "thrust_n": round(thrust, 2),
-        "isp_s": round(isp, 2),
-        "mach_exit": round(mach_e, 4),
-        "cf": round(cf, 4),
-    }
+    result["thrust_n"] = round(thrust, 2)
+    result["isp_s"] = round(isp, 2)
+    result["mach_exit"] = round(mach_e, 4)
+    result["cf"] = round(cf, 4)
+    return result
+
+
+def _propellant_for_node(node_id: str, edges: list) -> tuple[str, str]:
+    """指定ノードに接続された配管エッジ（propellant）から酸化剤・燃料種類を取得する"""
+    oxidizer = ""
+    fuel = ""
+    for edge in edges:
+        if edge.source != node_id and edge.target != node_id:
+            continue
+        if not edge.propellant:
+            continue
+        if edge.propellant in PROPELLANT_OXIDIZERS:
+            oxidizer = oxidizer or edge.propellant
+        else:
+            fuel = fuel or edge.propellant
+    return oxidizer, fuel
 
 
 @app.post("/rocket/stage/build")
 def build_rocket_stage(payload: RocketStagePayload):
-    """段の部品グラフ（外壁構造材・タンク・配管・ポンプ・燃焼器・ノズル・フェアリング・固定質量）から
+    """段の部品グラフ（外壁構造材・タンク・ポンプ・燃焼器（ノズル一体）・固定質量、および配管そのものを表すエッジ）から
     段全体の構造質量・推進剤質量・推力・燃焼時間を計算する。
-    燃焼器→ノズルは接続エッジでペアリングし、燃焼圧・拡大比からノズル性能（推力・Isp）を算出する。
+    配管（エッジ）の寸法・材質から配管質量を、運ぶ推進剤から燃焼器の酸化剤・燃料種類を決定する。
     結果は既存の StageSpec 形式（/launch/simulate へそのまま渡せる形）で返す。
     """
-    nodes_by_id = {n.id: n for n in payload.nodes}
-    nozzle_combustor: dict[str, str] = {}
-    for edge in payload.edges:
-        source = nodes_by_id.get(edge.source)
-        target = nodes_by_id.get(edge.target)
-        if not source or not target:
-            continue
-        if source.node_type == "combustor" and target.node_type == "nozzle":
-            nozzle_combustor[target.id] = source.id
-        elif source.node_type == "nozzle" and target.node_type == "combustor":
-            nozzle_combustor[source.id] = target.id
-
     results: dict[str, dict] = {}
+    edge_results: dict[str, dict] = {}
     dry_mass = 0.0
     propellant_mass = 0.0
     thrust_total = 0.0
@@ -2728,12 +4022,14 @@ def build_rocket_stage(payload: RocketStagePayload):
     oxidizer = ""
     fuel = ""
 
+    for edge in payload.edges:
+        edge_mass = _shell_mass(edge.diameter_mm, edge.length_mm, edge.thickness_mm, edge.density_kg_m3)
+        dry_mass += edge_mass
+        edge_results[edge.id] = {"mass_kg": round(edge_mass, 3)}
+
     for node in payload.nodes:
         params = node.params
-        if node.node_type in ("fairing", "pipe"):
-            r = _calc_shell_component(params)
-            dry_mass += r["mass_kg"]
-        elif node.node_type == "pump":
+        if node.node_type == "pump":
             r = _calc_direct_mass(params)
             dry_mass += r["mass_kg"]
         elif node.node_type == "tank":
@@ -2744,29 +4040,33 @@ def build_rocket_stage(payload: RocketStagePayload):
             r = _calc_combustor(params)
             dry_mass += r["shell_mass_kg"]
             mdot_total += r["mdot_kg_s"]
-            oxidizer = oxidizer or str(params.get("oxidizer", ""))
-            fuel = fuel or str(params.get("fuel", ""))
-        elif node.node_type == "nozzle":
-            combustor_id = nozzle_combustor.get(node.id)
-            combustor_params = nodes_by_id[combustor_id].params if combustor_id else None
-            r = _calc_nozzle(params, combustor_params)
-            dry_mass += r["shell_mass_kg"]
             thrust_total += r["thrust_n"]
+            edge_oxidizer, edge_fuel = _propellant_for_node(node.id, payload.edges)
+            oxidizer = oxidizer or edge_oxidizer
+            fuel = fuel or edge_fuel
         else:
             r = {}
         results[node.id] = r
 
     if payload.structure:
         dry_mass += _calc_shell_component(payload.structure)["mass_kg"]
-    dry_mass += sum(_rocket_num(m, "massKg") for m in payload.fixed_masses)
+
+    payload_mass = 0.0
+    for m in payload.fixed_masses:
+        amount = _rocket_num(m, "massKg")
+        if m.get("isPayload"):
+            payload_mass += amount
+        else:
+            dry_mass += amount
 
     burn_time = (propellant_mass / mdot_total) if mdot_total > 0 else 0.0
     stage = {
         "propellant_mass": round(propellant_mass, 3),
         "dry_mass": round(dry_mass, 3),
+        "payload_mass": round(payload_mass, 3),
         "oxidizer": oxidizer or "LOX",
         "fuel": fuel or "LCH4",
         "thrust": round(thrust_total, 2),
         "burn_time": round(burn_time, 3),
     }
-    return {"nodes": results, "stage": stage}
+    return {"nodes": results, "edges": edge_results, "stage": stage}
