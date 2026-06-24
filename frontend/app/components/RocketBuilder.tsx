@@ -1,6 +1,7 @@
 'use client'
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import {
   ReactFlow,
   Background,
@@ -17,6 +18,7 @@ import {
   type Edge,
   type Connection,
   type NodeProps,
+  type NodeChange,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import {
@@ -57,6 +59,7 @@ type FieldDef = {
   label: string
   unit?: string
   type?: 'material' | 'propellantDensity'
+  hint?: string
 }
 
 // 長さ系パラメータ（外径・長さ・肉厚など、unit:'mm'のフィールド）の表示単位をmm/mで切り替える
@@ -89,8 +92,11 @@ const FIELD_DEFS: Record<NodeCategory, FieldDef[]> = {
     { key: 'chamberPressurePa', label: '燃焼圧', unit: 'Pa' },
     { key: 'cStarMS', label: '特性排気速度 c*', unit: 'm/s' },
     { key: 'gamma', label: '比熱比 γ' },
-    { key: 'ofRatio', label: 'O/F比' },
-    { key: 'safetyFactor', label: '安全係数' },
+    {
+      key: 'safetyFactor',
+      label: '燃焼室板厚の安全率',
+      hint: '燃焼室の許容応力 = 材質の降伏応力 ÷ 安全率。値が大きいほど許容応力が下がり、フープ応力式から必要な肉厚（殻質量）が厚く＝安全側に算出されます。ノズル側の肉厚には適用されません。',
+    },
     { key: 'exitDiameterMm', label: 'ノズル出口径', unit: 'mm' },
     { key: 'nozzleLengthMm', label: 'ノズル長さ', unit: 'mm' },
     { key: 'expansionRatio', label: '拡大比 Ae/At' },
@@ -109,7 +115,7 @@ function defaultParams(category: NodeCategory): Record<string, number | string> 
     case 'pump': return { massKg: 50 }
     case 'combustor': return {
       diameterMm: 400, lengthMm: 600, throatDiameterMm: 150, chamberPressurePa: 6000000,
-      cStarMS: 1800, gamma: 1.2, ofRatio: 3.5, safetyFactor: 1.5,
+      cStarMS: 1800, gamma: 1.2, safetyFactor: 1.5,
       exitDiameterMm: 900, nozzleLengthMm: 1200, expansionRatio: 36, ambientPressurePa: 101325, thicknessMm: 3,
       material: '', densityKgM3: 8400, yieldStrengthPa: 900000000,
     }
@@ -122,6 +128,18 @@ type RocketNodeData = Record<string, unknown> & {
   params: Record<string, number | string>
   result?: RocketNodeResult
 }
+
+const RESULT_FIELD_META: { key: keyof RocketNodeResult; label: string; unit: string; decimals: number }[] = [
+  { key: 'shell_mass_kg', label: '殻質量', unit: 'kg', decimals: 1 },
+  { key: 'propellant_mass_kg', label: '推進剤質量', unit: 'kg', decimals: 1 },
+  { key: 'mass_kg', label: '質量', unit: 'kg', decimals: 1 },
+  { key: 'thickness_mm', label: '肉厚', unit: 'mm', decimals: 2 },
+  { key: 'mdot_kg_s', label: '質量流量', unit: 'kg/s', decimals: 2 },
+  { key: 'thrust_n', label: '推力', unit: 'N', decimals: 0 },
+  { key: 'isp_s', label: '比推力 Isp', unit: 's', decimals: 0 },
+  { key: 'mach_exit', label: '出口マッハ数', unit: '-', decimals: 2 },
+  { key: 'cf', label: '推力係数 Cf', unit: '-', decimals: 3 },
+]
 
 function resultSummary(d: RocketNodeData): string | null {
   const r = d.result
@@ -248,7 +266,6 @@ function createStageNode(id: string, name: string, y: number): Node {
     id,
     type: STAGE_TYPE,
     position: { x: 0, y },
-    deletable: false,
     data: {
       name,
       structure: defaultStageStructure(),
@@ -291,7 +308,7 @@ function createH3DefaultGraph(): { nodes: Node[]; edges: Edge[] } {
   const stage2Height = stageSize(stage2Structure).height
 
   const stage2: Node = {
-    id: 'stage-2', type: STAGE_TYPE, position: { x: 0, y: 0 }, deletable: false,
+    id: 'stage-2', type: STAGE_TYPE, position: { x: 0, y: 0 },
     data: {
       name: 'ステージ2（H3 2段目相当・LE-5B-3）',
       structure: stage2Structure,
@@ -301,7 +318,7 @@ function createH3DefaultGraph(): { nodes: Node[]; edges: Edge[] } {
     } as StageNodeData,
   }
   const stage1: Node = {
-    id: 'stage-1', type: STAGE_TYPE, position: { x: 0, y: stage2Height + STAGE_GAP }, deletable: false,
+    id: 'stage-1', type: STAGE_TYPE, position: { x: 0, y: stage2Height + STAGE_GAP },
     data: {
       name: 'ステージ1（H3 1段目相当・LE-9×3）',
       structure: stage1Structure,
@@ -321,7 +338,7 @@ function createH3DefaultGraph(): { nodes: Node[]; edges: Edge[] } {
   }, 'stage-1', 260, 60)
   const comb1 = defaultChildNode('combustor-1', 'combustor', '燃焼器（LE-9×3相当）', {
     diameterMm: 700, lengthMm: 900, throatDiameterMm: 507, chamberPressurePa: 12.16e6,
-    cStarMS: 2350, gamma: 1.2, ofRatio: 6.0, safetyFactor: 1.5,
+    cStarMS: 2350, gamma: 1.2, safetyFactor: 1.5,
     exitDiameterMm: 3083, nozzleLengthMm: 1800, expansionRatio: 37, ambientPressurePa: 101325, thicknessMm: 6,
     material: 'Inconel 718', densityKgM3: 8190, yieldStrengthPa: 1035e6,
   }, 'stage-1', 460, 60)
@@ -336,7 +353,7 @@ function createH3DefaultGraph(): { nodes: Node[]; edges: Edge[] } {
   }, 'stage-2', 220, 60)
   const comb2 = defaultChildNode('combustor-2', 'combustor', '燃焼器（LE-5B-3相当）', {
     diameterMm: 450, lengthMm: 400, throatDiameterMm: 166, chamberPressurePa: 3.5e6,
-    cStarMS: 2300, gamma: 1.2, ofRatio: 5.0, safetyFactor: 1.5,
+    cStarMS: 2300, gamma: 1.2, safetyFactor: 1.5,
     exitDiameterMm: 1741, nozzleLengthMm: 2500, expansionRatio: 110, ambientPressurePa: 0, thicknessMm: 4,
     material: 'Inconel 718', densityKgM3: 8190, yieldStrengthPa: 1035e6,
   }, 'stage-2', 380, 60)
@@ -424,19 +441,20 @@ function MaterialField({
   )
 }
 
-// 長さ系（unit:'mm'）フィールドはlengthUnitに応じてmm/m表示・入力変換を行う汎用の数値入力
 function NumberField({
-  label, unit, value, onChange,
+  label, unit, value, onChange, hint,
 }: {
   label: string
   unit?: string
   value: number
   onChange: (value: number) => void
+  hint?: string
 }) {
   return (
     <div>
-      <label className="mb-1 block text-xs font-medium text-gray-500">
+      <label className="mb-1 flex items-center gap-1 text-xs font-medium text-gray-500">
         {label}{unit ? ` [${unit}]` : ''}
+        {hint && <HintIcon text={hint} />}
       </label>
       <input
         type="number"
@@ -445,6 +463,39 @@ function NumberField({
         onChange={e => onChange(Number(e.target.value) || 0)}
         className="w-full rounded-md border border-gray-300 px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
       />
+    </div>
+  )
+}
+
+// 長さ系（unit:'mm'）フィールド専用の数値入力。フィールドごとに個別のmm/m切替ドロップダウンを持つ
+function LengthField({
+  label, valueMm, onChange,
+}: {
+  label: string
+  valueMm: number
+  onChange: (valueMm: number) => void
+}) {
+  const [unit, setUnit] = useState<LengthUnit>('mm')
+  return (
+    <div>
+      <label className="mb-1 block text-xs font-medium text-gray-500">{label}</label>
+      <div className="flex gap-1">
+        <input
+          type="number"
+          step="any"
+          value={String(toDisplayLength(valueMm, unit))}
+          onChange={e => onChange(fromDisplayLength(Number(e.target.value) || 0, unit))}
+          className="w-full rounded-md border border-gray-300 px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+        />
+        <select
+          value={unit}
+          onChange={e => setUnit(e.target.value as LengthUnit)}
+          className="shrink-0 rounded-md border border-gray-300 bg-white px-1.5 text-xs text-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500"
+        >
+          <option value="mm">mm</option>
+          <option value="m">m</option>
+        </select>
+      </div>
     </div>
   )
 }
@@ -461,16 +512,113 @@ function HintIcon({ text }: { text: string }) {
   )
 }
 
+// パラメータ設定パネルは幅が狭いため、図解はポータルで画面側にfixed表示し
+// パネルのoverflow-y-autoによるクリッピングを避ける
+function DiagramHint({ label, children }: { label: string; children: React.ReactNode }) {
+  const ref = useRef<HTMLSpanElement>(null)
+  const [pos, setPos] = useState<{ top: number; left: number } | null>(null)
+  const POPUP_WIDTH = 320
+
+  const show = () => {
+    const rect = ref.current?.getBoundingClientRect()
+    if (!rect) return
+    const left = Math.min(rect.left, window.innerWidth - POPUP_WIDTH - 8)
+    setPos({ top: rect.bottom + 6, left: Math.max(8, left) })
+  }
+  const hide = () => setPos(null)
+
+  return (
+    <span
+      ref={ref}
+      className="inline-flex items-center gap-1 text-xs text-gray-400"
+      onMouseEnter={show}
+      onMouseLeave={hide}
+    >
+      {label}
+      <span
+        tabIndex={0}
+        onFocus={show}
+        onBlur={hide}
+        className="inline-flex h-3.5 w-3.5 shrink-0 cursor-help items-center justify-center rounded-full border border-gray-300 text-[10px] font-semibold leading-none text-gray-400 hover:border-blue-400 hover:text-blue-500"
+      >
+        ?
+      </span>
+      {pos && typeof document !== 'undefined' && createPortal(
+        <div
+          style={{ position: 'fixed', top: pos.top, left: pos.left, width: POPUP_WIDTH, zIndex: 50 }}
+          className="rounded-lg border border-gray-200 bg-white p-3 shadow-xl"
+        >
+          {children}
+        </div>,
+        document.body,
+      )}
+    </span>
+  )
+}
+
+// 燃焼室・スロート・ノズルの各寸法パラメータがどの部位を指すかを示す簡易図
+function CombustorDimensionDiagram() {
+  return (
+    <svg viewBox="0 0 320 210" className="w-full">
+      <defs>
+        <marker id="combustor-dim-arrow" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 Z" fill="#2563eb" />
+        </marker>
+      </defs>
+
+      {/* 中心軸 */}
+      <line x1="10" y1="110" x2="310" y2="110" stroke="#cbd5e1" strokeDasharray="4 3" strokeWidth="1" />
+
+      {/* 外壁 */}
+      <path
+        d="M20,75 L110,75 L150,96 L290,60 M20,145 L110,145 L150,124 L290,160"
+        fill="none" stroke="#475569" strokeWidth="1.5"
+      />
+      {/* 内壁（外壁との隙間が肉厚を示す） */}
+      <path
+        d="M20,80 L110,80 L150,101 L290,65 M20,140 L110,140 L150,119 L290,155"
+        fill="none" stroke="#94a3b8" strokeWidth="1"
+      />
+      <line x1="20" y1="75" x2="20" y2="145" stroke="#475569" strokeWidth="1.5" />
+      <line x1="290" y1="60" x2="290" y2="160" stroke="#475569" strokeWidth="1.5" />
+
+      {/* 燃焼室外径 */}
+      <line x1="45" y1="75" x2="45" y2="145" stroke="#2563eb" strokeWidth="1.2" markerStart="url(#combustor-dim-arrow)" markerEnd="url(#combustor-dim-arrow)" />
+      <text x="45" y="66" textAnchor="middle" fontSize="9" fill="#1e3a8a">燃焼室外径</text>
+
+      {/* スロート径 */}
+      <line x1="150" y1="96" x2="150" y2="124" stroke="#2563eb" strokeWidth="1.2" markerStart="url(#combustor-dim-arrow)" markerEnd="url(#combustor-dim-arrow)" />
+      <text x="150" y="87" textAnchor="middle" fontSize="9" fill="#1e3a8a">スロート径</text>
+
+      {/* ノズル出口径 */}
+      <line x1="290" y1="60" x2="290" y2="160" stroke="#2563eb" strokeWidth="1.2" markerStart="url(#combustor-dim-arrow)" markerEnd="url(#combustor-dim-arrow)" />
+      <text x="290" y="51" textAnchor="middle" fontSize="9" fill="#1e3a8a">ノズル出口径</text>
+
+      {/* 燃焼室長さ */}
+      <line x1="20" y1="172" x2="110" y2="172" stroke="#16a34a" strokeWidth="1.2" markerStart="url(#combustor-dim-arrow)" markerEnd="url(#combustor-dim-arrow)" />
+      <text x="65" y="186" textAnchor="middle" fontSize="9" fill="#14532d">燃焼室長さ</text>
+
+      {/* ノズル長さ */}
+      <line x1="150" y1="178" x2="290" y2="178" stroke="#16a34a" strokeWidth="1.2" markerStart="url(#combustor-dim-arrow)" markerEnd="url(#combustor-dim-arrow)" />
+      <text x="220" y="192" textAnchor="middle" fontSize="9" fill="#14532d">ノズル長さ</text>
+
+      {/* ノズル肉厚（外壁・内壁の隙間） */}
+      <line x1="220" y1="40" x2="220" y2="78" stroke="#dc2626" strokeWidth="0.75" strokeDasharray="2 2" />
+      <line x1="220" y1="78" x2="220" y2="83" stroke="#dc2626" strokeWidth="1.2" markerStart="url(#combustor-dim-arrow)" markerEnd="url(#combustor-dim-arrow)" />
+      <text x="220" y="34" textAnchor="middle" fontSize="9" fill="#7f1d1d">ノズル肉厚</text>
+    </svg>
+  )
+}
+
 // ── Component param panel ─────────────────────────────────────────────
 
 function ParamPanel({
-  node, materials, propellants, edges, lengthUnit, onChangeParam, onChangeLabel, onChangeMaterial,
+  node, materials, propellants, edges, onChangeParam, onChangeLabel, onChangeMaterial,
 }: {
   node: Node
   materials: Material[]
   propellants: FluidLibraryEntry[]
   edges: Edge[]
-  lengthUnit: LengthUnit
   onChangeParam: (key: string, value: string) => void
   onChangeLabel: (value: string) => void
   onChangeMaterial: (materialName: string) => void
@@ -488,6 +636,11 @@ function ParamPanel({
           className="w-full rounded-md border border-gray-300 px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
         />
       </div>
+      {d.category === 'combustor' && (
+        <DiagramHint label="各寸法の位置">
+          <CombustorDimensionDiagram />
+        </DiagramHint>
+      )}
       {fields.map(field => {
         if (field.type === 'material') {
           return (
@@ -520,18 +673,44 @@ function ParamPanel({
             </div>
           )
         }
-        const isLength = field.unit === 'mm'
         const rawValue = Number(d.params[field.key]) || 0
-        return (
+        return field.unit === 'mm' ? (
+          <LengthField
+            key={field.key}
+            label={field.label}
+            valueMm={rawValue}
+            onChange={v => onChangeParam(field.key, String(v))}
+          />
+        ) : (
           <NumberField
             key={field.key}
             label={field.label}
-            unit={isLength ? lengthUnit : field.unit}
-            value={isLength ? toDisplayLength(rawValue, lengthUnit) : rawValue}
-            onChange={v => onChangeParam(field.key, String(isLength ? fromDisplayLength(v, lengthUnit) : v))}
+            unit={field.unit}
+            value={rawValue}
+            onChange={v => onChangeParam(field.key, String(v))}
+            hint={field.hint}
           />
         )
       })}
+
+      <div className="border-t border-gray-100 pt-4">
+        <h3 className="text-sm font-semibold text-gray-600 mb-3">計算結果</h3>
+        {d.result ? (
+          <table className="w-full text-sm text-gray-600">
+            <tbody>
+              {RESULT_FIELD_META.filter(m => d.result![m.key] !== undefined).map(m => (
+                <tr key={m.key} className="border-b border-gray-50 last:border-0">
+                  <td className="py-1 pr-3 text-gray-500">{m.label}</td>
+                  <td className="py-1 text-right font-medium tabular-nums text-gray-900">{d.result![m.key]!.toFixed(m.decimals)}</td>
+                  <td className="py-1 pl-1.5 text-gray-400">{m.unit}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : (
+          <p className="text-sm text-gray-400">右上の「計算開始」を押すと結果が表示されます</p>
+        )}
+      </div>
     </div>
   )
 }
@@ -575,11 +754,10 @@ function propellantEdgeColor(propellant?: string): string | undefined {
 }
 
 function EdgePanel({
-  edge, materials, lengthUnit, onChangeField, onChangeMaterial,
+  edge, materials, onChangeField, onChangeMaterial,
 }: {
   edge: Edge
   materials: Material[]
-  lengthUnit: LengthUnit
   onChangeField: (key: string, value: number | string) => void
   onChangeMaterial: (materialName: string) => void
 }) {
@@ -588,23 +766,20 @@ function EdgePanel({
   return (
     <div className="flex flex-col gap-3">
       <p className="text-xs text-gray-400">配管そのものを表すエッジです。寸法・材質・運ぶ推進剤を設定します</p>
-      <NumberField
+      <LengthField
         label="外径"
-        unit={lengthUnit}
-        value={toDisplayLength(d.diameterMm ?? 0, lengthUnit)}
-        onChange={v => onChangeField('diameterMm', fromDisplayLength(v, lengthUnit))}
+        valueMm={d.diameterMm ?? 0}
+        onChange={v => onChangeField('diameterMm', v)}
       />
-      <NumberField
+      <LengthField
         label="長さ"
-        unit={lengthUnit}
-        value={toDisplayLength(d.lengthMm ?? 0, lengthUnit)}
-        onChange={v => onChangeField('lengthMm', fromDisplayLength(v, lengthUnit))}
+        valueMm={d.lengthMm ?? 0}
+        onChange={v => onChangeField('lengthMm', v)}
       />
-      <NumberField
+      <LengthField
         label="肉厚"
-        unit={lengthUnit}
-        value={toDisplayLength(d.thicknessMm ?? 0, lengthUnit)}
-        onChange={v => onChangeField('thicknessMm', fromDisplayLength(v, lengthUnit))}
+        valueMm={d.thicknessMm ?? 0}
+        onChange={v => onChangeField('thicknessMm', v)}
       />
       <MaterialField label="材質" value={d.material ?? ''} materials={materials} onChange={onChangeMaterial} />
       <div>
@@ -634,12 +809,11 @@ function EdgePanel({
 // ── Stage param panel ──────────────────────────────────────────────────
 
 function StagePanel({
-  stageNode, materials, lengthUnit, onChangeName, onChangeStructure, onChangeStructureMaterial,
-  onAddFixedMass, onChangeFixedMass, onRemoveFixedMass, onChangeSeparationDelay, onCalc, calculating,
+  stageNode, materials, onChangeName, onChangeStructure, onChangeStructureMaterial,
+  onAddFixedMass, onChangeFixedMass, onRemoveFixedMass, onChangeSeparationDelay,
 }: {
   stageNode: Node
   materials: Material[]
-  lengthUnit: LengthUnit
   onChangeName: (value: string) => void
   onChangeStructure: (key: string, value: string) => void
   onChangeStructureMaterial: (materialName: string) => void
@@ -647,8 +821,6 @@ function StagePanel({
   onChangeFixedMass: (id: string, patch: Partial<FixedMass>) => void
   onRemoveFixedMass: (id: string) => void
   onChangeSeparationDelay: (value: number) => void
-  onCalc: () => void
-  calculating: boolean
 }) {
   const d = stageNode.data as unknown as StageNodeData
 
@@ -670,15 +842,13 @@ function StagePanel({
             if (field.type === 'material') {
               return <MaterialField key={field.key} label={field.label} value={d.structure.material} materials={materials} onChange={onChangeStructureMaterial} />
             }
-            const isLength = field.unit === 'mm'
             const rawValue = Number(d.structure[field.key as keyof StageStructureParams]) || 0
             return (
-              <NumberField
+              <LengthField
                 key={field.key}
                 label={field.label}
-                unit={isLength ? lengthUnit : field.unit}
-                value={isLength ? toDisplayLength(rawValue, lengthUnit) : rawValue}
-                onChange={v => onChangeStructure(field.key, String(isLength ? fromDisplayLength(v, lengthUnit) : v))}
+                valueMm={rawValue}
+                onChange={v => onChangeStructure(field.key, String(v))}
               />
             )
           })}
@@ -740,26 +910,32 @@ function StagePanel({
         <HintIcon text="エンジン燃焼終了（燃焼時間経過）から、この段が実際に切り離される（質量が投棄される）までのコースト時間です。0の場合は燃焼終了と同時に分離します。" />
       </div>
 
-      <button
-        type="button"
-        onClick={onCalc}
-        disabled={calculating}
-        className="bg-blue-600 hover:bg-blue-700 text-white text-sm px-4 py-1.5 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-      >
-        {calculating ? '計算中...' : 'このステージを計算'}
-      </button>
-
-      {d.stageResult && (
-        <div className="flex flex-col gap-1 border-t border-gray-100 pt-3 text-xs text-gray-600">
-          <span>乾燥質量 <b className="tabular-nums">{d.stageResult.dry_mass.toFixed(1)}</b> kg</span>
-          <span>推進剤 <b className="tabular-nums">{d.stageResult.propellant_mass.toFixed(1)}</b> kg</span>
-          {d.stageResult.payload_mass > 0 && (
-            <span>ペイロード <b className="tabular-nums">{d.stageResult.payload_mass.toFixed(1)}</b> kg</span>
-          )}
-          <span>推力 <b className="tabular-nums">{d.stageResult.thrust.toFixed(0)}</b> N</span>
-          <span>燃焼時間 <b className="tabular-nums">{d.stageResult.burn_time.toFixed(1)}</b> s</span>
-        </div>
-      )}
+      <div className="border-t border-gray-100 pt-4">
+        <h3 className="text-sm font-semibold text-gray-600 mb-3">計算結果</h3>
+        {d.stageResult ? (
+          <table className="w-full text-sm text-gray-600">
+            <tbody>
+              {[
+                { label: '乾燥質量', value: d.stageResult.dry_mass.toFixed(1), unit: 'kg' },
+                { label: '推進剤', value: d.stageResult.propellant_mass.toFixed(1), unit: 'kg' },
+                ...(d.stageResult.payload_mass > 0
+                  ? [{ label: 'ペイロード', value: d.stageResult.payload_mass.toFixed(1), unit: 'kg' }]
+                  : []),
+                { label: '推力', value: d.stageResult.thrust.toFixed(0), unit: 'N' },
+                { label: '燃焼時間', value: d.stageResult.burn_time.toFixed(1), unit: 's' },
+              ].map(row => (
+                <tr key={row.label} className="border-b border-gray-50 last:border-0">
+                  <td className="py-1 pr-3 text-gray-500">{row.label}</td>
+                  <td className="py-1 text-right font-medium tabular-nums text-gray-900">{row.value}</td>
+                  <td className="py-1 pl-1.5 text-gray-400">{row.unit}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : (
+          <p className="text-sm text-gray-400">右上の「計算開始」を押すと結果が表示されます</p>
+        )}
+      </div>
     </div>
   )
 }
@@ -778,11 +954,10 @@ function RocketBuilderInner({ onStagesChange }: { onStagesChange?: (stages: Stag
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>(defaultGraph.edges)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null)
-  const [loadingStageId, setLoadingStageId] = useState<string | null>(null)
+  const [calculatingAll, setCalculatingAll] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [materials, setMaterials] = useState<Material[]>([])
   const [propellants, setPropellants] = useState<FluidLibraryEntry[]>([])
-  const [lengthUnit, setLengthUnit] = useState<LengthUnit>('mm')
   const nodeCounter = useRef(0)
   const stageCounter = useRef(2)
   const lastStagesKey = useRef<string>('')
@@ -804,6 +979,8 @@ function RocketBuilderInner({ onStagesChange }: { onStagesChange?: (stages: Stag
       const r = d.stageResult
       const dryMass = r?.dry_mass ?? 0
       const propellantMass = r?.propellant_mass ?? 0
+      const oxidizerMass = r?.oxidizer_mass ?? 0
+      const fuelMass = r?.fuel_mass ?? 0
       const payloadMass = r?.payload_mass ?? 0
       const massKg = dryMass + propellantMass + payloadMass
       return {
@@ -811,10 +988,11 @@ function RocketBuilderInner({ onStagesChange }: { onStagesChange?: (stages: Stag
         index: i + 1,
         name: d.name,
         calculated: r !== null,
-        dryMass, propellantMass, payloadMass, massKg,
+        dryMass, propellantMass, oxidizerMass, fuelMass, payloadMass, massKg,
         weightN: massKg * G0,
         thrust: r?.thrust ?? 0,
         burnTime: r?.burn_time ?? 0,
+        mdotTotal: r?.mdot_total ?? 0,
       }
     })
   }, [nodes])
@@ -822,10 +1000,12 @@ function RocketBuilderInner({ onStagesChange }: { onStagesChange?: (stages: Stag
   const grandTotal = useMemo(() => stageSummaries.reduce((acc, s) => ({
     dryMass: acc.dryMass + s.dryMass,
     propellantMass: acc.propellantMass + s.propellantMass,
+    oxidizerMass: acc.oxidizerMass + s.oxidizerMass,
+    fuelMass: acc.fuelMass + s.fuelMass,
     payloadMass: acc.payloadMass + s.payloadMass,
     massKg: acc.massKg + s.massKg,
     weightN: acc.weightN + s.weightN,
-  }), { dryMass: 0, propellantMass: 0, payloadMass: 0, massKg: 0, weightN: 0 }), [stageSummaries])
+  }), { dryMass: 0, propellantMass: 0, oxidizerMass: 0, fuelMass: 0, payloadMass: 0, massKg: 0, weightN: 0 }), [stageSummaries])
 
   const totalMass = grandTotal.massKg
 
@@ -866,20 +1046,22 @@ function RocketBuilderInner({ onStagesChange }: { onStagesChange?: (stages: Stag
     setNodes(prev => [...prev, newStage])
   }
 
-  const removeStage = (stageId: string) => {
-    const stageCount = nodes.filter(n => n.type === STAGE_TYPE).length
-    if (stageCount <= 1) return
-    setNodes(prev => prev.filter(n => n.id !== stageId && n.parentId !== stageId))
-    setEdges(prev => prev.filter(e => {
-      const orphaned = (id: string) => id === stageId || nodes.find(n => n.id === id)?.parentId === stageId
-      return !orphaned(e.source) && !orphaned(e.target)
-    }))
-    setSelectedId(prev => {
-      if (prev === stageId) return null
-      const prevNode = nodes.find(n => n.id === prev)
-      return prevNode?.parentId === stageId ? null : prev
-    })
-  }
+  // Delキー等でのノード削除時、削除されたステージの子ノード・接続配管を連動して取り除く
+  // （React Flowの標準のremove変更は選択中のノードしか対象にしないため、後段で手動でカスケードする）
+  const handleNodesChange = useCallback((changes: NodeChange[]) => {
+    const stageIds = new Set(nodes.filter(n => n.type === STAGE_TYPE).map(n => n.id))
+    const removingStageCount = changes.filter(c => c.type === 'remove' && stageIds.has(c.id)).length
+    const safeChanges = removingStageCount > 0 && stageIds.size - removingStageCount < 1
+      ? changes.filter(c => !(c.type === 'remove' && stageIds.has(c.id)))
+      : changes
+    onNodesChange(safeChanges)
+    const removedIds = new Set(safeChanges.filter(c => c.type === 'remove').map(c => c.id))
+    if (removedIds.size === 0) return
+    nodes.forEach(n => { if (n.parentId && removedIds.has(n.parentId)) removedIds.add(n.id) })
+    setNodes(prev => prev.filter(n => !removedIds.has(n.id)))
+    setEdges(prev => prev.filter(e => !removedIds.has(e.source) && !removedIds.has(e.target)))
+    setSelectedId(prev => (prev && removedIds.has(prev) ? null : prev))
+  }, [nodes, onNodesChange, setNodes, setEdges])
 
   const onDragStart = (e: React.DragEvent, category: NodeCategory) => {
     e.dataTransfer.setData('application/reactflow', category)
@@ -980,13 +1162,6 @@ function RocketBuilderInner({ onStagesChange }: { onStagesChange?: (stages: Stag
     }))
   }, [selectedId, setNodes])
 
-  const removeSelectedNode = () => {
-    if (!selectedId) return
-    setNodes(prev => prev.filter(n => n.id !== selectedId))
-    setEdges(prev => prev.filter(e => e.source !== selectedId && e.target !== selectedId))
-    setSelectedId(null)
-  }
-
   const removeSelectedEdge = () => {
     if (!selectedEdgeId) return
     setEdges(prev => prev.filter(e => e.id !== selectedEdgeId))
@@ -1033,7 +1208,7 @@ function RocketBuilderInner({ onStagesChange }: { onStagesChange?: (stages: Stag
     ...d, fixedMasses: d.fixedMasses.filter(fm => fm.id !== fmId),
   }))
 
-  const handleCalcStage = async (stageId: string) => {
+  const calcStage = useCallback(async (stageId: string) => {
     const stageNode = nodes.find(n => n.id === stageId)
     if (!stageNode) return
     const stageData = stageNode.data as unknown as StageNodeData
@@ -1041,57 +1216,64 @@ function RocketBuilderInner({ onStagesChange }: { onStagesChange?: (stages: Stag
     const childIds = new Set(children.map(n => n.id))
     const stageEdges = edges.filter(e => childIds.has(e.source) && childIds.has(e.target))
 
-    setError(null)
-    setLoadingStageId(stageId)
-    try {
-      const payloadNodes: RocketNodePayload[] = children.map(n => {
+    const payloadNodes: RocketNodePayload[] = children.map(n => {
+      const d = n.data as unknown as RocketNodeData
+      let params = d.params
+      if (d.category === 'tank') {
+        const propellant = propellantForNode(n.id, stageEdges)
+        const density = propellant ? propellants.find(p => p.name === propellant)?.density_kg_m3 : undefined
+        if (density !== undefined) params = { ...params, propellantDensityKgM3: density }
+      }
+      return { id: n.id, node_type: d.category, params }
+    })
+    const payloadEdges: RocketEdgePayload[] = stageEdges.map(e => {
+      const ed = (e.data ?? {}) as RocketEdgeData
+      return {
+        id: e.id, source: e.source, target: e.target,
+        source_handle: e.sourceHandle ?? null, target_handle: e.targetHandle ?? null,
+        diameter_mm: ed.diameterMm ?? 0, length_mm: ed.lengthMm ?? 0, thickness_mm: ed.thicknessMm ?? 0,
+        material: ed.material || null, density_kg_m3: ed.densityKgM3 ?? 0, propellant: ed.propellant || null,
+      }
+    })
+    const res = await buildRocketStage({
+      nodes: payloadNodes,
+      edges: payloadEdges,
+      structure: stageData.structure,
+      fixed_masses: stageData.fixedMasses,
+    })
+    setNodes(prev => prev.map(n => {
+      if (n.parentId === stageId) {
+        const r = res.nodes[n.id]
+        if (!r) return n
         const d = n.data as unknown as RocketNodeData
-        let params = d.params
-        if (d.category === 'tank') {
-          const propellant = propellantForNode(n.id, stageEdges)
-          const density = propellant ? propellants.find(p => p.name === propellant)?.density_kg_m3 : undefined
-          if (density !== undefined) params = { ...params, propellantDensityKgM3: density }
-        }
-        return { id: n.id, node_type: d.category, params }
-      })
-      const payloadEdges: RocketEdgePayload[] = stageEdges.map(e => {
-        const ed = (e.data ?? {}) as RocketEdgeData
-        return {
-          id: e.id, source: e.source, target: e.target,
-          source_handle: e.sourceHandle ?? null, target_handle: e.targetHandle ?? null,
-          diameter_mm: ed.diameterMm ?? 0, length_mm: ed.lengthMm ?? 0, thickness_mm: ed.thicknessMm ?? 0,
-          material: ed.material || null, density_kg_m3: ed.densityKgM3 ?? 0, propellant: ed.propellant || null,
-        }
-      })
-      const res = await buildRocketStage({
-        nodes: payloadNodes,
-        edges: payloadEdges,
-        structure: stageData.structure,
-        fixed_masses: stageData.fixedMasses,
-      })
-      setNodes(prev => prev.map(n => {
-        if (n.parentId === stageId) {
-          const r = res.nodes[n.id]
-          if (!r) return n
-          const d = n.data as unknown as RocketNodeData
-          return { ...n, data: { ...d, result: r } as unknown as Record<string, unknown> }
-        }
-        if (n.id === stageId) {
-          const d = n.data as unknown as StageNodeData
-          return { ...n, data: { ...d, stageResult: res.stage } as unknown as Record<string, unknown> }
-        }
-        return n
-      }))
-      setEdges(prev => prev.map(e => {
-        const r = res.edges?.[e.id]
-        if (!r) return e
-        const ed = (e.data ?? {}) as RocketEdgeData
-        return { ...e, data: { ...ed, massKg: r.mass_kg }, label: `${r.mass_kg.toFixed(1)} kg` }
-      }))
+        return { ...n, data: { ...d, result: r } as unknown as Record<string, unknown> }
+      }
+      if (n.id === stageId) {
+        const d = n.data as unknown as StageNodeData
+        return { ...n, data: { ...d, stageResult: res.stage } as unknown as Record<string, unknown> }
+      }
+      return n
+    }))
+    setEdges(prev => prev.map(e => {
+      const r = res.edges?.[e.id]
+      if (!r) return e
+      const ed = (e.data ?? {}) as RocketEdgeData
+      return { ...e, data: { ...ed, massKg: r.mass_kg }, label: `${r.mass_kg.toFixed(1)} kg` }
+    }))
+  }, [nodes, edges, propellants, setNodes, setEdges])
+
+  const handleCalcAll = async () => {
+    const stageIds = nodes.filter(n => n.type === STAGE_TYPE).map(n => n.id)
+    setError(null)
+    setCalculatingAll(true)
+    try {
+      for (const stageId of stageIds) {
+        await calcStage(stageId)
+      }
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : '段の計算に失敗しました')
+      setError(e instanceof Error ? e.message : '計算に失敗しました')
     } finally {
-      setLoadingStageId(null)
+      setCalculatingAll(false)
     }
   }
 
@@ -1109,23 +1291,17 @@ function RocketBuilderInner({ onStagesChange }: { onStagesChange?: (stages: Stag
         </button>
         {error && <span className="text-sm text-red-500">{error}</span>}
         <div className="ml-auto flex items-center gap-3">
-          <div className="flex rounded-md border border-gray-300 text-xs overflow-hidden">
-            {(['mm', 'm'] as LengthUnit[]).map(u => (
-              <button
-                key={u}
-                type="button"
-                onClick={() => setLengthUnit(u)}
-                className={`px-2 py-1 font-medium transition-colors ${
-                  lengthUnit === u ? 'bg-blue-600 text-white' : 'bg-white text-gray-500 hover:bg-gray-50'
-                }`}
-              >
-                {u}
-              </button>
-            ))}
-          </div>
           <span className="text-sm text-gray-600">
             全備質量 <b className="text-blue-600 tabular-nums">{totalMass.toFixed(1)}</b> kg
           </span>
+          <button
+            type="button"
+            onClick={handleCalcAll}
+            disabled={calculatingAll || stageSummaries.length === 0}
+            className="rounded-md bg-blue-600 px-4 py-1.5 text-sm font-semibold text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {calculatingAll ? '計算中...' : '計算開始'}
+          </button>
         </div>
       </div>
 
@@ -1157,7 +1333,7 @@ function RocketBuilderInner({ onStagesChange }: { onStagesChange?: (stages: Stag
           <ReactFlow
             nodes={orderedNodes}
             edges={coloredEdges}
-            onNodesChange={onNodesChange}
+            onNodesChange={handleNodesChange}
             onEdgesChange={onEdgesChange}
             onConnect={onConnect}
             onNodeClick={onNodeClick}
@@ -1182,7 +1358,6 @@ function RocketBuilderInner({ onStagesChange }: { onStagesChange?: (stages: Stag
                 <StagePanel
                   stageNode={selectedNode}
                   materials={materials}
-                  lengthUnit={lengthUnit}
                   onChangeName={v => updateStageName(selectedNode.id, v)}
                   onChangeStructure={(k, v) => updateStageStructure(selectedNode.id, k, v)}
                   onChangeStructureMaterial={v => updateStageStructureMaterial(selectedNode.id, v)}
@@ -1190,32 +1365,14 @@ function RocketBuilderInner({ onStagesChange }: { onStagesChange?: (stages: Stag
                   onChangeFixedMass={(id, patch) => updateFixedMass(selectedNode.id, id, patch)}
                   onRemoveFixedMass={id => removeFixedMass(selectedNode.id, id)}
                   onChangeSeparationDelay={v => updateStageSeparationDelay(selectedNode.id, v)}
-                  onCalc={() => handleCalcStage(selectedNode.id)}
-                  calculating={loadingStageId === selectedNode.id}
                 />
-                <button
-                  type="button"
-                  onClick={() => removeStage(selectedNode.id)}
-                  className="mt-2 w-full rounded-md border border-red-200 bg-white px-3 py-1.5 text-sm font-medium text-red-600 hover:bg-red-50"
-                >
-                  ステージを削除
-                </button>
               </div>
             ) : (
-              <div className="flex flex-col gap-3">
-                <ParamPanel node={selectedNode} materials={materials} propellants={propellants} edges={edges} lengthUnit={lengthUnit} onChangeParam={updateParam} onChangeLabel={updateLabel} onChangeMaterial={updateMaterial} />
-                <button
-                  type="button"
-                  onClick={removeSelectedNode}
-                  className="mt-2 w-full rounded-md border border-red-200 bg-white px-3 py-1.5 text-sm font-medium text-red-600 hover:bg-red-50"
-                >
-                  ノードを削除
-                </button>
-              </div>
+              <ParamPanel node={selectedNode} materials={materials} propellants={propellants} edges={edges} onChangeParam={updateParam} onChangeLabel={updateLabel} onChangeMaterial={updateMaterial} />
             )
           ) : selectedEdge ? (
             <div className="flex flex-col gap-3">
-              <EdgePanel edge={selectedEdge} materials={materials} lengthUnit={lengthUnit} onChangeField={updateEdgeField} onChangeMaterial={updateEdgeMaterial} />
+              <EdgePanel edge={selectedEdge} materials={materials} onChangeField={updateEdgeField} onChangeMaterial={updateEdgeMaterial} />
               <button
                 type="button"
                 onClick={removeSelectedEdge}
@@ -1243,11 +1400,13 @@ function RocketBuilderInner({ onStagesChange }: { onStagesChange?: (stages: Stag
             <tr className="border-b border-gray-100 text-left text-xs text-gray-500">
               <th className="px-4 py-2 font-medium">ステージ</th>
               <th className="px-4 py-2 font-medium">乾燥質量 [kg]</th>
-              <th className="px-4 py-2 font-medium">推進剤質量 [kg]</th>
+              <th className="px-4 py-2 font-medium">酸化剤質量 [kg]</th>
+              <th className="px-4 py-2 font-medium">燃料質量 [kg]</th>
               <th className="px-4 py-2 font-medium">ペイロード [kg]</th>
               <th className="px-4 py-2 font-medium">合計質量 [kg]</th>
               <th className="px-4 py-2 font-medium">重量 [N]</th>
               <th className="px-4 py-2 font-medium">推力 [N]</th>
+              <th className="px-4 py-2 font-medium">質量流量 [kg/s]</th>
               <th className="px-4 py-2 font-medium">燃焼時間 [s]</th>
             </tr>
           </thead>
@@ -1259,17 +1418,19 @@ function RocketBuilderInner({ onStagesChange }: { onStagesChange?: (stages: Stag
                   {!s.calculated && <span className="ml-1 text-xs text-gray-400">（未計算）</span>}
                 </td>
                 <td className="px-4 py-2 tabular-nums text-gray-600">{s.dryMass.toFixed(1)}</td>
-                <td className="px-4 py-2 tabular-nums text-gray-600">{s.propellantMass.toFixed(1)}</td>
+                <td className="px-4 py-2 tabular-nums text-gray-600">{s.oxidizerMass.toFixed(1)}</td>
+                <td className="px-4 py-2 tabular-nums text-gray-600">{s.fuelMass.toFixed(1)}</td>
                 <td className="px-4 py-2 tabular-nums text-gray-600">{s.payloadMass.toFixed(1)}</td>
                 <td className="px-4 py-2 tabular-nums text-gray-600">{s.massKg.toFixed(1)}</td>
                 <td className="px-4 py-2 tabular-nums text-gray-600">{s.weightN.toFixed(1)}</td>
                 <td className="px-4 py-2 tabular-nums text-gray-600">{s.thrust.toFixed(0)}</td>
+                <td className="px-4 py-2 tabular-nums text-gray-600">{s.mdotTotal.toFixed(2)}</td>
                 <td className="px-4 py-2 tabular-nums text-gray-600">{s.burnTime.toFixed(1)}</td>
               </tr>
             ))}
             {stageSummaries.length === 0 && (
               <tr>
-                <td colSpan={8} className="px-4 py-6 text-center text-sm text-gray-400">ステージがありません</td>
+                <td colSpan={10} className="px-4 py-6 text-center text-sm text-gray-400">ステージがありません</td>
               </tr>
             )}
           </tbody>
@@ -1278,11 +1439,12 @@ function RocketBuilderInner({ onStagesChange }: { onStagesChange?: (stages: Stag
               <tr className="border-t-2 border-gray-200 bg-gray-50 font-semibold text-gray-900">
                 <td className="px-4 py-2">合計（全ステージ）</td>
                 <td className="px-4 py-2 tabular-nums">{grandTotal.dryMass.toFixed(1)}</td>
-                <td className="px-4 py-2 tabular-nums">{grandTotal.propellantMass.toFixed(1)}</td>
+                <td className="px-4 py-2 tabular-nums">{grandTotal.oxidizerMass.toFixed(1)}</td>
+                <td className="px-4 py-2 tabular-nums">{grandTotal.fuelMass.toFixed(1)}</td>
                 <td className="px-4 py-2 tabular-nums">{grandTotal.payloadMass.toFixed(1)}</td>
                 <td className="px-4 py-2 tabular-nums">{grandTotal.massKg.toFixed(1)}</td>
                 <td className="px-4 py-2 tabular-nums">{grandTotal.weightN.toFixed(1)}</td>
-                <td className="px-4 py-2 text-xs text-gray-400" colSpan={2}>推力・燃焼時間は段ごとに異なるため合計なし</td>
+                <td className="px-4 py-2 text-xs text-gray-400" colSpan={3}>推力・質量流量・燃焼時間は段ごとに異なるため合計なし</td>
               </tr>
             </tfoot>
           )}

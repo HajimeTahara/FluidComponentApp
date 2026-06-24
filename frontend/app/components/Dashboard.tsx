@@ -11,8 +11,9 @@ import ComponentLibrary from './ComponentLibrary'
 import MaterialDatabase from './MaterialDatabase'
 import FluidLibrary from './FluidLibrary'
 import LaunchAnalysis from './LaunchAnalysis'
+import RocketCdCalculator from './RocketCdCalculator'
 
-type Tab = 'fluid-library' | 'component-library' | 'material-library' | 'pid' | 'pressure-drop' | 'launch'
+type Tab = 'fluid-library' | 'component-library' | 'material-library' | 'pid' | 'pressure-drop' | 'launch' | 'rocket-cd'
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'fluid-library', label: '状態方程式' },
@@ -21,6 +22,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: 'pid', label: '非定常解析' },
   { id: 'pressure-drop', label: '定常流れ解析' },
   { id: 'launch', label: '打ち上げ解析' },
+  { id: 'rocket-cd', label: 'Cd計算' },
 ]
 
 export default function Dashboard() {
@@ -171,6 +173,7 @@ export default function Dashboard() {
               {tab === 'pid' && <TransientNetworkCalc seed={transientSeed} />}
               {tab === 'pressure-drop' && <PipeNetworkCalc onCopyToTransient={copyToTransient} />}
               {tab === 'launch' && <LaunchAnalysis />}
+              {tab === 'rocket-cd' && <RocketCdCalculator />}
             </>
           )}
         </main>

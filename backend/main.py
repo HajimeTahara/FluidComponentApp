@@ -3186,6 +3186,39 @@ class FairingSpec(BaseModel):
     diameter_m: float = 0.0            # フェアリング直径 [m]
 
 
+G0_MS2 = 9.80665      # 標準重力加速度（海面）[m/s²]
+R_EARTH_M = 6371000.0  # 地球平均半径 [m]（高度による重力減衰の計算に使用）
+
+
+def _gravity_at_altitude(altitude_m: float) -> float:
+    """高度による重力加速度: g(h) = g0 / (1 + h/R)^2（逆二乗則、地球を球とみなした近似）"""
+    return G0_MS2 / (1.0 + max(altitude_m, 0.0) / R_EARTH_M) ** 2
+
+
+# 国際標準大気(ISA)の区分線形気温モデル。各層は (層の下端高度[m], 下端での気温[K], 気温勾配[K/m])
+# 86km以上は気温勾配の物理的な定義が無いため、86kmでの値をそのまま一定とみなす簡易近似
+_ISA_LAYERS = [
+    (0.0, 288.15, -0.0065),       # 対流圏
+    (11000.0, 216.65, 0.0),       # 対流圏界面
+    (20000.0, 216.65, 0.001),     # 成層圏1
+    (32000.0, 228.65, 0.0028),    # 成層圏2
+    (47000.0, 270.65, 0.0),       # 成層圏界面
+    (51000.0, 270.65, -0.0028),   # 中間圏1
+    (71000.0, 214.65, -0.002),    # 中間圏2
+]
+_ISA_CAP_ALTITUDE_M = 86000.0
+
+
+def _isa_temperature(altitude_m: float) -> float:
+    """ISAモデルによる高度ごとの気温 [K]。86km以上は86kmでの値で一定とみなす"""
+    h = min(max(altitude_m, 0.0), _ISA_CAP_ALTITUDE_M)
+    for i, (base_alt, base_temp, lapse) in enumerate(_ISA_LAYERS):
+        next_alt = _ISA_LAYERS[i + 1][0] if i + 1 < len(_ISA_LAYERS) else _ISA_CAP_ALTITUDE_M
+        if h <= next_alt:
+            return base_temp + lapse * (h - base_alt)
+    return _ISA_LAYERS[-1][1]
+
+
 class LaunchRequest(BaseModel):
     stages: list[StageSpec] = Field(default_factory=lambda: [
         StageSpec(propellant_mass=300.0, dry_mass=150.0, thrust=12000.0, burn_time=20.0),
@@ -3219,12 +3252,11 @@ def simulate_launch(req: LaunchRequest):
     if req.duration <= 0 or req.dt <= 0:
         raise HTTPException(status_code=400, detail="シミュレーション時間・刻み幅は正の値を入力してください")
 
-    g0 = 9.80665
     angle_rad = np.radians(req.launch_angle)
     initial_mass = sum(s.propellant_mass + s.dry_mass + s.payload_mass for s in req.stages) + req.payload_mass
 
     thrust_vertical = req.stages[0].thrust * np.sin(angle_rad)
-    weight0 = initial_mass * g0
+    weight0 = initial_mass * G0_MS2
     if thrust_vertical <= weight0:
         raise HTTPException(
             status_code=400,
@@ -3254,7 +3286,7 @@ def simulate_launch(req: LaunchRequest):
                     drag_y = -Fd * vy / speed
 
             ax = (Fx + drag_x) / m
-            ay = (Fy + drag_y) / m - g0
+            ay = (Fy + drag_y) / m - _gravity_at_altitude(y)
             dm = -mdot if burning else 0.0
             return [vx, vy, ax, ay, dm]
         return ode
@@ -3278,13 +3310,17 @@ def simulate_launch(req: LaunchRequest):
     delta_v_total = 0.0
     stage_burnouts: list[dict] = []
     stage_separations: list[dict] = []
+    stage_start_times: list[float] = []
+    stage_mdots: list[float] = []
 
     for stage_idx, stage in enumerate(req.stages, start=1):
         if landed or remaining <= 1e-9:
             break
 
+        stage_start_times.append(t_cursor)
         span = min(stage.burn_time, remaining)
         mdot = stage.propellant_mass / stage.burn_time
+        stage_mdots.append(mdot)
         mass_before_burn = state[4]
         n_steps = max(int(np.ceil(span / req.dt)), 1)
         t_eval = np.linspace(0.0, span, n_steps + 1)
@@ -3408,6 +3444,32 @@ def simulate_launch(req: LaunchRequest):
     speed = np.hypot(vx, vy)
     apogee_idx = int(np.argmax(y))
 
+    # 環境（重力加速度・外気圧の高度依存性）の参照カーブ。到達高度に応じた範囲を自動でとる
+    env_max_altitude = float(min(max(float(y[apogee_idx]) * 1.2, 50000.0), 2000000.0))
+    env_altitude = np.linspace(0.0, env_max_altitude, 100)
+    env_gravity = G0_MS2 / (1.0 + env_altitude / R_EARTH_M) ** 2
+    # 抗力計算と同じ指数大気モデル（海面ρ0=1.225 kg/m³, スケール高度8500m）に対応する外気圧分布。
+    # 燃焼器の推力計算（ambientPressurePa）はこの分布を参照せず、設計時に指定した固定値を使う簡易モデルのため一致しない
+    env_pressure = 101325.0 * np.exp(-env_altitude / H_scale)
+    env_temperature = np.array([_isa_temperature(float(h)) for h in env_altitude])
+
+    # 各段の推進剤残量: 燃焼中は一定流量(mdot)で消費される前提のため、燃焼開始時刻からの
+    # 経過時間×mdotを満タン質量から差し引き、[0, 満タン]の範囲にクリップするだけで、
+    # 「燃焼開始前は満タン」「燃焼終了後は空」「未到達の段は満タンのまま」を一括で表現できる
+    stage_propellant_remaining = []
+    for i, stage in enumerate(req.stages):
+        if i < len(stage_start_times):
+            start = stage_start_times[i]
+            mdot_i = stage_mdots[i]
+        else:
+            start = float("inf")
+            mdot_i = stage.propellant_mass / stage.burn_time
+        remaining_kg = np.clip(stage.propellant_mass - mdot_i * (t - start), 0.0, stage.propellant_mass)
+        stage_propellant_remaining.append({
+            "stage_index": i + 1,
+            "propellant_kg": np.round(remaining_kg, 3).tolist(),
+        })
+
     # 浮動小数点誤差（例: 90°での cos が厳密に0でない）由来の極小値を丸めて除去
     return {
         "time": np.round(t, 6).tolist(),
@@ -3417,7 +3479,14 @@ def simulate_launch(req: LaunchRequest):
         "vy": np.round(vy, 6).tolist(),
         "speed": np.round(speed, 6).tolist(),
         "mass": np.round(m, 6).tolist(),
+        "stage_propellant_remaining": stage_propellant_remaining,
         "landed": landed,
+        "environment": {
+            "altitude_m": np.round(env_altitude, 2).tolist(),
+            "gravity_m_s2": np.round(env_gravity, 6).tolist(),
+            "pressure_pa": np.round(env_pressure, 3).tolist(),
+            "temperature_k": np.round(env_temperature, 2).tolist(),
+        },
         "stats": {
             "apogee_altitude_m": round(float(y[apogee_idx]), 2),
             "apogee_time_s": round(float(t[apogee_idx]), 2),
@@ -4017,6 +4086,8 @@ def build_rocket_stage(payload: RocketStagePayload):
     edge_results: dict[str, dict] = {}
     dry_mass = 0.0
     propellant_mass = 0.0
+    oxidizer_mass = 0.0
+    fuel_mass = 0.0
     thrust_total = 0.0
     mdot_total = 0.0
     oxidizer = ""
@@ -4036,6 +4107,11 @@ def build_rocket_stage(payload: RocketStagePayload):
             r = _calc_tank(params)
             dry_mass += r["shell_mass_kg"]
             propellant_mass += r["propellant_mass_kg"]
+            tank_oxidizer, tank_fuel = _propellant_for_node(node.id, payload.edges)
+            if tank_oxidizer:
+                oxidizer_mass += r["propellant_mass_kg"]
+            elif tank_fuel:
+                fuel_mass += r["propellant_mass_kg"]
         elif node.node_type == "combustor":
             r = _calc_combustor(params)
             dry_mass += r["shell_mass_kg"]
@@ -4062,11 +4138,234 @@ def build_rocket_stage(payload: RocketStagePayload):
     burn_time = (propellant_mass / mdot_total) if mdot_total > 0 else 0.0
     stage = {
         "propellant_mass": round(propellant_mass, 3),
+        "oxidizer_mass": round(oxidizer_mass, 3),
+        "fuel_mass": round(fuel_mass, 3),
         "dry_mass": round(dry_mass, 3),
         "payload_mass": round(payload_mass, 3),
         "oxidizer": oxidizer or "LOX",
         "fuel": fuel or "LCH4",
         "thrust": round(thrust_total, 2),
         "burn_time": round(burn_time, 3),
+        "mdot_total": round(mdot_total, 5),
     }
     return {"nodes": results, "edges": edge_results, "stage": stage}
+
+
+# ── ロケットCd(Mach)簡易計算（cd_calculator/rocket_cd_viewer.py のロジックを移植） ──
+
+class RocketCdRequest(BaseModel):
+    diameter_m: float = 0.10                       # 代表直径 D [m]
+    nose_type: str = "Von Karman / Haack"          # Conical | Tangent ogive | Elliptical | Parabolic | Von Karman / Haack
+    nose_length_d: float = 4.0                     # ノーズ長 Ln/D
+    body_length_d: float = 10.0                    # 胴体長 Lb/D
+    base_type: str = "Flat base"                   # Flat base | Boat tail
+    boat_tail_length_d: float = 1.5                # ボートテール長 Lbt/D
+    base_diameter_d: float = 0.65                  # ボートテール後端直径 Db/D
+    nozzle_exit_diameter_d: float = 0.35            # ノズル出口直径 De/D
+    fin_enabled: bool = True
+    fin_count: int = 4
+    fin_root_chord_d: float = 1.5                  # フィン翼根長 cr/D
+    fin_tip_chord_d: float = 0.7                    # フィン翼端長 ct/D
+    fin_span_d: float = 0.6                         # フィンスパン s/D
+    fin_sweep_d: float = 0.6                        # フィン後退量 xs/D
+    fin_thickness_d: float = 0.02                   # フィン厚 tf/D
+    surface_finish: str = "Smooth paint"            # Polished | Smooth paint | Regular paint | Unfinished | Rough
+    power_on: bool = False
+    aoa_deg: float = 0.0                            # 迎角 [deg]
+    reynolds_d_at_m1: float = 3.0e6                 # Mach1におけるRe_D
+    air_density_kg_m3: float = 1.225                # 抗力計算用の空気密度（デフォルトはISA海面標準大気値）[kg/m³]
+    sound_speed_m_s: float = 340.3                  # 抗力計算用の音速（デフォルトはISA海面標準大気値、V=Mach×音速）[m/s]
+    mach_min: float = 0.05
+    mach_max: float = 3.0
+    points: int = 300
+
+
+_ROCKET_CD_ROUGHNESS_MULT = {
+    "Polished": 0.85,
+    "Smooth paint": 1.00,
+    "Regular paint": 1.15,
+    "Unfinished": 1.35,
+    "Rough": 1.65,
+}
+
+_ROCKET_CD_NOSE_SHAPE_FACTOR = {
+    "Conical": 1.00,
+    "Tangent ogive": 0.82,
+    "Elliptical": 0.92,
+    "Parabolic": 0.78,
+    "Von Karman / Haack": 0.62,
+}
+
+
+def _rocket_cd_nose_profile(nose_type: str, length: float, radius: float, n: int = 60) -> tuple[np.ndarray, np.ndarray]:
+    """ノーズ先端x=0から根元x=Lまでのx,rプロファイルを返す"""
+    x = np.linspace(0.0, length, n)
+    xi = np.clip(x / max(length, 1e-12), 0.0, 1.0)
+
+    if nose_type == "Conical":
+        r = radius * xi
+    elif nose_type == "Tangent ogive":
+        rho = (radius ** 2 + length ** 2) / (2.0 * radius)
+        inside = np.maximum(rho ** 2 - (length - x) ** 2, 0.0)
+        r = np.sqrt(inside) + radius - rho
+    elif nose_type == "Elliptical":
+        r = radius * np.sqrt(np.maximum(1.0 - ((x - length) / max(length, 1e-12)) ** 2, 0.0))
+    elif nose_type == "Parabolic":
+        r = radius * (2.0 * xi - xi ** 2)
+    elif nose_type == "Von Karman / Haack":
+        theta = np.arccos(np.clip(1.0 - 2.0 * xi, -1.0, 1.0))
+        term = theta - 0.5 * np.sin(2.0 * theta)
+        r = radius * np.sqrt(np.maximum(term / math.pi, 0.0))
+    else:
+        r = radius * xi
+
+    r[0] = 0.0
+    r[-1] = radius
+    return x, r
+
+
+def _rocket_cd_surface_area_of_revolution(x: np.ndarray, r: np.ndarray) -> float:
+    drdx = np.gradient(r, x, edge_order=1)
+    integrand = 2.0 * math.pi * r * np.sqrt(1.0 + drdx ** 2)
+    return float(np.trapz(integrand, x))
+
+
+def _rocket_cd_turbulent_cf(re: np.ndarray, roughness_multiplier: float) -> np.ndarray:
+    re_clip = np.clip(re, 1.0e4, 1.0e9)
+    cf = 0.455 / (np.log10(re_clip) ** 2.58)
+    return cf * roughness_multiplier
+
+
+def _rocket_cd_smooth_step(x: np.ndarray, x0: float, width: float) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-(x - x0) / max(width, 1e-6)))
+
+
+@app.post("/rocket/cd-curve")
+def calc_rocket_cd_curve(req: RocketCdRequest):
+    """代表形状パラメータからCd(Mach)曲線（摩擦・ノーズ波動・ベース・ボートテール剥離抵抗・
+    フィン・迎角の各成分）と形状プロファイルを計算する簡易モデル"""
+    D = req.diameter_m
+    R = 0.5 * D
+    nose_length = req.nose_length_d * D
+    body_length = req.body_length_d * D
+    boat_tail_length = req.boat_tail_length_d * D if req.base_type == "Boat tail" else 0.0
+    base_radius = 0.5 * req.base_diameter_d * D if req.base_type == "Boat tail" else R
+    nozzle_radius = 0.5 * req.nozzle_exit_diameter_d * D
+    total_length = nose_length + body_length + boat_tail_length
+    Aref = math.pi * R ** 2
+    base_area_ratio = max(base_radius ** 2 - nozzle_radius ** 2, 0.0) / max(R ** 2, 1e-12)
+
+    if req.mach_max <= req.mach_min:
+        raise HTTPException(status_code=400, detail="Mach maxはMach minより大きくしてください")
+    M = np.linspace(req.mach_min, req.mach_max, max(req.points, 2))
+
+    # ── 形状プロファイル（フロントエンド表示用） ──
+    x_nose, r_nose = _rocket_cd_nose_profile(req.nose_type, nose_length, R)
+    xs = list(x_nose) + [nose_length + body_length]
+    rs = list(r_nose) + [R]
+    if req.base_type == "Boat tail" and boat_tail_length > 0:
+        xs.append(nose_length + body_length + boat_tail_length)
+        rs.append(base_radius)
+
+    # ── 濡れ面積 ──
+    S_nose = _rocket_cd_surface_area_of_revolution(x_nose, r_nose)
+    S_body = 2.0 * math.pi * R * body_length
+    if req.base_type == "Boat tail" and boat_tail_length > 0:
+        slant = math.sqrt((R - base_radius) ** 2 + boat_tail_length ** 2)
+        S_boattail = math.pi * (R + base_radius) * slant
+    else:
+        S_boattail = 0.0
+    if req.fin_enabled:
+        fin_planform = 0.5 * (req.fin_root_chord_d + req.fin_tip_chord_d) * req.fin_span_d * D ** 2
+        S_fins = 2.0 * req.fin_count * fin_planform
+    else:
+        S_fins = 0.0
+    S_total = S_nose + S_body + S_boattail + S_fins
+
+    # ── 摩擦抵抗 ──
+    rough_mult = _ROCKET_CD_ROUGHNESS_MULT.get(req.surface_finish, 1.0)
+    Re_D = np.clip(req.reynolds_d_at_m1 * np.maximum(M, 0.05), 1e4, 1e9)
+    Re_L = Re_D * max(total_length / D, 1.0)
+    Cf = _rocket_cd_turbulent_cf(Re_L, rough_mult)
+    cd_friction_body = Cf * (S_nose + S_body + S_boattail) / Aref
+    cd_friction_fins = Cf * S_fins / Aref
+
+    # ── ノーズ圧力・波動抵抗 ──
+    shape_factor = _ROCKET_CD_NOSE_SHAPE_FACTOR.get(req.nose_type, 0.85)
+    fineness_factor = (4.0 / max(req.nose_length_d, 0.5)) ** 1.1
+    transonic_bump = np.exp(-((M - 1.05) / 0.22) ** 2)
+    supersonic_ramp = _rocket_cd_smooth_step(M, 1.15, 0.10)
+    cd_nose_wave = shape_factor * fineness_factor * (
+        0.085 * transonic_bump + 0.045 * supersonic_ramp * (1.0 - np.exp(-0.7 * np.maximum(M - 1.0, 0.0)))
+    )
+
+    # ── ベース抵抗（推力ONで後流の低圧効果を緩和） ──
+    base_transonic = 0.11 + 0.16 * _rocket_cd_smooth_step(M, 0.80, 0.12)
+    base_high_mach_relief = 1.0 - 0.25 * _rocket_cd_smooth_step(M, 2.0, 0.35)
+    power_factor = 0.35 if req.power_on else 1.0
+    cd_base = base_area_ratio * base_transonic * base_high_mach_relief * power_factor
+
+    # ── ボートテール剥離抵抗 ──
+    if req.base_type == "Boat tail" and req.boat_tail_length_d > 0:
+        angle_deg = math.degrees(math.atan2(max(R - base_radius, 0.0), max(boat_tail_length, 1e-9)))
+        cd_boattail = np.full_like(M, max(angle_deg - 12.0, 0.0) / 100.0)
+    else:
+        cd_boattail = np.zeros_like(M)
+
+    # ── フィン圧力・波動抵抗 ──
+    if req.fin_enabled:
+        fin_area_ratio = 0.5 * (req.fin_root_chord_d + req.fin_tip_chord_d) * req.fin_span_d * req.fin_count
+        thickness_ratio = max(req.fin_thickness_d, 1e-4)
+        cd_fin_pressure = 0.015 * fin_area_ratio * (1.0 + 2.0 * supersonic_ramp) * (thickness_ratio / 0.02)
+    else:
+        cd_fin_pressure = np.zeros_like(M)
+
+    # ── 迎角抵抗（簡易二次近似） ──
+    alpha = math.radians(req.aoa_deg)
+    side_area_ratio = (total_length * D) / Aref
+    cd_aoa = np.full_like(M, 0.08 * side_area_ratio * alpha ** 2)
+
+    cd_total = (
+        cd_friction_body + cd_friction_fins + cd_nose_wave + cd_base
+        + cd_boattail + cd_fin_pressure + cd_aoa
+    )
+
+    # ── 抗力。指定した空気密度・音速から V = Mach × 音速 として Fd = (1/2)ρV²Cd・Aref を計算（高度変化は考慮しない） ──
+    velocity_ms = M * req.sound_speed_m_s
+    drag_n = 0.5 * req.air_density_kg_m3 * velocity_ms ** 2 * cd_total * Aref
+
+    return {
+        "mach": M.tolist(),
+        "drag_n": drag_n.tolist(),
+        "cd": {
+            "total": cd_total.tolist(),
+            "friction_body": cd_friction_body.tolist(),
+            "friction_fins": cd_friction_fins.tolist(),
+            "nose_wave_pressure": cd_nose_wave.tolist(),
+            "base": cd_base.tolist(),
+            "boattail_sep": cd_boattail.tolist(),
+            "fin_pressure_wave": cd_fin_pressure.tolist(),
+            "aoa": cd_aoa.tolist(),
+        },
+        "shape": {
+            "x_over_d": [v / D for v in xs],
+            "r_over_d": [v / D for v in rs],
+            "base_radius_over_d": base_radius / D,
+            "nozzle_radius_over_d": nozzle_radius / D,
+            "total_length_over_d": total_length / D,
+            "fin": {
+                "root_chord_d": req.fin_root_chord_d,
+                "tip_chord_d": req.fin_tip_chord_d,
+                "span_d": req.fin_span_d,
+                "sweep_d": req.fin_sweep_d,
+                "le_x_over_d": max(req.nose_length_d, (nose_length + body_length) / D - req.fin_root_chord_d),
+                "te_x_over_d": (nose_length + body_length) / D,
+            } if req.fin_enabled else None,
+        },
+        "summary": {
+            "aref_m2": Aref,
+            "total_length_over_d": total_length / D,
+            "base_area_ratio": base_area_ratio,
+            "wetted_area_over_aref": S_total / Aref,
+        },
+    }

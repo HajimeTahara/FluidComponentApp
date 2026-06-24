@@ -22,6 +22,17 @@ const SERIES_COLOR: Record<SeriesKey, string> = {
   mass: '#10b981',
 }
 
+// 環境カーブ（高度→重力加速度）上の到達高度の位置を線形補間で求める
+function interpAt(xs: number[], ys: number[], x: number): number {
+  if (xs.length === 0) return 0
+  if (x <= xs[0]) return ys[0]
+  if (x >= xs[xs.length - 1]) return ys[ys.length - 1]
+  let i = 0
+  while (i < xs.length - 1 && xs[i + 1] < x) i++
+  const t = (x - xs[i]) / (xs[i + 1] - xs[i])
+  return ys[i] + t * (ys[i + 1] - ys[i])
+}
+
 // ── Small reusable components ──────────────────────────────────────
 
 function SectionHeader({ children }: { children: React.ReactNode }) {
@@ -183,6 +194,69 @@ export default function LaunchAnalysis() {
       hovertemplate: `t: %{x:.1f} s<br>${SERIES_LABEL[series]}: %{y:.2f}<extra></extra>`,
     }]
   }, [result, series])
+
+  const propellantTrace = useMemo(() => {
+    if (!result) return []
+    const colors = ['#2563eb', '#f59e0b', '#10b981', '#ef4444', '#8b5cf6', '#0ea5e9']
+    return result.stage_propellant_remaining.map((s, i) => ({
+      x: result.time,
+      y: s.propellant_kg,
+      type: 'scatter' as const,
+      mode: 'lines' as const,
+      name: `第${s.stage_index}段`,
+      line: { color: colors[i % colors.length], width: 2.5 },
+      hovertemplate: `第${s.stage_index}段<br>t: %{x:.1f} s<br>残量: %{y:.1f} kg<extra></extra>`,
+    }))
+  }, [result])
+
+  const environmentTrace = useMemo(() => {
+    if (!result) return []
+    const env = result.environment
+    const apogeeAltitude = result.stats.apogee_altitude_m
+    return [
+      {
+        x: env.altitude_m,
+        y: env.gravity_m_s2,
+        type: 'scatter' as const,
+        mode: 'lines' as const,
+        name: '重力加速度',
+        line: { color: '#7c3aed', width: 2.5 },
+        hovertemplate: 'h: %{x:.0f} m<br>g: %{y:.4f} m/s²<extra></extra>',
+      },
+      {
+        x: [apogeeAltitude],
+        y: [interpAt(env.altitude_m, env.gravity_m_s2, apogeeAltitude)],
+        type: 'scatter' as const,
+        mode: 'markers+text' as const,
+        name: '最大到達高度',
+        text: ['最大到達高度'],
+        textposition: 'top center' as const,
+        textfont: { size: 10, color: '#dc2626' },
+        marker: { color: '#dc2626', size: 9, symbol: 'x' },
+        hovertemplate: 'h: %{x:.0f} m<br>g: %{y:.4f} m/s²<extra></extra>',
+      },
+      {
+        x: env.altitude_m,
+        y: env.pressure_pa,
+        yaxis: 'y2',
+        type: 'scatter' as const,
+        mode: 'lines' as const,
+        name: '外気圧',
+        line: { color: '#0891b2', width: 2.5 },
+        hovertemplate: 'h: %{x:.0f} m<br>P: %{y:.0f} Pa<extra></extra>',
+      },
+      {
+        x: env.altitude_m,
+        y: env.temperature_k,
+        yaxis: 'y3',
+        type: 'scatter' as const,
+        mode: 'lines' as const,
+        name: '外気温',
+        line: { color: '#ea580c', width: 2.5 },
+        hovertemplate: 'h: %{x:.0f} m<br>T: %{y:.1f} K<extra></extra>',
+      },
+    ]
+  }, [result])
 
   return (
     <div className="flex flex-col gap-6">
@@ -358,6 +432,61 @@ export default function LaunchAnalysis() {
                 config={{ displayModeBar: true, responsive: true, displaylogo: false }}
                 style={{ width: '100%', height: '320px' }}
               />
+            </div>
+
+            {/* Propellant Remaining Chart */}
+            <div className="bg-white rounded-lg border border-gray-200 p-4">
+              <Plot
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                data={propellantTrace as any}
+                layout={{
+                  title: { text: '各段の推進剤残量の時間変化', font: { size: 13 } },
+                  xaxis: { title: { text: '時刻 t [s]', standoff: 8 }, showgrid: true, gridcolor: '#f0f0f0', zeroline: false },
+                  yaxis: { title: { text: '推進剤残量 [kg]', standoff: 8 }, showgrid: true, gridcolor: '#f0f0f0', zeroline: false },
+                  margin: { t: 45, r: 20, b: 55, l: 70 },
+                  autosize: true,
+                  font: { family: 'system-ui, sans-serif', size: 12 },
+                }}
+                config={{ displayModeBar: true, responsive: true, displaylogo: false }}
+                style={{ width: '100%', height: '320px' }}
+              />
+            </div>
+
+            {/* Environment Chart */}
+            <div className="bg-white rounded-lg border border-gray-200 p-4">
+              <Plot
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                data={environmentTrace as any}
+                layout={{
+                  title: { text: '環境（高度による重力加速度・外気圧・外気温の変化）', font: { size: 13 } },
+                  xaxis: { title: { text: '高度 h [m]', standoff: 8 }, showgrid: true, gridcolor: '#f0f0f0', zeroline: false, domain: [0, 0.82] },
+                  yaxis: { title: { text: '重力加速度 g [m/s²]', standoff: 8 }, showgrid: true, gridcolor: '#f0f0f0', zeroline: false },
+                  yaxis2: {
+                    title: { text: '外気圧 P [Pa]', standoff: 8 },
+                    overlaying: 'y',
+                    anchor: 'free',
+                    side: 'right',
+                    position: 0.82,
+                    showgrid: false,
+                    zeroline: false,
+                  },
+                  yaxis3: {
+                    title: { text: '外気温 T [K]', standoff: 8 },
+                    overlaying: 'y',
+                    anchor: 'free',
+                    side: 'right',
+                    position: 1,
+                    showgrid: false,
+                    zeroline: false,
+                  },
+                  margin: { t: 45, r: 70, b: 55, l: 70 },
+                  autosize: true,
+                  font: { family: 'system-ui, sans-serif', size: 12 },
+                }}
+                config={{ displayModeBar: true, responsive: true, displaylogo: false }}
+                style={{ width: '100%', height: '320px' }}
+              />
+              <p className="mt-2 text-xs text-gray-400">g(h) = g₀ / (1 + h/R)²（g₀=9.80665 m/s², R=地球半径6371km の逆二乗則近似）。P(h) = P₀ × exp(-h/H)（P₀=101325 Pa, H=8500 m の指数大気近似、抗力計算と同じモデル）。T(h)は国際標準大気(ISA)の区分線形モデル（86km以上は86kmの値で一定）。軌道計算もこの高度依存重力を使用しますが、燃焼器の推力計算（外気圧パラメータ）や空気抵抗の密度計算（指数大気のみ）はこの気温分布を参照していません</p>
             </div>
 
           </>) : (

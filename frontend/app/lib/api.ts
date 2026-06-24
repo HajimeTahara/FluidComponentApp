@@ -313,6 +313,8 @@ export async function simulateTransientNetwork(payload: TransientNetworkPayload)
 // ── Launch Trajectory ──────────────────────────────────────────────
 export type StageSpec = {
   propellant_mass: number
+  oxidizer_mass?: number
+  fuel_mass?: number
   dry_mass: number
   payload_mass: number
   oxidizer: string
@@ -322,6 +324,7 @@ export type StageSpec = {
   length_m: number
   diameter_m: number
   separation_delay_s: number
+  mdot_total?: number
 }
 
 export type LaunchRequest = {
@@ -364,6 +367,18 @@ export type LaunchStats = {
   delta_v_ms: number
 }
 
+export type EnvironmentProfile = {
+  altitude_m: number[]
+  gravity_m_s2: number[]
+  pressure_pa: number[]
+  temperature_k: number[]
+}
+
+export type StagePropellantRemaining = {
+  stage_index: number
+  propellant_kg: number[]
+}
+
 export type LaunchResult = {
   time: number[]
   x: number[]
@@ -372,7 +387,9 @@ export type LaunchResult = {
   vy: number[]
   speed: number[]
   mass: number[]
+  stage_propellant_remaining: StagePropellantRemaining[]
   landed: boolean
+  environment: EnvironmentProfile
   stats: LaunchStats
 }
 
@@ -618,6 +635,91 @@ export async function updateFluidLibraryEntry(id: number, payload: FluidLibraryS
 export async function deleteFluidLibraryEntry(id: number): Promise<void> {
   const res = await fetch(`${API_BASE}/fluid-library/${id}`, { method: 'DELETE' })
   await vehicleResponse(res, '流体の削除に失敗しました')
+}
+
+// ── Rocket Cd(Mach) 簡易計算 ───────────────────────────────────────
+export type RocketCdRequest = {
+  diameter_m: number
+  nose_type: 'Conical' | 'Tangent ogive' | 'Elliptical' | 'Parabolic' | 'Von Karman / Haack'
+  nose_length_d: number
+  body_length_d: number
+  base_type: 'Flat base' | 'Boat tail'
+  boat_tail_length_d: number
+  base_diameter_d: number
+  nozzle_exit_diameter_d: number
+  fin_enabled: boolean
+  fin_count: number
+  fin_root_chord_d: number
+  fin_tip_chord_d: number
+  fin_span_d: number
+  fin_sweep_d: number
+  fin_thickness_d: number
+  surface_finish: 'Polished' | 'Smooth paint' | 'Regular paint' | 'Unfinished' | 'Rough'
+  power_on: boolean
+  aoa_deg: number
+  reynolds_d_at_m1: number
+  air_density_kg_m3: number
+  sound_speed_m_s: number
+  mach_min: number
+  mach_max: number
+  points: number
+}
+
+export type RocketCdComponents = {
+  total: number[]
+  friction_body: number[]
+  friction_fins: number[]
+  nose_wave_pressure: number[]
+  base: number[]
+  boattail_sep: number[]
+  fin_pressure_wave: number[]
+  aoa: number[]
+}
+
+export type RocketCdShapeFin = {
+  root_chord_d: number
+  tip_chord_d: number
+  span_d: number
+  sweep_d: number
+  le_x_over_d: number
+  te_x_over_d: number
+}
+
+export type RocketCdShape = {
+  x_over_d: number[]
+  r_over_d: number[]
+  base_radius_over_d: number
+  nozzle_radius_over_d: number
+  total_length_over_d: number
+  fin: RocketCdShapeFin | null
+}
+
+export type RocketCdSummary = {
+  aref_m2: number
+  total_length_over_d: number
+  base_area_ratio: number
+  wetted_area_over_aref: number
+}
+
+export type RocketCdResult = {
+  mach: number[]
+  drag_n: number[]
+  cd: RocketCdComponents
+  shape: RocketCdShape
+  summary: RocketCdSummary
+}
+
+export async function calcRocketCdCurve(payload: RocketCdRequest): Promise<RocketCdResult> {
+  const res = await fetch(`${API_BASE}/rocket/cd-curve`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error((err as { detail?: string }).detail ?? 'Cd計算に失敗しました')
+  }
+  return res.json()
 }
 
 export async function runSimulate(payload: {
